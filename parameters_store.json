@@ -1,0 +1,16 @@
+{
+    "active_version": 1,
+    "champion": {
+        "FAST_LENGTH": 8,
+        "SLOW_LENGTH": 21,
+        "VOL_LENGTH": 14,
+        "CVD_LENGTH": 14,
+        "BAND_MULT": 2.5,
+        "MIN_PROFIT_MARGIN": 0.3,
+        "TRAIL_MULT": 3.0,
+        "PING_STOP_MULT": 0.5,
+        "TP_PERCENT": 0.3
+    },
+    "shadow_challenger": null,
+    "history": []
+}
