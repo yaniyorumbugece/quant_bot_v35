@@ -3691,7 +3691,7 @@ class QuantBot:
         g_gate = float(gchart.get("gate", 0.5))
         chart_data = []
         for j in range(len(df)):
-            t_val = int(df['timestamp'].iloc[j].timestamp()) + UTC_OFFSET
+            t_val = int(df['timestamp'].iloc[j].timestamp())
             gi = j - g_off
             has_geo = 0 <= gi < g_n
             chart_data.append({
@@ -5047,6 +5047,21 @@ HTML_TEMPLATE = """
             .then(() => {
                 activeTF = tf;
                 document.querySelectorAll('.tf-btn').forEach(b => { b.classList.remove('active'); if(b.innerText === tf) b.classList.add('active'); });
+                // Timeframe değişince eski grafik verilerini temizle
+                if (candleSeries && tvChart) {
+                    tvChart.removeSeries(candleSeries);
+                    tvChart.removeSeries(aHist);
+                    candleSeries = tvChart.addCandlestickSeries({
+                        upColor: '#089981', downColor: '#f23645', borderVisible: false,
+                        wickUpColor: '#089981', wickDownColor: '#f23645'
+                    });
+                    aHist = tvChart.addHistogramSeries({
+                        priceScaleId: 'geo', priceLineVisible: false,
+                        lastValueVisible: false,
+                        priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+                    });
+                    tvChart.priceScale('geo').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+                }
             });
         }
 
@@ -6434,8 +6449,23 @@ bot_instance = None
 def run_bot():
     global bot_instance
     bot_instance = QuantBot()
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(bot_instance.main_loop())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(bot_instance.main_loop())
+    except Exception as e:
+        log.error(f"Bot main loop error: {e}")
+    finally:
+        try:
+            # Cancel all pending tasks gracefully
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        loop.close()
 
 if __name__ == "__main__":
     # ── CLI: --test / --test-geom / --test-comp / --test-safe run the embedded
