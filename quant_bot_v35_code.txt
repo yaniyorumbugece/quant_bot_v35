@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  QUANT BOT V3.1 — Scale-Out (70/30) + MTF Micro-Trailing Stop              ║
-║  MEXC Spot · Gaussian Crossover · Order Book Depth · PyWebView              ║
+║  QUANT BOT V3.6 — LEARNED GEOMETRY (nihai mimari)                          ║
+║  MEXC Spot · PyWebView arayüz · Scale-Out (70/30) + MTF Trailing           ║
+║                                                                            ║
+║  Çekirdek: Vol-Norm → Multi-res Paths (5/15/30/60 dyadik) → Chen İmzaları  ║
+║  → δ̂ diagnostiği (κ_init + faktör bütçesi) → Shared Encoder                ║
+║  M = H^a(κ)[×S^b×E^c] → Bundle Z(t) → Innovations → Epizot/Küme/Geçiş     ║
+║  Grafı → GBM → Meta Labeling → Conformal (A = α·A_pred + β·A_geom)         ║
+║  + Anchor Panel (append-only defter) + Purged WFO (warm start + RKD)       ║
 ║                                                                            ║
 ║  Mimarlar: Profesör + Antigravity AI + Kullanıcı                           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -87,6 +93,44 @@ UTC_OFFSET = int(datetime.now(_tz.utc).astimezone().utcoffset().total_seconds())
 tf_change_event = asyncio.Event()
 state_lock = threading.Lock()
 
+PARAMETERS_STORE_PATH = Path(__file__).parent / "parameters_store.json"
+
+def get_active_parameters():
+    try:
+        if PARAMETERS_STORE_PATH.exists():
+            import json
+            with open(PARAMETERS_STORE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("champion", {})
+    except Exception as e:
+        log.error(f"Error loading parameters: {e}")
+    return {
+        "FAST_LENGTH": 8,
+        "SLOW_LENGTH": 21,
+        "VOL_LENGTH": 14,
+        "CVD_LENGTH": 14,
+        "BAND_MULT": 2.5,
+        "MIN_PROFIT_MARGIN": 0.3,
+        "TRAIL_MULT": 3.0,
+        "PING_STOP_MULT": 0.5,
+        "TP_PERCENT": 3.0
+    }
+
+def get_all_parameters():
+    try:
+        if PARAMETERS_STORE_PATH.exists():
+            import json
+            with open(PARAMETERS_STORE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.error(f"Error loading full parameters store: {e}")
+    return {
+        "active_version": 1,
+        "champion": get_active_parameters(),
+        "shadow_challenger": None,
+        "history": []
+    }
+
 bot_state = {
     "is_trading_active": False,
     "trading_mode": "PAPER",
@@ -155,7 +199,32 @@ bot_state = {
     "ou_jump_mean": 0.0,
     "ou_jump_std": 0.0,
     "ou_jump_detected": False,
-    "ou_jump_cooldown": 0
+    "ou_jump_cooldown": 0,
+    
+    # Shadow Mode keys
+    "shadow_active": False,
+    "shadow_parameters": {},
+    "shadow_balance": 1000.0,
+    "shadow_position_side": None,
+    "shadow_position_entry": 0.0,
+    "shadow_position_qty": 0.0,
+    "shadow_position_pnl": 0.0,
+    "shadow_total_pnl": 0.0,
+    "shadow_trade_count": 0,
+    "shadow_trades": [],
+    
+    # Backtest and WFO keys
+    "wfo_report": None,
+    "wfo_running": False,
+    "backtest_report": None,
+    "backtest_running": False,
+    "active_parameters": get_active_parameters(),
+    "parameters_store": get_all_parameters(),
+
+    # V3.6 Learned Geometry state
+    "geom": {"status": "collecting", "signal": "HOLD", "schema": "-", "kappa": 0.0,
+             "a_score": 0.0, "a_gate": 0.5, "p_gbm": 0.5, "p_meta": 0.5,
+             "episode": "NORMAL", "cluster": -1, "fold": 0}
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,6 +502,59 @@ class HyperbolicClassifier:
         elif bear_w > bull_w * 1.2: return -1
         return 0
 
+    def classify_fast(self, features, closes, current_idx, k=8, lookback=300):
+        n = current_idx + 1
+        if n < 50:
+            return 0
+        start = max(0, n - lookback)
+        wf = features[start:n]
+        mins = np.min(wf, axis=0)
+        maxs = np.max(wf, axis=0)
+        ranges = maxs - mins
+        ranges[ranges == 0] = 1.0
+        normalized = 2 * (wf - mins) / ranges - 1
+        v_norm = np.linalg.norm(normalized, axis=1, keepdims=True)
+        v_norm = np.maximum(v_norm, 1e-10)
+        embedded = np.tanh(v_norm / 2.0) * normalized / v_norm
+        labels = np.zeros(len(embedded))
+        for i in range(len(embedded) - 4):
+            ai = start + i
+            if ai + 4 < n:
+                labels[i] = 1.0 if closes[ai + 4] > closes[ai] else -1.0
+        ci = len(embedded) - 1
+        current = embedded[ci]
+        train_start = max(0, ci - lookback)
+        train_end = ci - 4
+        if train_end <= train_start:
+            return 0
+        train_embedded = embedded[train_start:train_end]
+        train_labels = labels[train_start:train_end]
+        valid_mask = train_labels != 0
+        if not np.any(valid_mask):
+            return 0
+        train_embedded = train_embedded[valid_mask]
+        train_labels = train_labels[valid_mask]
+        diff_sq = np.sum((train_embedded - current)**2, axis=1)
+        u_sq = np.sum(current**2)
+        v_sq = np.sum(train_embedded**2, axis=1)
+        denom = (1.0 - u_sq) * (1.0 - v_sq)
+        denom = np.maximum(denom, 1e-10)
+        arg = 1.0 + 2.0 * diff_sq / denom
+        distances = np.arccosh(np.maximum(arg, 1.0))
+        if len(distances) < k:
+            return 0
+        top_k_indices = np.argsort(distances)[:k]
+        top_k_dists = distances[top_k_indices]
+        top_k_labels = train_labels[top_k_indices]
+        weights = 1.0 / (top_k_dists + 1e-10)
+        bull_w = np.sum(weights[top_k_labels > 0])
+        bear_w = np.sum(weights[top_k_labels < 0])
+        if bull_w > bear_w * 1.2:
+            return 1
+        elif bear_w > bull_w * 1.2:
+            return -1
+        return 0
+
 class OUPingPong:
     """
     Jump-Diffusion Ornstein-Uhlenbeck süreci: dX = θ(μ - X)dt + σdW + J dN
@@ -533,6 +655,9 @@ class OUPingPong:
         self.sigma_ou = float(np.std(residuals))
         self.half_life = math.log(2) / self.theta
         ou_std = self.sigma_ou / math.sqrt(2 * self.theta)
+        # Cap corridor range to prevent excessive widening (max 0.5% deviation)
+        max_allowed_std = self.mu * 0.005
+        ou_std = min(ou_std, max_allowed_std)
         
         self.ou_upper = self.mu + 2 * ou_std
         self.ou_lower = self.mu - 2 * ou_std
@@ -543,73 +668,2185 @@ class OUPingPong:
     def get_signal(self, price):
         if not self.is_valid or self.jump_cooldown > 0: return "HOLD", ""
         if price <= self.ou_lower: return "BUY", "OU-Ping"
-        if price >= self.ou_upper: return "SELL", "OU-Pong"
         return "HOLD", ""
 
-class RegimeDetector:
-    def __init__(self):
-        self.model = None; self.ranging_state = 1; self.last_train_bar = -999
-        if HAS_HMMLEARN: self.model = HMMLearnGaussianHMM(n_components=HMM_N_STATES, covariance_type="full", n_iter=50)
-        else: self.model = NumpyGaussianHMM(n_components=HMM_N_STATES)
+class DynamicTargetOptimizer:
+    """
+    Geçmiş işlemlerin sonuçlarına göre TP/SL hedeflerini dinamik olarak optimize eden katman.
+    """
+    def __init__(self, lookback_trades=50):
+        self.lookback_trades = lookback_trades
+        self.trade_history = []  # list of dicts: {"regime": str, "volatility": float, "max_excursion_pct": float, "max_drawdown_pct": float, "pnl_pct": float}
 
-    def train(self, features, bar_index, force=False):
-        if not force and (bar_index - self.last_train_bar < HMM_RETRAIN_FREQ) and self.last_train_bar >= 0: return
-        X = features[max(0, len(features)-HMM_TRAIN_WINDOW):]
-        try:
-            self.model.fit(X)
-            vols = [self.model.means_[i][1] for i in range(HMM_N_STATES)]
-            self.ranging_state = int(np.argmin(vols)); self.last_train_bar = bar_index
-        except Exception: pass
+    def record_trade(self, regime, volatility, max_excursion_pct, max_drawdown_pct, pnl_pct):
+        self.trade_history.append({
+            "regime": regime,
+            "volatility": float(volatility),
+            "max_excursion_pct": float(max_excursion_pct),
+            "max_drawdown_pct": float(max_drawdown_pct),
+            "pnl_pct": float(pnl_pct)
+        })
+        if len(self.trade_history) > self.lookback_trades:
+            self.trade_history.pop(0)
 
-    def is_ranging(self, features):
-        if self.model is None or self.model.means_ is None: return False
+    def get_optimal_targets(self, regime_type, current_volatility, default_tp=0.3, default_sl=0.3):
+        relevant = [t for t in self.trade_history if t["regime"] == regime_type]
+        if len(relevant) < 3:
+            return default_tp, default_sl
+
+        relevant.sort(key=lambda x: abs(x["volatility"] - current_volatility))
+        neighbors = relevant[:5]
+
+        excursions = [t["max_excursion_pct"] for t in neighbors if t["max_excursion_pct"] > 0]
+        drawdowns = [t["max_drawdown_pct"] for t in neighbors if t["max_drawdown_pct"] > 0]
+
+        opt_tp = np.mean(excursions) * 0.80 if len(excursions) > 0 else default_tp
+        opt_sl = np.mean(drawdowns) * 1.20 if len(drawdowns) > 0 else default_sl
+
+        if regime_type == "trend":
+            opt_tp = np.clip(opt_tp, 0.15, 2.0)
+            opt_sl = np.clip(opt_sl, 0.15, 1.5)
+        else:
+            opt_tp = np.clip(opt_tp, 0.10, 1.0)
+            opt_sl = np.clip(opt_sl, 0.10, 1.0)
+
+        return float(opt_tp), float(opt_sl)
+
+class RoughPathClassifier:
+    """
+    Rough Path Signatures (Kaba Patika İmzaları) + Pure NumPy Ridge Regression Classifier.
+    Fiyat patikasını saf NumPy ile 1., 2. ve 3. seviye imza özelliklerine (signatures) dönüştürür.
+    Herhangi bir dış kütüphane bağımlılığı olmadan (scikit-learn/lightgbm) rejim ve trend tahmin eder.
+    """
+    def __init__(self, window=14):
+        self.window = window
+        self.model = None
+
+    def _compute_signatures(self, prices):
+        """
+        Pure NumPy implementation of Path Signatures up to Level 3.
+        """
+        n = len(prices)
+        if n < self.window:
+            return np.zeros((n, 9))
+            
+        features = []
+        for i in range(n):
+            if i < self.window - 1:
+                features.append(np.zeros(9))
+                continue
+                
+            w = prices[i - self.window + 1 : i + 1]
+            w_mean = np.mean(w)
+            w_std = np.std(w)
+            if w_std < 1e-8:
+                w_std = 1e-8
+            path = (w - w_mean) / w_std
+            
+            dx = np.diff(path)
+            sig_l1 = float(np.sum(dx))
+            sig_l2_1 = 0.5 * (sig_l1 ** 2)
+            
+            dt = 1.0 / (self.window - 1)
+            t_grid = np.arange(self.window) * dt
+            
+            s_1_2 = float(np.sum(t_grid[1:] * dx))
+            s_2_1 = float(np.sum(path[1:] * dt))
+            area = s_1_2 - s_2_1
+            
+            qv = float(np.sum(dx ** 2))
+            cv = float(np.sum(dx ** 3))
+            sig_l3_2 = (sig_l1 ** 3) / 6.0
+            
+            len_path = float(np.sum(np.abs(dx)))
+            sign_changes = float(np.sum(np.diff(np.sign(dx)) != 0))
+            
+            features.append(np.array([
+                sig_l1,
+                sig_l2_1,
+                area,
+                qv,
+                cv,
+                sig_l3_2,
+                len_path,
+                sign_changes,
+                path[-1]
+            ]))
+            
+        return np.array(features)
+
+    def fit(self, df):
+        """
+        Train the classifier on the historical price dataframe using Ridge Regression.
+        """
+        closes = df['close'].values
+        n = len(closes)
+        if n < self.window + 20:
+            return
+            
+        X = self._compute_signatures(closes)
+        
+        y = np.zeros(n)
+        for i in range(n - 4):
+            ret = (closes[i+4] - closes[i]) / closes[i] * 100
+            if ret > 0.05:
+                y[i] = 1.0
+            elif ret < -0.05:
+                y[i] = -1.0
+            else:
+                y[i] = 0.0
+                
+        train_idx = np.arange(self.window, n - 4)
+        X_train = X[train_idx]
+        y_train = y[train_idx]
+        
+        # Add bias column
+        X_bias = np.column_stack([X_train, np.ones(len(X_train))])
+        
+        # Closed-form Ridge Regression: W = (X^T X + alpha * I)^-1 X^T Y
+        d = X_bias.shape[1]
+        alpha = 10.0
+        XTX = np.dot(X_bias.T, X_bias)
+        XTY = np.dot(X_bias.T, y_train)
+        
         try:
-            state = self.model.predict(features[-5:])[-1] if HAS_HMMLEARN else self.model.predict(features)
-            return state == self.ranging_state
-        except: return False
+            self.model = np.linalg.solve(XTX + alpha * np.eye(d), XTY)
+            log.info("RoughPathClassifier successfully trained using pure NumPy Ridge Regression.")
+        except Exception as e:
+            self.model = None
+            log.error(f"RoughPathClassifier training failed: {e}")
+
+    def predict(self, prices):
+        """
+        Predict the regime for the last window.
+        """
+        if self.model is None:
+            return 0
+        if len(prices) < self.window:
+            return 0
+            
+        feats = self._compute_signatures(prices)[-1]
+        feats_bias = np.append(feats, 1.0)
+        pred_val = float(np.dot(feats_bias, self.model))
+        
+        if pred_val > 0.35:
+            return 1
+        elif pred_val < -0.35:
+            return -1
+        return 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V3.6 — LEARNED GEOMETRY CORE ("nihai mimari")
+#
+# OHLCV + Order Flow ──► Volatility Normalization ──► Multi-resolution Paths
+# (5/15/30/60, dyadic tree) ──► Rough Path Signatures (Chen: fine → coarse)
+#   │◄┄ δ̂ diagnostic (first window only, intra-resolution quadruples,
+#   │   scale-normalized) → κ_init + factor budget
+#   ▼
+# Shared Encoder — LEARNED GEOMETRY  M = H^a(κ) [× S^b × E^c],  κ ≤ κ_max < 0
+#   r_prior ← e_res (deterministic, low capacity) · u ← content (unit tangent)
+#   δ_i ← content (L1 + soft-threshold, sparse)
+#   ▼
+# Bundle state Z(t) ──► Innovations (fold-local μ/σ) ──► Episode segmentation
+# (δ≠0 runs, hysteresis) ──► Anomaly clustering ──► Normal-centric transition
+# graph ──► Gradient boosting ──► Meta labeling ──► Conformal gate
+# A = α·A_pred + β·A_geom(panel) ──► Purged Walk-Forward (warm start +
+# neighbour-fold RKD, geometry schema fixed) ──► Backtest
+#
+# Off-flow measurement standard: ANCHOR PANEL (core append-only ledger frozen
+# at signature level + adaptive rolling buffer) feeding RKD targets, δ̂ health,
+# D_anchor log, A_geom and κ_init.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GEOM_RESOLUTIONS = (5, 15, 30, 60)     # bars per window, fine → coarse (dyadic tree 5→15→30→60)
+GEOM_PATH_DIM = 3                      # (t, vol-normalized log price, normalized signed flow)
+GEOM_SIG_DIM = GEOM_PATH_DIM + GEOM_PATH_DIM**2 + GEOM_PATH_DIM**3   # levels 1..3 = 39
+GEOM_HORIZON = 4                       # label horizon in bars (matches legacy classifiers)
+GEOMETRY_STORE_PATH = Path(__file__).parent / "geometry_store.json"
+
+
+def _softplus(x):
+    return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
+
+def _inv_softplus(y):
+    y = np.maximum(y, 1e-6)
+    return np.where(y > 30.0, y, np.log(np.expm1(np.minimum(y, 30.0))))
+
+def _soft_threshold(x, tau):
+    """Proximal operator of tau·|x| — produces exact zeros so P(δ≠0) stays well defined."""
+    return np.sign(x) * np.maximum(np.abs(x) - tau, 0.0)
+
+
+class ChenSignature:
+    """
+    Level-1..3 path signatures of a d-dimensional piecewise-linear path, with
+    Chen's identity used to combine fine blocks into coarse windows
+    ("Chen: ince → kaba birleşim"). All tensors are kept explicitly:
+    S1 (d,), S2 (d,d), S3 (d,d,d).
+    """
+
+    @staticmethod
+    def segment(v):
+        """Signature of a single linear segment with increment vector v."""
+        S1 = v
+        S2 = np.outer(v, v) / 2.0
+        S3 = np.einsum('i,j,k->ijk', v, v, v) / 6.0
+        return (S1, S2, S3)
+
+    @staticmethod
+    def combine(A, B):
+        """Chen identity: Sig(x*y) = Sig(x) ⊗ Sig(y), truncated at level 3."""
+        A1, A2, A3 = A
+        B1, B2, B3 = B
+        C1 = A1 + B1
+        C2 = A2 + B2 + np.outer(A1, B1)
+        C3 = (A3 + B3
+              + np.einsum('i,jk->ijk', A1, B2)
+              + np.einsum('ij,k->ijk', A2, B1))
+        return (C1, C2, C3)
+
+    @staticmethod
+    def of_increments(dX):
+        """Signature of a path given its per-step increments dX (n_steps, d)."""
+        d = dX.shape[1]
+        sig = (np.zeros(d), np.zeros((d, d)), np.zeros((d, d, d)))
+        for k in range(dX.shape[0]):
+            sig = ChenSignature.combine(sig, ChenSignature.segment(dX[k]))
+        return sig
+
+    @staticmethod
+    def flatten(sig):
+        S1, S2, S3 = sig
+        return np.concatenate([S1.ravel(), S2.ravel(), S3.ravel()])
+
+
+class VolatilityNormalizer:
+    """
+    Volatility Normalization stage. Log returns are divided by an EWMA realized
+    volatility and bar-level signed flow (order-flow proxy: sign(close-open)·volume)
+    is divided by its own EWMA scale, so every resolution sees O(1) increments.
+    Also produces the model-free strata used by the anchor panel
+    (RV quantile, jump flag, volume quantile, hour bucket).
+    """
+
+    def __init__(self, span=64, eps=1e-10):
+        self.span = span
+        self.eps = eps
+
+    @staticmethod
+    def _ewma_std(x, span):
+        alpha = 2.0 / (span + 1.0)
+        var = np.zeros(len(x))
+        m = 0.0
+        v = np.mean(x[:8] ** 2) if len(x) >= 8 else (x[0] ** 2 if len(x) else 1.0)
+        for i in range(len(x)):
+            m = (1 - alpha) * m + alpha * x[i]
+            v = (1 - alpha) * v + alpha * (x[i] - m) ** 2
+            var[i] = v
+        return np.sqrt(np.maximum(var, 1e-18))
+
+    def transform(self, df):
+        c = df['close'].values.astype(float)
+        o = df['open'].values.astype(float)
+        v = df['volume'].values.astype(float)
+        n = len(c)
+        log_ret = np.zeros(n)
+        log_ret[1:] = np.diff(np.log(np.maximum(c, self.eps)))
+
+        rv = self._ewma_std(log_ret, self.span)
+        rv = np.maximum(rv, self.eps)
+        norm_ret = np.clip(log_ret / rv, -8.0, 8.0)
+
+        flow = np.sign(c - o) * v
+        fs = self._ewma_std(flow, self.span)
+        norm_flow = np.clip(flow / np.maximum(fs, self.eps), -8.0, 8.0)
+
+        # increments of the 3-d path: (dt=1 bar, normalized log return, normalized flow).
+        # dt is a constant 1 bar at every resolution so Chen combination stays exact;
+        # per-resolution scale differences are absorbed by fold-local standardization.
+        increments = np.column_stack([np.ones(n), norm_ret, norm_flow])
+        increments[0, 1] = 0.0
+
+        log_rv = np.log(rv)
+        jump = np.abs(norm_ret) > 4.0
+
+        # model-free strata (per bar) for the anchor panel
+        def _quantile_bucket(x, qs=(0.33, 0.66)):
+            lo, hi = np.quantile(x, qs[0]), np.quantile(x, qs[1])
+            return (x > lo).astype(int) + (x > hi).astype(int)
+
+        rv_q = _quantile_bucket(rv)
+        vol_q = _quantile_bucket(v)
+        if 'timestamp' in df.columns:
+            hours = pd.to_datetime(df['timestamp']).dt.hour.values
+        else:
+            hours = np.zeros(n, dtype=int)
+        hour_b = (hours // 6).astype(int)  # 4 buckets of 6h
+
+        return {
+            "increments": increments,
+            "norm_ret": norm_ret,
+            "rv": rv,
+            "log_rv": log_rv,
+            "jump": jump,
+            "strata": np.column_stack([rv_q, jump.astype(int), vol_q, hour_b]),
+        }
+
+
+class MultiResolutionSignatures:
+    """
+    Multi-resolution Paths (5/15/30/60 — dyadic tree) → Rough Path Signatures.
+    Signatures of end-aligned windows are produced for every bar t ≥ 60 at each
+    resolution. Fine 5-bar block signatures are computed once and coarser
+    resolutions are assembled from them via Chen's identity (15 = 3×5,
+    30 = 2×15, 60 = 2×30), so the fine → coarse combination is exact.
+    """
+
+    def __init__(self, resolutions=GEOM_RESOLUTIONS):
+        self.resolutions = tuple(resolutions)
+        self.warmup = max(self.resolutions)
+
+    def compute(self, increments):
+        n = increments.shape[0]
+        res_feats = {r: np.zeros((n, GEOM_SIG_DIM)) for r in self.resolutions}
+        valid = np.zeros(n, dtype=bool)
+        if n <= self.warmup:
+            return res_feats, valid
+
+        # 5-bar block signature ending at t (bars t-4..t), for every t ≥ 4
+        base = self.resolutions[0]
+        block = {}
+        for t in range(base - 1, n):
+            block[t] = ChenSignature.of_increments(increments[t - base + 1:t + 1])
+
+        for t in range(self.warmup, n):
+            # end-aligned block chain: twelve 5-bar blocks cover the last 60 bars
+            ends = [t - base * k for k in range(11, -1, -1)]  # oldest → newest
+            sigs = [block[e] for e in ends]
+
+            def chain(blocks):
+                s = blocks[0]
+                for b in blocks[1:]:
+                    s = ChenSignature.combine(s, b)
+                return s
+
+            res_feats[5][t] = ChenSignature.flatten(sigs[-1])
+            res_feats[15][t] = ChenSignature.flatten(chain(sigs[-3:]))
+            res_feats[30][t] = ChenSignature.flatten(chain(sigs[-6:]))
+            res_feats[60][t] = ChenSignature.flatten(chain(sigs[-12:]))
+            valid[t] = True
+        return res_feats, valid
+
+
+class DeltaHatDiagnostic:
+    """
+    δ̂ diagnostic — Gromov four-point hyperbolicity on sampled intra-resolution
+    quadruples, scale-normalized by the diameter. Runs on the FIRST window only
+    and yields κ_init plus the factor budget (how many dimensions H gets; S only
+    if the periodicity test passes, E only if δ̂ is weak).
+    """
+
+    KAPPA_ABS_MIN = 0.10   # κ_max = -0.10 < 0 (hard bound, "κ ≤ κ_max < 0")
+    KAPPA_ABS_MAX = 4.00
+
+    def __init__(self, n_quadruples=1500, seed=42):
+        self.n_quadruples = n_quadruples
+        self.seed = seed
+
+    def measure(self, feats):
+        """feats: (n, F) signature features of ONE resolution. Returns scale-normalized δ̂_rel."""
+        n = len(feats)
+        if n < 16:
+            return 0.35
+        rng = np.random.default_rng(self.seed)
+        m = min(n, 220)
+        idx = rng.choice(n, size=m, replace=False)
+        P = feats[idx]
+        D = np.sqrt(np.maximum(
+            np.sum(P ** 2, axis=1)[:, None] + np.sum(P ** 2, axis=1)[None, :] - 2.0 * (P @ P.T), 0.0))
+        diam = float(np.max(D))
+        if diam <= 1e-12:
+            return 0.35
+        deltas = np.empty(self.n_quadruples)
+        quad = rng.integers(0, m, size=(self.n_quadruples, 4))
+        for q in range(self.n_quadruples):
+            x, y, z, w = quad[q]
+            s1 = D[x, y] + D[z, w]
+            s2 = D[x, z] + D[y, w]
+            s3 = D[x, w] + D[y, z]
+            a, b, _ = sorted((s1, s2, s3), reverse=True)
+            deltas[q] = (a - b) / 2.0
+        # p90 of the four-point defect, normalized by diameter (robust version of max-δ)
+        delta_rel = float(2.0 * np.quantile(deltas, 0.90) / diam)
+        return max(delta_rel, 1e-4)
+
+    def kappa_from_delta(self, delta_rel):
+        """Khrulkov-style mapping c = (0.144/δ_rel)², bounded to [κ_min, κ_max]."""
+        c = (0.144 / max(delta_rel, 1e-3)) ** 2
+        c = float(np.clip(c, self.KAPPA_ABS_MIN, self.KAPPA_ABS_MAX))
+        return -c
+
+    @staticmethod
+    def periodicity_test(norm_ret, min_period=8, max_period=96, power_ratio=6.0):
+        """S factor admission: dominant FFT peak must clearly beat the median power."""
+        x = norm_ret[-1024:] if len(norm_ret) > 1024 else norm_ret
+        x = x - np.mean(x)
+        if len(x) < 4 * min_period:
+            return False, 0.0, 0
+        spec = np.abs(np.fft.rfft(x)) ** 2
+        freqs = np.fft.rfftfreq(len(x), d=1.0)
+        periods = np.divide(1.0, freqs, out=np.full_like(freqs, np.inf), where=freqs > 0)
+        band = (periods >= min_period) & (periods <= max_period)
+        if not np.any(band):
+            return False, 0.0, 0
+        med = float(np.median(spec[1:])) + 1e-12
+        peak_i = np.argmax(spec * band)
+        ratio = float(spec[peak_i] / med)
+        return ratio >= power_ratio, ratio, int(round(periods[peak_i]))
+
+    def build_schema(self, res_feats, valid, norm_ret, timeframe, version=1):
+        """First-window protocol: sign from theory (dyadic tree → κ<0), magnitude from δ̂,
+        factor budget frozen here. Adding/removing S/E later is a schema change and is
+        only allowed at a fold boundary, with a version bump."""
+        delta_hat = {}
+        vidx = np.where(valid)[0]
+        for r in GEOM_RESOLUTIONS:
+            delta_hat[r] = self.measure(res_feats[r][vidx])
+        # magnitude from the finest structurally meaningful level (median across resolutions)
+        delta_med = float(np.median(list(delta_hat.values())))
+        kappa_init = self.kappa_from_delta(delta_med)
+        s_ok, s_ratio, s_period = self.periodicity_test(norm_ret)
+        e_ok = delta_med > 0.30   # δ̂ weak → data not strongly hyperbolic → grant E dims
+        budget = {
+            "a": 6,
+            "b": 2 if s_ok else 0,
+            "c": 2 if e_ok else 0,
+            "S_active": bool(s_ok),
+            "E_active": bool(e_ok),
+            "S_period": int(s_period),
+            "S_ratio": float(s_ratio),
+        }
+        return GeometrySchema(
+            version=version,
+            timeframe=timeframe,
+            resolutions=list(GEOM_RESOLUTIONS),
+            kappa_init=kappa_init,
+            kappa_max=-self.KAPPA_ABS_MIN,
+            delta_hat={str(k): float(vv) for k, vv in delta_hat.items()},
+            budget=budget,
+        )
+
+
+class GeometrySchema:
+    """
+    Geometry protocol contract: the schema (κ sign+init, factor budget, resolutions)
+    is fixed in the first window. S/E membership changes are schema changes —
+    allowed only at fold boundaries and always versioned.
+    """
+
+    def __init__(self, version, timeframe, resolutions, kappa_init, kappa_max, delta_hat, budget):
+        self.version = int(version)
+        self.timeframe = timeframe
+        self.resolutions = list(resolutions)
+        self.kappa_init = float(kappa_init)
+        self.kappa_max = float(kappa_max)
+        self.delta_hat = dict(delta_hat)
+        self.budget = dict(budget)
+
+    def label(self):
+        s = f"H^{self.budget['a']}(κ̂={self.kappa_init:.2f})"
+        if self.budget.get("S_active"):
+            s += f"×S^{self.budget['b']}"
+        if self.budget.get("E_active"):
+            s += f"×E^{self.budget['c']}"
+        return s + f" v{self.version}"
+
+    def to_dict(self):
+        return {
+            "version": self.version, "timeframe": self.timeframe,
+            "resolutions": self.resolutions, "kappa_init": self.kappa_init,
+            "kappa_max": self.kappa_max, "delta_hat": self.delta_hat,
+            "budget": self.budget,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        return GeometrySchema(
+            d.get("version", 1), d.get("timeframe", "1m"), d.get("resolutions", list(GEOM_RESOLUTIONS)),
+            d.get("kappa_init", -0.5), d.get("kappa_max", -0.1),
+            d.get("delta_hat", {}), d.get("budget", {"a": 6, "b": 0, "c": 0}))
+
+    @staticmethod
+    def load_store():
+        try:
+            if GEOMETRY_STORE_PATH.exists():
+                import json
+                with open(GEOMETRY_STORE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            log.error(f"Geometry store load error: {e}")
+        return {"schemas": {}}
+
+    def persist(self):
+        """Versioned, append-style persistence keyed by timeframe."""
+        try:
+            import json
+            store = GeometrySchema.load_store()
+            entry = self.to_dict()
+            entry["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            hist = store["schemas"].setdefault(self.timeframe, [])
+            if not hist or hist[-1].get("version") != self.version:
+                hist.append(entry)
+            else:
+                hist[-1] = entry
+            with open(GEOMETRY_STORE_PATH, "w", encoding="utf-8") as f:
+                json.dump(store, f, indent=2)
+        except Exception as e:
+            log.error(f"Geometry store persist error: {e}")
+
+
+class LearnedGeometryEncoder:
+    """
+    Shared encoder onto the learned-geometry manifold M = H^a(κ) [× S^b × E^c].
+
+    Head contract (per sample):
+      r_prior ← e_res   deterministic, low capacity: one softplus scalar per resolution
+      u       ← content unit vector in the tangent space at the origin
+      δ_i     ← content sparse radial correction (L1 objective + soft-threshold forward,
+                so the proximal step keeps P(δ≠0) well defined)
+      z = exp_0^κ((r_prior + δ)·u) — represented in geodesic polar form (r, u);
+      distances use the hyperbolic law of cosines with curvature κ.
+
+    κ is learnable but bounded: κ = -(c_min + (c_max-c_min)·σ(ξ)) ≤ κ_max < 0, with
+    the fine-tuning done by a clipped ("bounded gradient") update. The speed
+    coefficient is named η — κ is reserved for curvature.
+
+    Training loss (training only):
+      Recon (FiLM decoder x̂ = W_dec·(γ(r)⊙h + β·r), γ(r) = 1 + softplus(g)·r monotone)
+      + λ₁‖δ‖₁ + λ_c·max(0, cone_violation − m)
+      + λ_t·Σ_i w_{i,t}·(d(z_t, z_{t−1}) − η·s_{i,t})²,  w from per-resolution
+      standardized log-RV. Optional RKD term against a teacher's panel relations.
+    """
+
+    R_FLOOR = 0.05
+    R_CAP = 3.5
+
+    def __init__(self, in_dim, schema, hidden=24, seed=42):
+        self.in_dim = in_dim
+        self.schema = schema
+        self.hidden = hidden
+        self.a = int(schema.budget.get("a", 6))
+        rng = np.random.default_rng(seed)
+        s1 = 1.0 / math.sqrt(in_dim)
+        s2 = 1.0 / math.sqrt(hidden)
+        self.params = {
+            "W1": rng.normal(0, s1, (hidden, in_dim)),
+            "b1": np.zeros(hidden),
+            "Wu": rng.normal(0, s2, (self.a, hidden)),
+            "wd": rng.normal(0, s2, hidden),
+            "bd": np.array(0.0),
+            "rho": _inv_softplus(np.array([1.20, 0.90, 0.60, 0.35])),  # fine→coarse prior radii
+            "g": np.full(hidden, -1.0),      # γ slope ≥ 0 via softplus → γ monotone in r
+            "beta": np.zeros(hidden),
+            "Wdec": rng.normal(0, s2, (in_dim, hidden)),
+            "bdec": np.zeros(in_dim),
+        }
+        # curvature: c = |κ| bounded in [c_min, c_max] ⇒ κ ≤ -c_min < 0 always
+        self.c_min = DeltaHatDiagnostic.KAPPA_ABS_MIN
+        self.c_max = DeltaHatDiagnostic.KAPPA_ABS_MAX
+        c0 = float(np.clip(-schema.kappa_init, self.c_min + 1e-3, self.c_max - 1e-3))
+        frac = (c0 - self.c_min) / (self.c_max - self.c_min)
+        self.xi = float(np.log(frac / (1.0 - frac)))
+        self.eta = 1.0                     # speed coefficient (renamed from κ to avoid collision)
+        self.tau = 0.20                    # soft-threshold of the δ head
+        # λ's are fold-local (adjusted by the fold protocol between folds)
+        self.lambdas = {"l1": 0.05, "cone": 0.5, "speed": 0.20, "rkd": 1.0}
+        self.cone_cos_min = math.cos(math.radians(75.0))
+        self.cone_margin = 0.05
+        self.cone_r_margin = 0.02
+        self._adam = {k: [np.zeros_like(np.asarray(v, dtype=float)),
+                          np.zeros_like(np.asarray(v, dtype=float))] for k, v in self.params.items()}
+        self._adam_t = 0
+        self.train_history = []
+        self.E_proj = None                 # closed-form linear (ridge) readout for the E factor
+
+    # ── basic pieces ───────────────────────────────────────────────────────────
+    @property
+    def curvature_c(self):
+        return self.c_min + (self.c_max - self.c_min) * _sigmoid(np.array(self.xi)).item()
+
+    @property
+    def kappa(self):
+        return -self.curvature_c
+
+    def r_prior(self):
+        return _softplus(self.params["rho"])
+
+    def forward(self, X, ridx):
+        """X: (B,F) signature features (standardized), ridx: (B,) resolution index 0..3."""
+        p = self.params
+        H1 = X @ p["W1"].T + p["b1"]
+        h = np.tanh(H1)
+        U0 = h @ p["Wu"].T
+        nu = np.linalg.norm(U0, axis=1) + 1e-9
+        u = U0 / nu[:, None]
+        draw = h @ p["wd"] + p["bd"]
+        delta = _soft_threshold(draw, self.tau)
+        rp = self.r_prior()[ridx]
+        r0 = rp + delta
+        r = np.clip(r0, self.R_FLOOR, self.R_CAP)
+        sp_g = _softplus(p["g"])
+        gam = 1.0 + sp_g[None, :] * r[:, None]
+        film = gam * h + p["beta"][None, :] * r[:, None]
+        Xh = film @ p["Wdec"].T + p["bdec"]
+        return {"X": X, "ridx": ridx, "H1": H1, "h": h, "U0": U0, "nu": nu, "u": u,
+                "draw": draw, "delta": delta, "rp": rp, "r0": r0, "r": r,
+                "sp_g": sp_g, "gam": gam, "film": film, "Xh": Xh}
+
+    # hyperbolic distance in geodesic polar form (law of cosines), curvature -c
+    @staticmethod
+    def _hyp_dist(r1, r2, cosang, c):
+        s = math.sqrt(c)
+        A = np.cosh(s * r1) * np.cosh(s * r2) - np.sinh(s * r1) * np.sinh(s * r2) * cosang
+        A = np.maximum(A, 1.0 + 1e-12)
+        return np.arccosh(A) / s, A
+
+    @staticmethod
+    def _hyp_dist_grads(r1, r2, cosang, c, A):
+        """Returns dd/dr1, dd/dr2, dd/dcosang for d = arccosh(A)/√c."""
+        s = math.sqrt(c)
+        dA = 1.0 / (s * np.sqrt(np.maximum(A * A - 1.0, 1e-12)))
+        dA_dr1 = s * (np.sinh(s * r1) * np.cosh(s * r2) - np.cosh(s * r1) * np.sinh(s * r2) * cosang)
+        dA_dr2 = s * (np.cosh(s * r1) * np.sinh(s * r2) - np.sinh(s * r1) * np.cosh(s * r2) * cosang)
+        dA_dcos = -np.sinh(s * r1) * np.sinh(s * r2)
+        return dA * dA_dr1, dA * dA_dr2, dA * dA_dcos
+
+    # ── loss + hand-derived gradients ─────────────────────────────────────────
+    def _loss_and_grads(self, X, ridx, tgrid, speed, w_speed, rkd=None):
+        """
+        X (B,F) stacked per-resolution blocks; ridx (B,); tgrid (B,) time index of each
+        row (rows of one resolution are consecutive in time); speed (B,) s_{i,t};
+        w_speed (B,) weights from per-resolution standardized log-RV.
+        rkd: optional dict {"Xp","ridxp","Dt","Ct"} — teacher relations on the anchor panel.
+        """
+        p = self.params
+        lam = self.lambdas
+        fw = self.forward(X, ridx)
+        B = X.shape[0]
+        c = self.curvature_c
+        grads = {k: np.zeros_like(np.asarray(v, dtype=float)) for k, v in p.items()}
+
+        # accumulators flowing back into shared quantities
+        dh = np.zeros_like(fw["h"])
+        du = np.zeros_like(fw["u"])
+        dr = np.zeros(B)
+
+        # 1) reconstruction (FiLM decoder)
+        diff = fw["Xh"] - X
+        L_rec = float(np.mean(diff ** 2))
+        dXh = 2.0 * diff / diff.size
+        grads["Wdec"] += dXh.T @ fw["film"]
+        grads["bdec"] += dXh.sum(0)
+        dfilm = dXh @ p["Wdec"]
+        dgam = dfilm * fw["h"]
+        dh += dfilm * fw["gam"]
+        grads["g"] += (dgam * fw["r"][:, None]).sum(0) * _sigmoid(p["g"])
+        grads["beta"] += (dfilm * fw["r"][:, None]).sum(0)
+        dr += (dgam * fw["sp_g"][None, :]).sum(1) + (dfilm * p["beta"][None, :]).sum(1)
+
+        # 2) sparsity: λ₁‖δ‖₁ (exact subgradient off the soft-threshold kink)
+        L_l1 = lam["l1"] * float(np.mean(np.abs(fw["delta"])))
+        ddelta = lam["l1"] * np.sign(fw["delta"]) / B
+
+        # 3) cone constraint between adjacent resolutions at the same timestamp
+        L_cone = 0.0
+        n_res = len(GEOM_RESOLUTIONS)
+        T = B // n_res
+        if T > 0 and lam["cone"] > 0:
+            for i in range(n_res - 1):          # child (finer) i vs parent (coarser) i+1
+                ci = slice(i * T, (i + 1) * T)
+                pi = slice((i + 1) * T, (i + 2) * T)
+                cosang = np.sum(fw["u"][ci] * fw["u"][pi], axis=1)
+                ang_slack = self.cone_cos_min - cosang
+                rad_slack = fw["r"][pi] - fw["r"][ci] + self.cone_r_margin
+                viol = np.maximum(ang_slack, 0.0) + np.maximum(rad_slack, 0.0)
+                active = viol > self.cone_margin
+                L_cone += lam["cone"] * float(np.mean(np.maximum(viol - self.cone_margin, 0.0))) / (n_res - 1)
+                if np.any(active):
+                    scale = lam["cone"] / (T * (n_res - 1))
+                    m_ang = active & (ang_slack > 0)
+                    m_rad = active & (rad_slack > 0)
+                    du[ci][m_ang] -= scale * fw["u"][pi][m_ang]
+                    du[pi][m_ang] -= scale * fw["u"][ci][m_ang]
+                    dr_c = np.zeros(T); dr_p = np.zeros(T)
+                    dr_c[m_rad] -= scale
+                    dr_p[m_rad] += scale
+                    dr[ci] += dr_c
+                    dr[pi] += dr_p
+
+        # 4) speed consistency: λ_t·w·(d(z_t,z_{t−1}) − η·s)²
+        L_speed = 0.0
+        if lam["speed"] > 0 and T > 1:
+            for i in range(n_res):
+                blk = slice(i * T, (i + 1) * T)
+                rb, ub = fw["r"][blk], fw["u"][blk]
+                sb, wb = speed[blk], w_speed[blk]
+                cosang = np.sum(ub[1:] * ub[:-1], axis=1)
+                d, A = self._hyp_dist(rb[1:], rb[:-1], cosang, c)
+                resid = d - self.eta * sb[1:]
+                L_speed += lam["speed"] * float(np.mean(wb[1:] * resid ** 2)) / n_res
+                dd = lam["speed"] * 2.0 * wb[1:] * resid / (n_res * (T - 1))
+                g1, g2, gcos = self._hyp_dist_grads(rb[1:], rb[:-1], cosang, c, A)
+                drb = np.zeros(T); dub = np.zeros_like(ub)
+                drb[1:] += dd * g1
+                drb[:-1] += dd * g2
+                dub[1:] += (dd * gcos)[:, None] * ub[:-1]
+                dub[:-1] += (dd * gcos)[:, None] * ub[1:]
+                dr[blk] += drb
+                du[blk] += dub
+
+        # 5) RKD against the teacher's panel relations (fold protocol)
+        L_rkd = 0.0
+        if rkd is not None and lam["rkd"] > 0:
+            fwp = self.forward(rkd["Xp"], rkd["ridxp"])
+            P = rkd["Xp"].shape[0]
+            rp_, up_ = fwp["r"], fwp["u"]
+            cosM = np.clip(up_ @ up_.T, -1.0, 1.0)
+            Rm = np.tile(rp_[:, None], (1, P))
+            D, A = self._hyp_dist(Rm, Rm.T, cosM, c)
+            np.fill_diagonal(D, 0.0)
+            off = ~np.eye(P, dtype=bool)
+            mD = float(np.mean(D[off])) + 1e-9
+            Dn = D / mD
+            dDn = 2.0 * (Dn - rkd["Dt"]) / D.size
+            L_rkd += lam["rkd"] * float(np.mean((Dn - rkd["Dt"]) ** 2))
+            # d/dD of (D/mD): direct term + mean term
+            dD = dDn / mD - (np.sum(dDn * D) / (mD * mD)) * (off.astype(float) / off.sum())
+            dD *= lam["rkd"]
+            g1, g2, gcos = self._hyp_dist_grads(Rm, Rm.T, cosM, c, A)
+            np.fill_diagonal(g1, 0.0); np.fill_diagonal(g2, 0.0); np.fill_diagonal(gcos, 0.0)
+            drp = (dD * g1).sum(1) + (dD * g2).sum(0)
+            dcosM = dD * gcos
+            # angle relations
+            dCs = lam["rkd"] * 2.0 * (cosM - rkd["Ct"]) / cosM.size
+            np.fill_diagonal(dCs, 0.0)
+            L_rkd += lam["rkd"] * float(np.mean((cosM - rkd["Ct"]) ** 2))
+            dcosM += dCs
+            dup = (dcosM + dcosM.T) @ up_
+            # backprop through the panel forward pass into shared params
+            self._backprop_heads(fwp, rkd["Xp"], dup, drp, np.zeros(P), grads)
+
+        # ── shared backprop for the main batch ────────────────────────────────
+        self._backprop_heads(fw, X, du, dr, ddelta, grads)
+
+        total = L_rec + L_l1 + L_cone + L_speed + L_rkd
+        parts = {"rec": L_rec, "l1": L_l1, "cone": L_cone, "speed": L_speed, "rkd": L_rkd}
+        # dh from recon path was accumulated locally; merge it here
+        self._backprop_trunk(fw, X, dh, grads)
+        return total, parts, grads, fw
+
+    def _backprop_heads(self, fw, X, du, dr, ddelta_extra, grads):
+        """Route du (through u-normalization), dr (through δ clip + rho) and δ-subgradients
+        back into head weights and the trunk."""
+        p = self.params
+        # u = U0/‖U0‖ backprop
+        dU0 = (du - fw["u"] * np.sum(du * fw["u"], axis=1, keepdims=True)) / fw["nu"][:, None]
+        grads["Wu"] += dU0.T @ fw["h"]
+        dh = dU0 @ p["Wu"]
+        # r = clip(rp + δ) backprop
+        mask_r = ((fw["r0"] > self.R_FLOOR) & (fw["r0"] < self.R_CAP)).astype(float)
+        dr0 = dr * mask_r
+        # rho (per-resolution deterministic prior)
+        sig_rho = _sigmoid(p["rho"])
+        for i in range(len(GEOM_RESOLUTIONS)):
+            m = fw["ridx"] == i
+            if np.any(m):
+                grads["rho"][i] += np.sum(dr0[m]) * sig_rho[i]
+        # δ head: soft-threshold derivative is 1 off the kink, 0 inside
+        ddelta = dr0 + ddelta_extra
+        st_mask = (np.abs(fw["draw"]) > self.tau).astype(float)
+        ddraw = ddelta * st_mask
+        grads["wd"] += fw["h"].T @ ddraw
+        grads["bd"] = grads["bd"] + np.sum(ddraw)
+        dh += ddraw[:, None] * p["wd"][None, :]
+        self._backprop_trunk(fw, X, dh, grads)
+
+    def _backprop_trunk(self, fw, X, dh, grads):
+        dH1 = dh * (1.0 - fw["h"] ** 2)
+        grads["W1"] += dH1.T @ X
+        grads["b1"] += dH1.sum(0)
+
+    # ── optimization ──────────────────────────────────────────────────────────
+    def _adam_step(self, grads, lr=3e-3, clip=5.0):
+        # bounded gradient contract: global norm clip before every update
+        gn = math.sqrt(sum(float(np.sum(np.asarray(g) ** 2)) for g in grads.values()))
+        scale = min(1.0, clip / (gn + 1e-12))
+        self._adam_t += 1
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for k, g in grads.items():
+            g = np.asarray(g, dtype=float) * scale
+            m, v = self._adam[k]
+            m[...] = b1 * m + (1 - b1) * g
+            v[...] = b2 * v + (1 - b2) * g * g
+            mh = m / (1 - b1 ** self._adam_t)
+            vh = v / (1 - b2 ** self._adam_t)
+            upd = lr * mh / (np.sqrt(vh) + eps)
+            self.params[k] = np.asarray(self.params[k], dtype=float) - upd
+
+    def _update_eta(self, X, ridx, speed, w_speed):
+        """Closed-form weighted LS for the speed coefficient η (kept strictly positive)."""
+        fw = self.forward(X, ridx)
+        c = self.curvature_c
+        n_res = len(GEOM_RESOLUTIONS)
+        T = X.shape[0] // n_res
+        num, den = 0.0, 0.0
+        for i in range(n_res):
+            blk = slice(i * T, (i + 1) * T)
+            rb, ub = fw["r"][blk], fw["u"][blk]
+            cosang = np.sum(ub[1:] * ub[:-1], axis=1)
+            d, _ = self._hyp_dist(rb[1:], rb[:-1], cosang, c)
+            sb, wb = speed[blk][1:], w_speed[blk][1:]
+            num += float(np.sum(wb * d * sb))
+            den += float(np.sum(wb * sb * sb))
+        if den > 1e-12:
+            self.eta = float(np.clip(num / den, 0.01, 10.0))
+
+    def _update_kappa(self, X, ridx, speed, w_speed, rkd, step_cap=0.25):
+        """κ fine-tuning by a clipped finite-difference step on the curvature-dependent
+        loss terms ("ince ayar sınırlı gradyandan")."""
+        def loss_at(xi_val):
+            old = self.xi
+            self.xi = xi_val
+            lam = self.lambdas
+            fw = self.forward(X, ridx)
+            c = self.curvature_c
+            n_res = len(GEOM_RESOLUTIONS)
+            T = X.shape[0] // n_res
+            L = 0.0
+            for i in range(n_res):
+                blk = slice(i * T, (i + 1) * T)
+                rb, ub = fw["r"][blk], fw["u"][blk]
+                cosang = np.sum(ub[1:] * ub[:-1], axis=1)
+                d, _ = self._hyp_dist(rb[1:], rb[:-1], cosang, c)
+                resid = d - self.eta * speed[blk][1:]
+                L += lam["speed"] * float(np.mean(w_speed[blk][1:] * resid ** 2)) / n_res
+            if rkd is not None:
+                fwp = self.forward(rkd["Xp"], rkd["ridxp"])
+                P = rkd["Xp"].shape[0]
+                cosM = np.clip(fwp["u"] @ fwp["u"].T, -1.0, 1.0)
+                Rm = np.tile(fwp["r"][:, None], (1, P))
+                D, _ = self._hyp_dist(Rm, Rm.T, cosM, c)
+                np.fill_diagonal(D, 0.0)
+                off = ~np.eye(P, dtype=bool)
+                Dn = D / (float(np.mean(D[off])) + 1e-9)
+                L += lam["rkd"] * float(np.mean((Dn - rkd["Dt"]) ** 2))
+            self.xi = old
+            return L
+        h = 0.10
+        gxi = (loss_at(self.xi + h) - loss_at(self.xi - h)) / (2 * h)
+        self.xi = float(self.xi - np.clip(0.5 * gxi / (abs(gxi) + 1e-9) * min(abs(gxi) * 20, step_cap),
+                                          -step_cap, step_cap))
+
+    def train(self, X, ridx, tgrid, speed, w_speed, epochs=60, lr=3e-3, rkd=None,
+              val_frac=0.15, log_prefix="ENC"):
+        """Full-batch Adam with chronological held-out tail for the recon diagnostic."""
+        n_res = len(GEOM_RESOLUTIONS)
+        T = X.shape[0] // n_res
+        T_tr = max(int(T * (1.0 - val_frac)), 8)
+        tr_rows = np.concatenate([np.arange(i * T, i * T + T_tr) for i in range(n_res)])
+        va_rows = np.concatenate([np.arange(i * T + T_tr, (i + 1) * T) for i in range(n_res)])
+        Xtr, rtr = X[tr_rows], ridx[tr_rows]
+        ttr, str_, wtr = tgrid[tr_rows], speed[tr_rows], w_speed[tr_rows]
+        for ep in range(epochs):
+            total, parts, grads, _ = self._loss_and_grads(Xtr, rtr, ttr, str_, wtr, rkd=rkd)
+            self._adam_step(grads, lr=lr)
+            if ep % 3 == 2:
+                self._update_eta(Xtr, rtr, str_, wtr)
+                self._update_kappa(Xtr, rtr, str_, wtr, rkd)
+            if ep == 0 or ep == epochs - 1 or ep % 10 == 9:
+                self.train_history.append({"epoch": ep, **{k: round(v, 6) for k, v in parts.items()}})
+        # closed-form ridge readout for the E factor (linear residual innovation)
+        fw = self.forward(X, ridx)
+        resid = X - fw["Xh"]
+        H = fw["h"]
+        A = H.T @ H + 1e-3 * np.eye(H.shape[1])
+        self.E_proj = np.linalg.solve(A, H.T @ resid)
+        # held-out recon diagnostic
+        if len(va_rows):
+            fwv = self.forward(X[va_rows], ridx[va_rows])
+            heldout = float(np.mean((fwv["Xh"] - X[va_rows]) ** 2))
+        else:
+            heldout = float("nan")
+        log.info(f"[{log_prefix}] trained {epochs} epochs | κ={self.kappa:.3f} η={self.eta:.3f} "
+                 f"| heldout_recon={heldout:.4f} | P(δ≠0)={float(np.mean(fw['delta'] != 0)):.3f}")
+        return heldout
+
+    # ── inference / diagnostics ───────────────────────────────────────────────
+    def embed(self, X, ridx):
+        fw = self.forward(X, ridx)
+        out = {"r": fw["r"], "u": fw["u"], "delta": fw["delta"], "h": fw["h"],
+               "recon_err": np.mean((fw["Xh"] - X) ** 2, axis=1)}
+        if self.E_proj is not None:
+            lin_res = (X - fw["Xh"]) - fw["h"] @ self.E_proj
+            out["e_resid"] = np.linalg.norm(lin_res, axis=1)
+        else:
+            out["e_resid"] = np.zeros(X.shape[0])
+        return out
+
+    def pair_dist(self, r1, u1, r2, u2):
+        cosang = np.clip(np.sum(u1 * u2, axis=-1), -1.0, 1.0)
+        d, _ = self._hyp_dist(r1, r2, cosang, self.curvature_c)
+        return d
+
+    def panel_relations(self, Xp, ridxp):
+        """Batch-normalized distance matrix + angle relations on the (frozen) panel —
+        the RKD target a student fold distills from ('öğretmen = yalnız önceki fold')."""
+        fw = self.forward(Xp, ridxp)
+        P = Xp.shape[0]
+        cosM = np.clip(fw["u"] @ fw["u"].T, -1.0, 1.0)
+        Rm = np.tile(fw["r"][:, None], (1, P))
+        D, _ = self._hyp_dist(Rm, Rm.T, cosM, self.curvature_c)
+        np.fill_diagonal(D, 0.0)
+        off = ~np.eye(P, dtype=bool)
+        Dn = D / (float(np.mean(D[off])) + 1e-9)
+        return {"Dt": Dn, "Ct": cosM}
+
+    def e_res_intervention(self, X, ridx):
+        """Mandatory dashboard: swap the e_res → r_prior mapping (roll resolution
+        assignment by one) and measure recon degradation. ≈0 means the radius prior
+        is unused; >0 means the geometry actually consumes e_res."""
+        base = float(np.mean((self.forward(X, ridx)["Xh"] - X) ** 2))
+        rolled = (ridx + 1) % len(GEOM_RESOLUTIONS)
+        pert = float(np.mean((self.forward(X, rolled)["Xh"] - X) ** 2))
+        return {"recon": base, "recon_intervened": pert,
+                "degradation": (pert - base) / (base + 1e-12)}
+
+    def r_eff(self):
+        """r_prior·√|κ| per resolution — is curvature actually used or do we live in
+        the flat region?"""
+        sq = math.sqrt(self.curvature_c)
+        return {str(r): float(v * sq) for r, v in zip(GEOM_RESOLUTIONS, self.r_prior())}
+
+
+class InnovationEngine:
+    """
+    Innovations (factor based), standardized with fold-local μ/σ.
+    The feature schema handed to the upper layers is one of the two permanent
+    contracts of the system — names are stable; S/E columns exist only if the
+    (frozen) geometry schema granted them a budget.
+      H:  δ_i, cone slack        [S: phase deviation]   [E: linear residual]
+      +   speed residual, r̃_i, θ levels, Δθ_ij
+    """
+
+    def __init__(self, schema):
+        self.schema = schema
+        names = []
+        for r in GEOM_RESOLUTIONS:
+            names += [f"delta_{r}", f"r_{r}", f"theta_{r}", f"speed_resid_{r}"]
+        for i in range(len(GEOM_RESOLUTIONS) - 1):
+            a, b = GEOM_RESOLUTIONS[i], GEOM_RESOLUTIONS[i + 1]
+            names += [f"dtheta_{a}_{b}", f"cone_ang_{a}_{b}", f"cone_rad_{a}_{b}"]
+        if schema.budget.get("S_active"):
+            names += [f"phase_dev_{r}" for r in GEOM_RESOLUTIONS]
+        if schema.budget.get("E_active"):
+            names += [f"e_resid_{r}" for r in GEOM_RESOLUTIONS]
+        self.names = names
+        self.mu = None
+        self.sigma = None
+        self.mean_dphase = 0.0
+
+    def _phase_series(self, norm_ret, period):
+        """S factor: phase of the dominant-frequency component over a trailing window."""
+        n = len(norm_ret)
+        period = max(int(period), 8)
+        win = min(4 * period, 256)
+        ph = np.zeros(n)
+        tt = np.arange(win)
+        co = np.cos(2 * np.pi * tt / period)
+        si = np.sin(2 * np.pi * tt / period)
+        for t in range(win, n):
+            seg = norm_ret[t - win:t]
+            ph[t] = math.atan2(float(seg @ si), float(seg @ co))
+        return ph
+
+    def compute_raw(self, encoder, embeds, speed, norm_ret):
+        """embeds: dict res → encoder embed dict over a common T grid."""
+        T = len(embeds[GEOM_RESOLUTIONS[0]]["r"])
+        cols = []
+        eta = encoder.eta
+        for r in GEOM_RESOLUTIONS:
+            e = embeds[r]
+            theta = np.arctan2(e["u"][:, 1], e["u"][:, 0])
+            d_step = np.zeros(T)
+            if T > 1:
+                d_step[1:] = encoder.pair_dist(e["r"][1:], e["u"][1:], e["r"][:-1], e["u"][:-1])
+            speed_resid = d_step - eta * speed
+            cols += [e["delta"], e["r"], theta, speed_resid]
+        for i in range(len(GEOM_RESOLUTIONS) - 1):
+            ec = embeds[GEOM_RESOLUTIONS[i]]
+            ep = embeds[GEOM_RESOLUTIONS[i + 1]]
+            cosang = np.clip(np.sum(ec["u"] * ep["u"], axis=1), -1.0, 1.0)
+            dtheta = np.arccos(cosang)
+            cone_ang = encoder.cone_cos_min - cosang           # >0 → outside the cone
+            cone_rad = ep["r"] - ec["r"] + encoder.cone_r_margin
+            cols += [dtheta, cone_ang, cone_rad]
+        if self.schema.budget.get("S_active"):
+            period = self.schema.budget.get("S_period", 24) or 24
+            ph = self._phase_series(norm_ret, period)[-T:]
+            dph = np.zeros(T)
+            dph[1:] = np.angle(np.exp(1j * np.diff(ph)))
+            phase_dev = dph - self.mean_dphase
+            for r in GEOM_RESOLUTIONS:
+                cols.append(phase_dev)   # shared data-side phase, per-res slot kept for schema stability
+        if self.schema.budget.get("E_active"):
+            for r in GEOM_RESOLUTIONS:
+                cols.append(embeds[r]["e_resid"])
+        return np.column_stack(cols)
+
+    def fit_norm(self, X_raw):
+        """fold-local μ, σ."""
+        self.mu = np.mean(X_raw, axis=0)
+        self.sigma = np.std(X_raw, axis=0) + 1e-9
+
+    def transform(self, X_raw):
+        return (X_raw - self.mu) / self.sigma
+
+    def group_masks(self):
+        """Feature-stability ablation groups: 'levels' vs 'deviations'."""
+        levels = np.array([n.startswith(("r_", "theta_", "dtheta_")) for n in self.names])
+        return {"levels": levels, "deviations": ~levels}
+
+
+class EpisodeSegmenter:
+    """Episode segmentation from δ≠0 runs with hysteresis: ON after `on_bars`
+    consecutive bars with ≥ `min_active` active δ's, OFF after `off_bars` clean bars."""
+
+    def __init__(self, min_active=2, on_bars=2, off_bars=3):
+        self.min_active = min_active
+        self.on_bars = on_bars
+        self.off_bars = off_bars
+        self.reset()
+
+    def reset(self):
+        self._on_run = 0
+        self._off_run = 0
+        self.active = False
+        self._cur_start = -1
+
+    def step(self, t, n_active):
+        """Returns (episode_active, closed_episode_span or None)."""
+        closed = None
+        if n_active >= self.min_active:
+            self._on_run += 1
+            self._off_run = 0
+        else:
+            self._off_run += 1
+            self._on_run = 0
+        if not self.active and self._on_run >= self.on_bars:
+            self.active = True
+            self._cur_start = t - self.on_bars + 1
+        elif self.active and self._off_run >= self.off_bars:
+            self.active = False
+            closed = (self._cur_start, t - self.off_bars)
+            self._cur_start = -1
+        return self.active, closed
+
+    def segment(self, active_counts):
+        """Batch mode over an array of per-bar active-δ counts."""
+        self.reset()
+        flags = np.zeros(len(active_counts), dtype=bool)
+        episodes = []
+        for t, k in enumerate(active_counts):
+            on, closed = self.step(t, int(k))
+            flags[t] = on
+            if closed is not None:
+                episodes.append(closed)
+        if self.active and self._cur_start >= 0:
+            episodes.append((self._cur_start, len(active_counts) - 1))
+        return flags, episodes
+
+
+class AnomalyClusterer:
+    """K-means (pure NumPy) over episode summary vectors."""
+
+    SUMMARY_DIM = 6
+
+    def __init__(self, k=3, seed=42):
+        self.k = k
+        self.seed = seed
+        self.centroids = None
+        self.mu = None
+        self.sigma = None
+
+    @staticmethod
+    def summarize(span, deltas_abs_sum, cone_viol, speed_resid_abs, dtheta_abs, norm_ret):
+        s, e = span
+        seg = slice(s, e + 1)
+        dur = float(e - s + 1)
+        return np.array([
+            math.log1p(dur),
+            float(np.mean(deltas_abs_sum[seg])),
+            float(np.max(cone_viol[seg])) if e >= s else 0.0,
+            float(np.mean(speed_resid_abs[seg])),
+            float(np.mean(dtheta_abs[seg])),
+            float(np.sum(norm_ret[seg])),
+        ])
+
+    def fit(self, S):
+        if len(S) < self.k:
+            self.centroids = None
+            return self
+        self.mu = S.mean(0)
+        self.sigma = S.std(0) + 1e-9
+        Z = (S - self.mu) / self.sigma
+        rng = np.random.default_rng(self.seed)
+        cent = Z[rng.choice(len(Z), self.k, replace=False)]
+        for _ in range(25):
+            d2 = ((Z[:, None, :] - cent[None, :, :]) ** 2).sum(-1)
+            lab = np.argmin(d2, axis=1)
+            for j in range(self.k):
+                if np.any(lab == j):
+                    cent[j] = Z[lab == j].mean(0)
+        self.centroids = cent
+        return self
+
+    def assign(self, s_vec):
+        if self.centroids is None:
+            return -1
+        z = (s_vec - self.mu) / self.sigma
+        return int(np.argmin(((self.centroids - z) ** 2).sum(1)))
+
+
+class TransitionGraph:
+    """Normal-centric transition graph: states {N, A_0..A_{k-1}} with NORMAL between
+    episodes. Purely observational statistics feeding the classifier."""
+
+    def __init__(self, k=3):
+        self.k = k
+        self.n_states = k + 1        # 0 = NORMAL
+        self.counts = np.ones((self.n_states, self.n_states)) * 0.5   # Laplace prior
+        self.state_ret = np.zeros(self.n_states)
+        self.state_ret_n = np.zeros(self.n_states)
+
+    def fit(self, state_sequence, fwd_returns):
+        for i in range(len(state_sequence) - 1):
+            self.counts[state_sequence[i], state_sequence[i + 1]] += 1.0
+        for st, fr in fwd_returns:
+            self.state_ret[st] += fr
+            self.state_ret_n[st] += 1.0
+        return self
+
+    def transmat(self):
+        return self.counts / self.counts.sum(axis=1, keepdims=True)
+
+    def expected_return(self, state):
+        n = self.state_ret_n[state]
+        return float(self.state_ret[state] / n) if n > 0 else 0.0
+
+    def p_return_to_normal(self, state):
+        return float(self.transmat()[state, 0])
+
+    def features(self, episode_active, cluster):
+        """Per-bar graph features for the classifier: [in_episode, onehot cluster,
+        P(→NORMAL), E[fwd ret | state]]."""
+        state = 0 if not episode_active or cluster < 0 else cluster + 1
+        onehot = np.zeros(self.k)
+        if state > 0:
+            onehot[state - 1] = 1.0
+        return np.concatenate([[float(episode_active)], onehot,
+                               [self.p_return_to_normal(state), self.expected_return(state)]])
+
+    @property
+    def n_features(self):
+        return 3 + self.k
+
+
+class PureGradientBoosting:
+    """
+    LightGBM-style gradient boosted trees (binary logistic), dependency-free NumPy
+    implementation (drops in for LightGBM in this box of the architecture; the
+    real library is used instead when installed).
+    """
+
+    def __init__(self, n_trees=40, depth=3, lr=0.1, min_leaf=20, n_bins=24, seed=42):
+        self.n_trees = n_trees
+        self.depth = depth
+        self.lr = lr
+        self.min_leaf = min_leaf
+        self.n_bins = n_bins
+        self.seed = seed
+        self.trees = []
+        self.f0 = 0.0
+
+    def _fit_tree(self, X, g, hset, depth, rng):
+        n, d = X.shape
+        node = {"leaf": True, "value": float(np.sum(g) / (np.sum(hset) + 1e-9))}
+        if depth == 0 or n < 2 * self.min_leaf:
+            return node
+        best = None
+        feat_idx = rng.choice(d, size=max(1, int(math.sqrt(d)) + 2), replace=False)
+        base_score = (np.sum(g) ** 2) / (np.sum(hset) + 1e-9)
+        for j in feat_idx:
+            xs = X[:, j]
+            qs = np.quantile(xs, np.linspace(0.05, 0.95, self.n_bins))
+            for thr in np.unique(qs):
+                m = xs <= thr
+                nl = int(np.sum(m))
+                if nl < self.min_leaf or n - nl < self.min_leaf:
+                    continue
+                gl, gr = np.sum(g[m]), np.sum(g[~m])
+                hl, hr = np.sum(hset[m]), np.sum(hset[~m])
+                gain = gl * gl / (hl + 1e-9) + gr * gr / (hr + 1e-9) - base_score
+                if best is None or gain > best[0]:
+                    best = (gain, j, thr, m)
+        if best is None or best[0] <= 1e-9:
+            return node
+        _, j, thr, m = best
+        return {"leaf": False, "feat": int(j), "thr": float(thr),
+                "left": self._fit_tree(X[m], g[m], hset[m], depth - 1, rng),
+                "right": self._fit_tree(X[~m], g[~m], hset[~m], depth - 1, rng)}
+
+    def _predict_tree(self, node, X):
+        if node["leaf"]:
+            return np.full(X.shape[0], node["value"])
+        m = X[:, node["feat"]] <= node["thr"]
+        out = np.empty(X.shape[0])
+        out[m] = self._predict_tree(node["left"], X[m])
+        out[~m] = self._predict_tree(node["right"], X[~m])
+        return out
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=float)
+        p_mean = float(np.clip(np.mean(y), 1e-3, 1 - 1e-3))
+        self.f0 = math.log(p_mean / (1 - p_mean))
+        F = np.full(len(y), self.f0)
+        rng = np.random.default_rng(self.seed)
+        self.trees = []
+        for _ in range(self.n_trees):
+            p = _sigmoid(F)
+            g = y - p                      # negative gradient
+            hset = p * (1 - p)             # hessian (Newton leaf values)
+            tree = self._fit_tree(X, g, hset, self.depth, rng)
+            self.trees.append(tree)
+            F += self.lr * self._predict_tree(tree, X)
+        return self
+
+    def predict_proba(self, X):
+        F = np.full(X.shape[0], self.f0)
+        for tree in self.trees:
+            F += self.lr * self._predict_tree(tree, X)
+        return _sigmoid(F)
+
+    @staticmethod
+    def auc(y, p):
+        order = np.argsort(p)
+        ranks = np.empty(len(p)); ranks[order] = np.arange(1, len(p) + 1)
+        pos = y > 0.5
+        n1, n0 = int(np.sum(pos)), int(np.sum(~pos))
+        if n1 == 0 or n0 == 0:
+            return 0.5
+        return float((np.sum(ranks[pos]) - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+class MetaLabeler:
+    """
+    Meta labeling: logistic model estimating P(primary signal wins the barrier race
+    TP-before-SL). Trained on the primary model's own historical signals.
+    """
+
+    def __init__(self, lr=0.1, epochs=300, l2=1e-3):
+        self.lr = lr
+        self.epochs = epochs
+        self.l2 = l2
+        self.w = None
+        self.mu = None
+        self.sigma = None
+
+    @staticmethod
+    def barrier_outcome(closes, t, tp_pct, sl_pct, max_hold=30):
+        entry = closes[t]
+        for j in range(t + 1, min(t + max_hold + 1, len(closes))):
+            r = (closes[j] - entry) / entry * 100.0
+            if r >= tp_pct:
+                return 1
+            if r <= -sl_pct:
+                return 0
+        return 1 if closes[min(t + max_hold, len(closes) - 1)] > entry else 0
+
+    def fit(self, X, y):
+        self.mu = X.mean(0)
+        self.sigma = X.std(0) + 1e-9
+        Z = np.column_stack([np.ones(len(X)), (X - self.mu) / self.sigma])
+        w = np.zeros(Z.shape[1])
+        y = np.asarray(y, dtype=float)
+        for _ in range(self.epochs):
+            p = _sigmoid(Z @ w)
+            grad = Z.T @ (p - y) / len(y) + self.l2 * w
+            w -= self.lr * grad
+        self.w = w
+        return self
+
+    def predict_proba(self, X):
+        if self.w is None:
+            return np.full(X.shape[0], 0.5)
+        Z = np.column_stack([np.ones(len(X)), (X - self.mu) / self.sigma])
+        return _sigmoid(Z @ self.w)
+
+
+class ConformalGate:
+    """
+    Conformal prediction gate: A = α·A_pred + β·A_geom(panel).
+    Calibration uses a RECENT, CHRONOLOGICAL, deliberately NON-stratified window
+    ("yakın, kronolojik, stratifiye-EDİLMEMİŞ pencere").
+    """
+
+    def __init__(self, alpha=0.6, beta=0.4):
+        self.alpha = alpha
+        self.beta = beta
+        self.cal_scores = np.array([])      # nonconformity = 1 - p_meta
+        self.cal_dmin = np.array([])        # geometric distances on the calibration window
+        self.a_min = 0.5
+
+    def calibrate(self, p_meta_cal, dmin_cal, target_accept=0.60):
+        self.cal_scores = np.sort(1.0 - np.asarray(p_meta_cal, dtype=float))
+        self.cal_dmin = np.sort(np.asarray(dmin_cal, dtype=float))
+        if len(p_meta_cal) >= 5:
+            A_cal = np.array([self.combined(p, d) for p, d in zip(p_meta_cal, dmin_cal)])
+            self.a_min = float(np.quantile(A_cal, 1.0 - target_accept))
+        else:
+            self.a_min = 0.5
+
+    def a_pred(self, p_meta):
+        if len(self.cal_scores) == 0:
+            return 0.5
+        s = 1.0 - p_meta
+        ge = len(self.cal_scores) - np.searchsorted(self.cal_scores, s, side="left")
+        return float((1.0 + ge) / (len(self.cal_scores) + 1.0))
+
+    def a_geom(self, dmin):
+        """Geometric half of the conformal score, from the anchor panel distances."""
+        if len(self.cal_dmin) == 0:
+            return 0.5
+        ge = len(self.cal_dmin) - np.searchsorted(self.cal_dmin, dmin, side="left")
+        return float((1.0 + ge) / (len(self.cal_dmin) + 1.0))
+
+    def combined(self, p_meta, dmin):
+        return self.alpha * self.a_pred(p_meta) + self.beta * self.a_geom(dmin)
+
+
+class AnchorPanel:
+    """
+    ANCHOR PANEL — off-flow measurement standard.
+      Core: frozen at the signature level, append-only ledger (anchors are retired,
+            never deleted; metadata: added/last-seen fold, OOD score, usage, status).
+            Strata are model-free (RV quantile, jump, volume, hour), kept per resolution.
+      Adaptive: rolling buffer tracking current regimes.
+    Feeds: RKD targets (teacher = previous fold only), δ̂ health + geometry drift,
+    per-fold observational D_anchor log, A_geom, κ_init.
+    """
+
+    ADAPTIVE_MAX = 64
+
+    def __init__(self, max_per_stratum=2):
+        self.core = []                       # append-only ledger
+        self.adaptive = {r: [] for r in GEOM_RESOLUTIONS}
+        self.max_per_stratum = max_per_stratum
+        self.d_anchor_log = []               # per fold, observational
+        self.baseline_relations = None       # fold-0 panel relations
+        self.kappa_init = None
+
+    # ── core ledger ───────────────────────────────────────────────────────────
+    def build_core(self, res_feats, valid, strata, fold=0):
+        vidx = np.where(valid)[0]
+        for ri, r in enumerate(GEOM_RESOLUTIONS):
+            F = res_feats[r][vidx]
+            S = strata[vidx]
+            keys = [tuple(row) for row in S]
+            buckets = {}
+            for i, k in enumerate(keys):
+                buckets.setdefault(k, []).append(i)
+            for k, rows in buckets.items():
+                rows = np.array(rows)
+                sub = F[rows]
+                centroid = sub.mean(0)
+                d = np.linalg.norm(sub - centroid, axis=1)
+                order = np.argsort(d)[:self.max_per_stratum]
+                for oi in order:
+                    self.core.append({
+                        "sig": F[rows[oi]].copy(), "res": r, "res_idx": ri,
+                        "stratum": tuple(int(x) for x in k),
+                        "added_fold": fold, "last_seen_fold": fold,
+                        "ood": 0.0, "usage": 0, "status": "active",
+                    })
+        log.info(f"[PANEL] core ledger built: {len(self.core)} anchors "
+                 f"({sum(1 for a in self.core if a['status']=='active')} active)")
+
+    def active_core(self, res=None):
+        return [a for a in self.core
+                if a["status"] == "active" and (res is None or a["res"] == res)]
+
+    def push_adaptive(self, res, sig):
+        buf = self.adaptive[res]
+        buf.append(np.asarray(sig, dtype=float))
+        if len(buf) > self.ADAPTIVE_MAX:
+            buf.pop(0)
+
+    def refresh(self, res_feats, valid, fold):
+        """Update OOD/usage/last-seen metadata; retire stale anchors (never delete)."""
+        vidx = np.where(valid)[0]
+        for r in GEOM_RESOLUTIONS:
+            F = res_feats[r][vidx]
+            if len(F) == 0:
+                continue
+            mu = F.mean(0)
+            sd = F.std(0) + 1e-9
+            anchors = self.active_core(res=r)
+            if not anchors:
+                continue
+            A = np.stack([a["sig"] for a in anchors])
+            ood = np.linalg.norm((A - mu) / sd, axis=1) / math.sqrt(A.shape[1])
+            # nearest-anchor usage on a sample of current windows
+            sample = F[:: max(1, len(F) // 64)]
+            d2 = ((sample[:, None, :] - A[None, :, :]) ** 2).sum(-1)
+            near = np.argmin(d2, axis=1)
+            for i, a in enumerate(anchors):
+                a["ood"] = float(ood[i])
+                hits = int(np.sum(near == i))
+                if hits > 0:
+                    a["usage"] += hits
+                    a["last_seen_fold"] = fold
+                if fold - a["last_seen_fold"] >= 3 and a["ood"] > 3.0:
+                    a["status"] = "retired"   # emekli işaretlenir, silinmez
+
+    # ── panel sampling for RKD / drift ────────────────────────────────────────
+    def panel_matrix(self, max_points=96, include_adaptive=True, seed=42):
+        rows, ridx = [], []
+        anchors = self.active_core()
+        rng = np.random.default_rng(seed)
+        if len(anchors) > max_points:
+            anchors = [anchors[i] for i in rng.choice(len(anchors), max_points, replace=False)]
+        for a in anchors:
+            rows.append(a["sig"]); ridx.append(a["res_idx"])
+        if include_adaptive:
+            for ri, r in enumerate(GEOM_RESOLUTIONS):
+                for sigv in self.adaptive[r][-8:]:
+                    rows.append(sigv); ridx.append(ri)
+        if not rows:
+            return None, None
+        return np.stack(rows), np.array(ridx, dtype=int)
+
+    def rkd_targets(self, teacher, feature_standardizer):
+        """Relations of the TEACHER (always the immediately previous fold) on the panel."""
+        Xp, ridxp = self.panel_matrix()
+        if Xp is None:
+            return None
+        Xps = feature_standardizer(Xp, ridxp)
+        rel = teacher.panel_relations(Xps, ridxp)
+        return {"Xp": Xps, "ridxp": ridxp, "Dt": rel["Dt"], "Ct": rel["Ct"]}
+
+    def log_d_anchor(self, fold, encoder, feature_standardizer):
+        """Representation-side drift: distance between the current encoder's panel
+        relations and the fold-0 baseline. Observational only, never a constraint."""
+        Xp, ridxp = self.panel_matrix(include_adaptive=False)
+        if Xp is None:
+            return None
+        rel = encoder.panel_relations(feature_standardizer(Xp, ridxp), ridxp)
+        if self.baseline_relations is None:
+            self.baseline_relations = rel
+            entry = {"fold": fold, "d_anchor": 0.0}
+        else:
+            P = min(rel["Dt"].shape[0], self.baseline_relations["Dt"].shape[0])
+            dd = float(np.mean(np.abs(rel["Dt"][:P, :P] - self.baseline_relations["Dt"][:P, :P])))
+            entry = {"fold": fold, "d_anchor": dd}
+        self.d_anchor_log.append(entry)
+        return entry
+
+    def delta_hat_health(self, diag):
+        """δ̂ recomputed on the frozen core signatures — geometry drift guard."""
+        out = {}
+        for r in GEOM_RESOLUTIONS:
+            anchors = self.active_core(res=r)
+            if len(anchors) >= 16:
+                out[str(r)] = diag.measure(np.stack([a["sig"] for a in anchors]))
+        return out
+
+    # ── A_geom support ────────────────────────────────────────────────────────
+    def dmin(self, sig_by_res):
+        """Scale-normalized nearest-active-anchor distance, averaged over resolutions."""
+        vals = []
+        for r in GEOM_RESOLUTIONS:
+            anchors = self.active_core(res=r)
+            if len(anchors) < 3 or r not in sig_by_res:
+                continue
+            A = np.stack([a["sig"] for a in anchors])
+            d = np.linalg.norm(A - sig_by_res[r], axis=1)
+            spacing = np.median(np.linalg.norm(A - A.mean(0), axis=1)) + 1e-9
+            vals.append(float(np.min(d) / spacing))
+        return float(np.mean(vals)) if vals else 1.0
+
+    def summary(self):
+        act = sum(1 for a in self.core if a["status"] == "active")
+        return {"core_total": len(self.core), "core_active": act,
+                "core_retired": len(self.core) - act,
+                "adaptive": {str(r): len(self.adaptive[r]) for r in GEOM_RESOLUTIONS},
+                "d_anchor_log": self.d_anchor_log[-12:]}
+
+
+class GeometricPipeline:
+    """
+    Orchestrates the full learned-geometry flow and enforces the three protocols:
+
+    • Geometry protocol — κ sign from theory (dyadic tree → κ<0), initial magnitude
+      from δ̂, factor budget frozen in the first window; S/E membership changes only
+      at fold boundaries, versioned.
+    • Fold protocol — warm start; RKD distillation on the panel (distance
+      batch-normalized + angle relations, teacher = previous fold only); μ/σ, λ's and
+      conformal calibration fold-local; D_anchor logged per fold (observational);
+      panel frozen at the signature level.
+    • Mandatory dashboards — P(δ≠0) per fold, intra-resolution Var(r_i), e_res
+      intervention test, held-out recon, r_prior·√|κ|, and the data-side δ̂(t) vs
+      representation-side D_anchor drift kept as two separate series (for attribution).
+    """
+
+    MIN_TRAIN_BARS = 340
+    LIVE_REFIT_BARS = 240
+
+    def __init__(self, timeframe="1m", seed=42, encoder_epochs=60):
+        self.seed = seed
+        self.encoder_epochs = encoder_epochs
+        self._lock = threading.Lock()
+        self._training = False
+        self.reset(timeframe)
+
+    def reset(self, timeframe):
+        with getattr(self, "_lock", threading.Lock()):
+            self.timeframe = timeframe
+            self.status = "collecting"
+            self.schema = None
+            self.encoder = None
+            self.innov = None
+            self.clusterer = None
+            self.graph = None
+            self.gbm = None
+            self.meta = None
+            self.conformal = None
+            self.panel = AnchorPanel()
+            self.fold = 0
+            self.p_hi = 0.6
+            self.feat_mu = None            # fold-local per-resolution feature stats
+            self.feat_sd = None
+            self._panel_std0 = None        # frozen fold-0 standardizer for D_anchor
+            self.feature_mask = None
+            self.diagnostics = []
+            self.delta_hat_series = []     # data-side δ̂(t) drift series
+            self.last_state = {"status": "collecting", "signal": "HOLD"}
+            self._bars_at_fit = 0
+            self._prev_standardize = None
+
+    # ── shared preprocessing ──────────────────────────────────────────────────
+    def preprocess(self, df):
+        vol = VolatilityNormalizer().transform(df)
+        sigs, valid = MultiResolutionSignatures().compute(vol["increments"])
+        return vol, sigs, valid
+
+    def _fit_feature_stats(self, sigs, valid):
+        mu, sd = [], []
+        vidx = np.where(valid)[0]
+        for r in GEOM_RESOLUTIONS:
+            F = sigs[r][vidx]
+            mu.append(F.mean(0))
+            sd.append(F.std(0) + 1e-9)
+        return mu, sd
+
+    def _standardize(self, X, ridx, stats=None):
+        mu, sd = stats if stats is not None else (self.feat_mu, self.feat_sd)
+        out = np.empty_like(X, dtype=float)
+        for i in range(len(GEOM_RESOLUTIONS)):
+            m = ridx == i
+            if np.any(m):
+                out[m] = (X[m] - mu[i]) / sd[i]
+        return out
+
+    def _stack_training(self, vol, sigs, valid):
+        """Res-major stacked tensors on the common valid time grid."""
+        vidx = np.where(valid)[0]
+        T = len(vidx)
+        Xs, ridx = [], []
+        for i, r in enumerate(GEOM_RESOLUTIONS):
+            Xs.append((sigs[r][vidx] - 0.0))
+            ridx.append(np.full(T, i, dtype=int))
+        X = np.vstack(Xs)
+        ridx = np.concatenate(ridx)
+        X = self._standardize(X, ridx)
+        speed_bar = np.abs(vol["norm_ret"])[vidx]
+        speed = np.tile(speed_bar, len(GEOM_RESOLUTIONS))
+        # w from per-resolution standardized log-RV
+        w_parts = []
+        rv = vol["rv"]
+        for r in GEOM_RESOLUTIONS:
+            rv_r = pd.Series(rv).rolling(r, min_periods=1).mean().values[vidx]
+            z = np.log(np.maximum(rv_r, 1e-12))
+            z = (z - z.mean()) / (z.std() + 1e-9)
+            w_parts.append(np.exp(np.clip(z, -1.5, 1.5)))
+        w = np.concatenate([p / np.mean(p) for p in w_parts])
+        tgrid = np.tile(vidx, len(GEOM_RESOLUTIONS))
+        return X, ridx, tgrid, speed, w, vidx
+
+    def _embed_by_res(self, encoder, sigs, valid, stats=None):
+        vidx = np.where(valid)[0]
+        out = {}
+        for i, r in enumerate(GEOM_RESOLUTIONS):
+            Xr = self._standardize(sigs[r][vidx], np.full(len(vidx), i, dtype=int), stats=stats)
+            out[r] = encoder.embed(Xr, np.full(len(vidx), i, dtype=int))
+        return out, vidx
+
+    # ── decision-layer feature assembly (causal) ──────────────────────────────
+    def _decision_features(self, embeds, vidx, vol, innov_X, fit_mode, closes):
+        T = len(vidx)
+        deltas = np.stack([np.abs(embeds[r]["delta"]) for r in GEOM_RESOLUTIONS])
+        active_counts = np.sum(deltas > 0, axis=0)
+        deltas_abs_sum = deltas.sum(0)
+        cone_cols = [j for j, n in enumerate(self.innov.names) if n.startswith("cone_ang")]
+        sr_cols = [j for j, n in enumerate(self.innov.names) if n.startswith("speed_resid")]
+        dt_cols = [j for j, n in enumerate(self.innov.names) if n.startswith("dtheta")]
+        cone_viol = np.maximum(innov_X[:, cone_cols], 0.0).max(1) if cone_cols else np.zeros(T)
+        speed_abs = np.abs(innov_X[:, sr_cols]).mean(1) if sr_cols else np.zeros(T)
+        dtheta_abs = np.abs(innov_X[:, dt_cols]).mean(1) if dt_cols else np.zeros(T)
+        nret = vol["norm_ret"][vidx]
+
+        seg = EpisodeSegmenter()
+        flags, episodes = seg.segment(active_counts)
+
+        if fit_mode:
+            S = np.stack([AnomalyClusterer.summarize(sp, deltas_abs_sum, cone_viol,
+                                                     speed_abs, dtheta_abs, nret)
+                          for sp in episodes]) if episodes else np.zeros((0, AnomalyClusterer.SUMMARY_DIM))
+            self.clusterer = AnomalyClusterer().fit(S)
+
+        # causal per-bar state: ongoing episodes are assigned from their partial summary
+        states = np.zeros(T, dtype=int)
+        ep_start = -1
+        for t in range(T):
+            if flags[t]:
+                if ep_start < 0:
+                    ep_start = t
+                s_vec = AnomalyClusterer.summarize((ep_start, t), deltas_abs_sum, cone_viol,
+                                                   speed_abs, dtheta_abs, nret)
+                cl = self.clusterer.assign(s_vec) if self.clusterer else -1
+                states[t] = cl + 1 if cl >= 0 else 1
+            else:
+                ep_start = -1
+                states[t] = 0
+
+        if fit_mode:
+            HZ = GEOM_HORIZON
+            fwd = [(states[t], float((closes[vidx[t] + HZ] - closes[vidx[t]]) / closes[vidx[t]]))
+                   for t in range(T) if vidx[t] + HZ < len(closes)]
+            self.graph = TransitionGraph(k=self.clusterer.k if self.clusterer else 3).fit(states, fwd)
+
+        gfeats = np.stack([self.graph.features(bool(flags[t]), states[t] - 1) for t in range(T)])
+        return np.hstack([innov_X, gfeats]), flags, states, active_counts
+
+    # ── fitting (first window / fold update) ──────────────────────────────────
+    def fit(self, df, teacher=None, warm_from=None, fold=None, precomputed=None):
+        t0 = datetime.now()
+        vol, sigs, valid = precomputed if precomputed is not None else self.preprocess(df)
+        if int(np.sum(valid)) < 120:
+            raise ValueError(f"Not enough valid windows for geometry fit ({int(np.sum(valid))})")
+        fold = self.fold if fold is None else fold
+        closes = df['close'].values.astype(float)
+
+        diag = DeltaHatDiagnostic(seed=self.seed)
+        if self.schema is None:
+            # first-window protocol: δ̂ only here; κ_init + factor budget frozen
+            self.schema = diag.build_schema(sigs, valid, vol["norm_ret"], self.timeframe,
+                                            version=self._next_schema_version())
+            self.schema.persist()
+            self.panel.build_core(sigs, valid, vol["strata"], fold=fold)
+            self.panel.kappa_init = self.schema.kappa_init
+            log.info(f"[GEOM] first-window schema: {self.schema.label()} | δ̂={self.schema.delta_hat}")
+
+        # fold-local feature standardization
+        self.feat_mu, self.feat_sd = self._fit_feature_stats(sigs, valid)
+        if self._panel_std0 is None:
+            self._panel_std0 = (self.feat_mu, self.feat_sd)
+
+        X, ridx, tgrid, speed, w, vidx = self._stack_training(vol, sigs, valid)
+
+        # RKD targets: teacher = previous fold ONLY, relations on the frozen panel
+        rkd = None
+        if teacher is not None:
+            Xp_raw, ridxp = self.panel.panel_matrix()
+            if Xp_raw is not None:
+                t_std = teacher.get("standardize") or (lambda Xq, rq: self._standardize(Xq, rq))
+                rel = teacher["encoder"].panel_relations(t_std(Xp_raw, ridxp), ridxp)
+                rkd = {"Xp": self._standardize(Xp_raw, ridxp), "ridxp": ridxp,
+                       "Dt": rel["Dt"], "Ct": rel["Ct"]}
+
+        encoder = LearnedGeometryEncoder(GEOM_SIG_DIM, self.schema, seed=self.seed)
+        if warm_from is not None:
+            for k_ in encoder.params:
+                encoder.params[k_] = np.array(warm_from.params[k_], dtype=float, copy=True)
+            encoder.xi = warm_from.xi
+            encoder.eta = warm_from.eta
+            encoder.lambdas = dict(warm_from.lambdas)
+        epochs = self.encoder_epochs if warm_from is None else max(20, self.encoder_epochs // 2)
+        heldout = encoder.train(X, ridx, tgrid, speed, w, epochs=epochs, rkd=rkd,
+                                log_prefix=f"ENC f{fold}")
+        self.encoder = encoder
+
+        # innovations, fold-local μ/σ
+        self.innov = InnovationEngine(self.schema)
+        embeds, vidx2 = self._embed_by_res(encoder, sigs, valid)
+        speed_bar = np.abs(vol["norm_ret"])[vidx2]
+        raw = self.innov.compute_raw(encoder, embeds, speed_bar, vol["norm_ret"])
+        self.innov.fit_norm(raw)
+        Xin = self.innov.transform(raw)
+
+        # episodes → clusters → transition graph → decision features
+        Xf, flags, states, active_counts = self._decision_features(
+            embeds, vidx2, vol, Xin, fit_mode=True, closes=closes)
+
+        # labels (direction over the horizon) with purged tail
+        HZ = GEOM_HORIZON
+        T = len(vidx2)
+        usable = np.array([vidx2[t] + HZ < len(closes) for t in range(T)])
+        y = np.zeros(T)
+        for t in range(T):
+            if usable[t]:
+                y[t] = 1.0 if closes[vidx2[t] + HZ] > closes[vidx2[t]] else 0.0
+
+        cal_start = int(T * 0.80)          # recent, chronological, NOT stratified
+        tr_mask = usable.copy(); tr_mask[cal_start:] = False
+
+        # feature-stability ablation (levels vs deviations), evaluated on the cal tail
+        masks = self.innov.group_masks()
+        n_innov = Xin.shape[1]
+        stab = {}
+        for gname, gmask in masks.items():
+            cols = np.where(gmask)[0]
+            if len(cols) == 0:
+                stab[f"{gname}_auc"] = 0.5
+                continue
+            gb = PureGradientBoosting(n_trees=18, depth=2, seed=self.seed)
+            gb.fit(Xf[tr_mask][:, cols], y[tr_mask])
+            va = usable & (np.arange(T) >= cal_start)
+            stab[f"{gname}_auc"] = PureGradientBoosting.auc(y[va], gb.predict_proba(Xf[va][:, cols])) if np.any(va) else 0.5
+        self.feature_mask = np.ones(Xf.shape[1], dtype=bool)
+        for gname, gmask in masks.items():
+            if stab.get(f"{gname}_auc", 0.5) < 0.47:
+                self.feature_mask[np.where(np.concatenate([gmask, np.zeros(Xf.shape[1] - n_innov, dtype=bool)]))[0]] = False
+
+        # main classifier (LightGBM slot)
+        self.gbm = PureGradientBoosting(n_trees=40, depth=3, seed=self.seed)
+        self.gbm.fit(Xf[tr_mask][:, self.feature_mask], y[tr_mask])
+        p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
+        self.p_hi = float(np.quantile(p_all[:cal_start], 0.70))
+
+        # meta labeling on the primary model's own signals (train part)
+        params_now = get_active_parameters()
+        tp_pct = float(params_now.get("TP_PERCENT", 0.3))
+        sl_pct = tp_pct
+        fired_tr = [t for t in range(cal_start) if usable[t] and p_all[t] >= self.p_hi]
+        meta_X, meta_y = [], []
+        for t in fired_tr:
+            meta_X.append(self._meta_features(p_all[t], Xin[t], flags[t], states[t]))
+            meta_y.append(MetaLabeler.barrier_outcome(closes, vidx2[t], tp_pct, sl_pct))
+        self.meta = MetaLabeler()
+        if len(meta_X) >= 12 and 0 < np.mean(meta_y) < 1:
+            self.meta.fit(np.stack(meta_X), np.array(meta_y))
+
+        # conformal calibration on the chronological tail
+        self.conformal = ConformalGate()
+        fired_cal = [t for t in range(cal_start, T) if p_all[t] >= self.p_hi]
+        if len(fired_cal) >= 5:
+            pm, dm = [], []
+            for t in fired_cal:
+                pm.append(float(self.meta.predict_proba(
+                    self._meta_features(p_all[t], Xin[t], flags[t], states[t])[None, :])[0]))
+                dm.append(self.panel.dmin({r: sigs[r][vidx2[t]] for r in GEOM_RESOLUTIONS}))
+            self.conformal.calibrate(pm, dm)
+
+        # panel bookkeeping + drift series
+        self.panel.refresh(sigs, valid, fold)
+        for r in GEOM_RESOLUTIONS:
+            for t in vidx2[-6:]:
+                self.panel.push_adaptive(r, sigs[r][t])
+        d_anchor = self.panel.log_d_anchor(
+            fold, encoder, lambda Xq, rq: self._standardize(Xq, rq, stats=self._panel_std0))
+        tail = np.where(valid)[0][-200:]
+        dh_data = float(np.median([DeltaHatDiagnostic(n_quadruples=600, seed=self.seed).measure(
+            sigs[r][tail]) for r in GEOM_RESOLUTIONS]))
+        self.delta_hat_series.append({"fold": fold, "bars": int(len(df)), "delta_hat": dh_data})
+
+        # mandatory dashboards ("zorunlu kadranlar")
+        fw_all = encoder.forward(X, ridx)
+        p_dnz = float(np.mean(fw_all["delta"] != 0))
+        var_r = {}
+        n_res = len(GEOM_RESOLUTIONS)
+        Tb = X.shape[0] // n_res
+        for i, r in enumerate(GEOM_RESOLUTIONS):
+            var_r[str(r)] = float(np.var(fw_all["r"][i * Tb:(i + 1) * Tb]))
+        diag_entry = {
+            "fold": fold,
+            "p_delta_nonzero": p_dnz,
+            "var_r": var_r,
+            "e_res_test": encoder.e_res_intervention(X, ridx),
+            "heldout_recon": heldout,
+            "r_eff": encoder.r_eff(),
+            "kappa": encoder.kappa,
+            "eta": encoder.eta,
+            "d_anchor": (d_anchor or {}).get("d_anchor", 0.0),
+            "delta_hat_data": dh_data,
+            "feature_stability": stab,
+            "lambda_l1": encoder.lambdas["l1"],
+            "n_episodes": int(len([1 for f_ in np.diff(flags.astype(int)) if f_ == 1]) + (1 if flags[0] else 0)),
+            "schema": self.schema.label(),
+        }
+        self.diagnostics.append(diag_entry)
+
+        # fold-local λ adaptation for the NEXT fold (kept inside the encoder object)
+        if p_dnz > 0.45:
+            encoder.lambdas["l1"] = min(encoder.lambdas["l1"] * 1.5, 0.5)
+        elif p_dnz < 0.03:
+            encoder.lambdas["l1"] = max(encoder.lambdas["l1"] / 1.5, 0.005)
+
+        self.fold = fold + 1
+        self._bars_at_fit = len(df)
+        self._prev_standardize = (lambda mu, sd: (lambda Xq, rq: self._standardize(Xq, rq, stats=(mu, sd))))(
+            self.feat_mu, self.feat_sd)
+        self.status = "ready"
+        log.info(f"[GEOM] fold {fold} fitted in {(datetime.now()-t0).total_seconds():.1f}s | "
+                 f"P(δ≠0)={p_dnz:.3f} | D_anchor={diag_entry['d_anchor']:.4f} | schema={self.schema.label()}")
+        return diag_entry
+
+    def _next_schema_version(self):
+        store = GeometrySchema.load_store()
+        hist = store.get("schemas", {}).get(self.timeframe, [])
+        return (hist[-1]["version"] + 1) if hist else 1
+
+    def _meta_features(self, p, xin_row, flag, state):
+        return np.concatenate([[p, float(flag), float(state)],
+                               xin_row[:8]])
+
+    # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
+    def batch_signals(self, df, start_at=0, precomputed=None):
+        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t."""
+        n = len(df)
+        out = {
+            "signal": np.array(["HOLD"] * n, dtype=object),
+            "exit_flag": np.zeros(n, dtype=bool),
+            "p": np.full(n, 0.5), "p_meta": np.full(n, 0.5),
+            "A": np.zeros(n), "episode": np.zeros(n, dtype=bool),
+            "state": np.zeros(n, dtype=int),
+        }
+        if self.encoder is None:
+            return out
+        vol, sigs, valid = precomputed if precomputed is not None else self.preprocess(df)
+        embeds, vidx = self._embed_by_res(self.encoder, sigs, valid)
+        if len(vidx) < 3:
+            return out
+        speed_bar = np.abs(vol["norm_ret"])[vidx]
+        raw = self.innov.compute_raw(self.encoder, embeds, speed_bar, vol["norm_ret"])
+        Xin = self.innov.transform(raw)
+        closes = df['close'].values.astype(float)
+        Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
+                                                       fit_mode=False, closes=closes)
+        p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
+        a_gate = self.conformal.a_min if self.conformal else 0.5
+        for t in range(len(vidx)):
+            bar = vidx[t]
+            if bar < start_at:
+                continue
+            p = float(p_all[t])
+            mf = self._meta_features(p, Xin[t], flags[t], states[t])
+            pm = float(self.meta.predict_proba(mf[None, :])[0]) if self.meta else 0.5
+            dm = self.panel.dmin({r: sigs[r][bar] for r in GEOM_RESOLUTIONS})
+            A = self.conformal.combined(pm, dm) if self.conformal else 0.5
+            out["p"][bar] = p
+            out["p_meta"][bar] = pm
+            out["A"][bar] = A
+            out["episode"][bar] = bool(flags[t])
+            out["state"][bar] = int(states[t])
+            if p >= self.p_hi and A >= a_gate:
+                out["signal"][bar] = "BUY"
+            exp_ret = self.graph.expected_return(states[t]) if self.graph else 0.0
+            out["exit_flag"][bar] = bool(flags[t] and exp_ret < 0.0 and A < 0.8 * a_gate)
+        return out
+
+    # ── live path ─────────────────────────────────────────────────────────────
+    def infer_latest(self, df):
+        tail = df.iloc[-(MultiResolutionSignatures().warmup + 96):]
+        geo = self.batch_signals(tail.reset_index(drop=True))
+        i = len(tail) - 1
+        st = int(geo["state"][i])
+        state = {
+            "status": "ready",
+            "signal": str(geo["signal"][i]),
+            "exit_flag": bool(geo["exit_flag"][i]),
+            "p_gbm": float(geo["p"][i]),
+            "p_meta": float(geo["p_meta"][i]),
+            "a_score": float(geo["A"][i]),
+            "a_gate": float(self.conformal.a_min if self.conformal else 0.5),
+            "episode": "EPISODE" if geo["episode"][i] else "NORMAL",
+            "cluster": st - 1,
+        }
+        return state
+
+    def live_state(self, extra=None):
+        s = {
+            "status": self.status,
+            "schema": self.schema.label() if self.schema else "-",
+            "version": self.schema.version if self.schema else 0,
+            "kappa": float(self.encoder.kappa) if self.encoder else 0.0,
+            "kappa_init": float(self.schema.kappa_init) if self.schema else 0.0,
+            "eta": float(self.encoder.eta) if self.encoder else 0.0,
+            "delta_hat": self.schema.delta_hat if self.schema else {},
+            "fold": self.fold,
+            "signal": "HOLD", "exit_flag": False,
+            "p_gbm": 0.5, "p_meta": 0.5, "a_score": 0.0, "a_gate": 0.5,
+            "episode": "NORMAL", "cluster": -1,
+            "panel": self.panel.summary() if self.panel else {},
+            "delta_hat_series": self.delta_hat_series[-12:],
+            "diag": self.diagnostics[-1] if self.diagnostics else {},
+        }
+        if extra:
+            s.update(extra)
+        self.last_state = s
+        return s
+
+    def on_bar(self, df, force_retrain=False, timeframe=None):
+        """Live tick entry point — schedules background (re)training, never blocks."""
+        tf = timeframe or self.timeframe
+        if tf != self.timeframe:
+            log.info(f"[GEOM] timeframe changed {self.timeframe} → {tf}: resetting geometry (new first window)")
+            self.reset(tf)
+        with self._lock:
+            busy = self._training
+            status = self.status
+        if status == "collecting" and not busy and len(df) >= self.MIN_TRAIN_BARS:
+            self._spawn_fit(df, teacher=None, warm=None)
+            return self.live_state({"status": "training"})
+        if status == "ready" and not busy and (
+                force_retrain or len(df) - self._bars_at_fit >= self.LIVE_REFIT_BARS):
+            teacher = {"encoder": self.encoder, "standardize": self._prev_standardize}
+            self._spawn_fit(df, teacher=teacher, warm=self.encoder)
+        if status == "ready":
+            try:
+                return self.live_state(self.infer_latest(df))
+            except Exception as e:
+                log.error(f"[GEOM] live inference error: {e}")
+                return self.live_state()
+        return self.live_state({"status": "training" if busy else status})
+
+    def _spawn_fit(self, df, teacher, warm):
+        df_copy = df.copy()
+        with self._lock:
+            if self._training:
+                return
+            self._training = True
+
+        def _worker():
+            try:
+                self.fit(df_copy, teacher=teacher, warm_from=warm)
+            except Exception as e:
+                log.error(f"[GEOM] background fit failed: {e}")
+                if self.status != "ready":
+                    self.status = "collecting"
+            finally:
+                with self._lock:
+                    self._training = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+class PurgedWalkForwardEngine:
+    """
+    Purged Walk-Forward over the geometric pipeline: expanding chronological folds
+    with an embargo gap (signature warm-up + label horizon) between IS and OOS,
+    warm start + neighbour-fold RKD between folds, geometry schema fixed after the
+    first window. The OOS trading-parameter mini-grid keeps the champion/challenger
+    contract of the legacy optimizer.
+    """
+
+    def __init__(self, df, timeframe="1m", n_folds=5, seed=42):
+        self.df = df.reset_index(drop=True)
+        self.timeframe = timeframe
+        self.n_folds = n_folds
+        self.seed = seed
+        self.embargo = max(GEOM_RESOLUTIONS) + GEOM_HORIZON
+
+    def run(self):
+        df = self.df
+        n = len(df)
+        first_is = max(GeometricPipeline.MIN_TRAIN_BARS, int(n * 0.35))
+        if n < first_is + 3 * (self.embargo + 120):
+            raise ValueError(f"Not enough bars for purged WFO ({n})")
+        oos_len = (n - first_is) // self.n_folds
+
+        pipeline = GeometricPipeline(self.timeframe, seed=self.seed, encoder_epochs=45)
+        pre_full = pipeline.preprocess(df)
+
+        def pre_slice(upto):
+            vol, sigs, valid = pre_full
+            return ({k: (v[:upto] if isinstance(v, np.ndarray) else v) for k, v in vol.items()},
+                    {r: sigs[r][:upto] for r in GEOM_RESOLUTIONS}, valid[:upto])
+
+        base = get_active_parameters()
+        combos = []
+        for tp in (0.3, 0.6, 1.0):
+            for tm in (2.0, 3.0, 4.0):
+                cmb = dict(base)
+                cmb["TP_PERCENT"] = tp
+                cmb["TRAIL_MULT"] = tm
+                combos.append(cmb)
+
+        fold_results = {i: [] for i in range(len(combos))}
+        prev_encoder = None
+        prev_std = None
+        for k in range(self.n_folds):
+            is_end = first_is + k * oos_len
+            oos_start = is_end + self.embargo
+            oos_end = min(is_end + oos_len, n) if k < self.n_folds - 1 else n
+            if oos_start >= oos_end - 30:
+                continue
+            teacher = ({"encoder": prev_encoder, "standardize": prev_std}
+                       if prev_encoder is not None else None)
+            pipeline.fit(df.iloc[:is_end], teacher=teacher,
+                         warm_from=prev_encoder, fold=k, precomputed=pre_slice(is_end))
+            prev_encoder = pipeline.encoder
+            prev_std = pipeline._prev_standardize
+
+            geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
+                                              precomputed=pre_slice(oos_end))
+            oos_df = df.iloc[oos_start:oos_end].reset_index(drop=True)
+            geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
+                   for kk, vv in geo_full.items()}
+            for ci, cmb in enumerate(combos):
+                res = Backtester(oos_df).run(cmb, geo=geo)
+                fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
+                                         "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
+
+        best_ci, best_stable, best_var = 0, -1, float("inf")
+        for ci in fold_results:
+            rs = fold_results[ci]
+            stable = sum(1 for r in rs if r["pf"] > 1.10 and r["calmar"] > 0.8)
+            pfs = [min(r["pf"], 10.0) for r in rs]
+            var = float(np.std(pfs)) if pfs else 0.0
+            if stable > best_stable or (stable == best_stable and var < best_var):
+                best_ci, best_stable, best_var = ci, stable, var
+        challenger = dict(combos[best_ci])
+        return {
+            "challenger": challenger,
+            "stability_count": int(best_stable),
+            "variance": float(best_var if best_var != float("inf") else 0.0),
+            "slices_evaluated": self.n_folds,
+            "engine": "geometric-purged-wfo",
+            "diagnostics": pipeline.diagnostics,
+            "d_anchor_log": pipeline.panel.d_anchor_log,
+            "delta_hat_series": pipeline.delta_hat_series,
+            "schema": pipeline.schema.label() if pipeline.schema else "-",
+            "fold_results": {str(ci): fold_results[ci] for ci in fold_results},
+        }
+
+
+def run_geometric_backtest(df, params, timeframe="1m", seed=42):
+    """Backtest stage of the flow: train on the first window, trade the purged remainder."""
+    df = df.reset_index(drop=True)
+    n = len(df)
+    split = max(GeometricPipeline.MIN_TRAIN_BARS, int(n * 0.35))
+    embargo = max(GEOM_RESOLUTIONS) + GEOM_HORIZON
+    if n < split + embargo + 120:
+        raise ValueError(f"Not enough bars for geometric backtest ({n})")
+    pipeline = GeometricPipeline(timeframe, seed=seed, encoder_epochs=45)
+    pipeline.fit(df.iloc[:split])
+    geo = pipeline.batch_signals(df, start_at=split + embargo)
+    report = Backtester(df).run(params, geo=geo)
+    report["engine"] = "geometric"
+    report["train_bars"] = int(split)
+    report["schema"] = pipeline.schema.label() if pipeline.schema else "-"
+    report["diagnostics"] = pipeline.diagnostics[-1] if pipeline.diagnostics else {}
+    return report
+
 
 class SignalEngine:
-    def __init__(self):
-        self.regime = RegimeDetector()
-        self.hyperbolic = HyperbolicClassifier()
+    def __init__(self, enable_geometry=True):
+        self.regime = RoughPathClassifier()
         self.ou = OUPingPong()
+        # V3.6 learned-geometry pipeline; the legacy classifiers remain as the
+        # fallback while the first window is still being collected/trained.
+        self.geometry = GeometricPipeline(bot_state.get("timeframe", "1m")) if enable_geometry else None
 
-    def process(self, df, margin=0.3, band_mult=2.5, force_retrain=False):
+    def process(self, df, params=None, force_retrain=False):
+        if params is None:
+            params = get_active_parameters()
+        
+        fast_len = int(params.get("FAST_LENGTH", 8))
+        slow_len = int(params.get("SLOW_LENGTH", 21))
+        vol_len = int(params.get("VOL_LENGTH", 14))
+        cvd_len = int(params.get("CVD_LENGTH", 14))
+        band_mult = float(params.get("BAND_MULT", 2.5))
+        margin = float(params.get("MIN_PROFIT_MARGIN", 0.3))
+        
         c, h, l, o, v = df['close'].values, df['high'].values, df['low'].values, df['open'].values, df['volume'].values
-        fg = gaussian_filter(c, FAST_LENGTH); sg = gaussian_filter(c, SLOW_LENGTH)
-        gv = gaussian_filter(calc_true_range(h,l,c), VOL_LENGTH)
-        delta = np.where(c>o, v, np.where(c<o, -v, 0.0)); cvd_g = gaussian_filter(np.cumsum(delta), CVD_LENGTH)
-        lr = np.log(c[1:]/c[:-1]); lv = np.where(np.isinf(np.log(h[1:]/l[1:])), 0, np.log(h[1:]/l[1:]))
-        features = np.column_stack([lr, lv])
-        self.regime.train(features, len(df), force=force_retrain); is_r = self.regime.is_ranging(features)
+        fg = gaussian_filter(c, fast_len); sg = gaussian_filter(c, slow_len)
+        gv = gaussian_filter(calc_true_range(h,l,c), vol_len)
+        delta = np.where(c>o, v, np.where(c<o, -v, 0.0)); cvd_g = gaussian_filter(np.cumsum(delta), cvd_len)
+        
+        # Train classifier if not trained yet or forced
+        if self.regime.model is None or force_retrain:
+            self.regime.fit(df)
+            
         i = len(df)-1
         ub, lb = sg[i]+gv[i]*band_mult, sg[i]-gv[i]*band_mult
-        cu = fg[i]>sg[i] and fg[i-1]<=sg[i-1]; cd = fg[i]<sg[i] and fg[i-1]>=sg[i-1]
-        cb, cbe = cvd_g[i]>cvd_g[i-1], cvd_g[i]<cvd_g[i-1]
-        ml = ((sg[i]-lb)/lb*100)>=margin if lb>0 else False
-        ms = ((ub-sg[i])/sg[i]*100)>=margin if sg[i]>0 else False
         
-        # Hyperbolic direction confirmation
-        hyp_direction = self.hyperbolic.classify(df)
+        # Predict regime from Rough Path Signatures
+        pred_direction = self.regime.predict(c)
+        is_r = (pred_direction == 0)
         
-        # OU model fitting using last 100 closes
-        self.ou.fit(c[max(0, len(c)-100):])
-
         sig, st = "HOLD", ""
-        # Trend: requires Gaussian cross + CVD + Hyperbolic confirmation
-        if not is_r and cu and cb and hyp_direction == 1:
+        # Trend: model predicts 1 (bullish) or -1 (bearish)
+        if not is_r and pred_direction == 1:
             sig, st = "BUY", "Trend"
-        elif not is_r and cd and cbe and hyp_direction == -1:
+        elif not is_r and pred_direction == -1:
             sig, st = "SELL", "Trend"
-        # Yatay piyasa: OU model takes priority, fallback to original bands
+        # Ranging: OU model primary, fallback to bands
         elif is_r and self.ou.is_valid:
             ou_sig, ou_type = self.ou.get_signal(c[i])
             if ou_sig != "HOLD":
                 sig, st = ou_sig, ou_type
-        elif is_r and ml and l[i]<lb and c[i]>lb:
-            sig, st = "BUY", "Ping"
-        elif is_r and ms and h[i]>ub and c[i]<ub:
-            sig, st = "SELL", "Pong"
+        elif is_r and l[i]<lb and c[i]>lb:
+            ml = ((sg[i]-lb)/lb*100)>=margin if lb>0 else False
+            if ml:
+                sig, st = "BUY", "Ping"
+        elif is_r and h[i]>ub and c[i]<ub:
+            ms = ((ub-sg[i])/sg[i]*100)>=margin if sg[i]>0 else False
+            if ms:
+                sig, st = "SELL", "Pong"
+
+        # Fit OU model for future/ranging calculations
+        self.ou.fit(c[max(0, len(c)-100):])
+
+        # ── V3.6 learned geometry: once trained, the geometric decision chain
+        # (GBM → meta labeling → conformal gate) is the authoritative signal.
+        geom_state = {}
+        if self.geometry is not None:
+            try:
+                geom_state = self.geometry.on_bar(
+                    df, force_retrain=force_retrain,
+                    timeframe=bot_state.get("timeframe", self.geometry.timeframe))
+            except Exception as e_geom:
+                log.error(f"Geometry pipeline error: {e_geom}")
+                geom_state = self.geometry.live_state() if self.geometry else {}
+            if geom_state.get("status") == "ready":
+                gsig = geom_state.get("signal", "HOLD")
+                if gsig == "BUY":
+                    sig, st = "BUY", "Geo"
+                else:
+                    sig, st = "HOLD", ""
 
         def sanitize(v, default=0.0):
             if v is None or math.isnan(v) or math.isinf(v):
@@ -619,6 +2856,7 @@ class SignalEngine:
         return {
             "signal": sig,
             "type": st,
+            "geom": geom_state,
             "price": float(c[i]),
             "gauss_vol": float(gv[i]),
             "slow_gauss": float(sg[i]),
@@ -630,7 +2868,7 @@ class SignalEngine:
             "sg_list": sg,
             "ub_list": sg+gv*band_mult,
             "lb_list": sg-gv*band_mult,
-            "hyp_direction": hyp_direction,
+            "hyp_direction": int(pred_direction),
             "ou_theta": sanitize(self.ou.theta),
             "ou_mu": sanitize(self.ou.mu),
             "ou_half_life": sanitize(self.ou.half_life, 999.0),
@@ -664,11 +2902,18 @@ class PositionManager:
         self.mode = "PAPER"
         self.stop_order_id = None
         self.realized_pnl_usdt = 0.0
+        self.max_price_seen = 0.0
+        self.min_price_seen = 0.0
+        self.entry_volatility = 0.0
+        self.tp_percent = 0.3
+        self.sl_percent = 0.3
 
     @property
     def is_open(self): return self.side is not None
 
-    def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None):
+    def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0):
+        if params is None:
+            params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
         self.invested_amount = invested_amount
         self.has_taken_partial_tp = False
@@ -677,15 +2922,23 @@ class PositionManager:
         self.mode = mode
         self.stop_order_id = stop_order_id
         self.realized_pnl_usdt = 0.0
+        self.tp_percent = tp_percent
+        self.sl_percent = sl_percent
+        self.entry_volatility = entry_volatility
+        self.max_price_seen = price
+        self.min_price_seen = price
+        
+        self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
+        self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
         
         if side == "long":
-            self.trail_stop_30 = price - gauss_vol*TRAIL_MULT
-            self.trail_stop_70 = price - gauss_vol*TRAIL_MULT
-            self.ping_stop = price - gauss_vol*PING_STOP_MULT
+            self.trail_stop_30 = price - gauss_vol*self.trail_mult
+            self.trail_stop_70 = price - gauss_vol*self.trail_mult
+            self.ping_stop = price - gauss_vol*self.ping_stop_mult
         else:
-            self.trail_stop_30 = price + gauss_vol*TRAIL_MULT
-            self.trail_stop_70 = price + gauss_vol*TRAIL_MULT
-            self.ping_stop = price + gauss_vol*PING_STOP_MULT
+            self.trail_stop_30 = price + gauss_vol*self.trail_mult
+            self.trail_stop_70 = price + gauss_vol*self.trail_mult
+            self.ping_stop = price + gauss_vol*self.ping_stop_mult
 
     def close(self, reason, price):
         pnl_pct = (price-self.entry_price)/self.entry_price*100 if self.side=="long" else (self.entry_price-price)/self.entry_price*100
@@ -698,16 +2951,18 @@ class PositionManager:
         return pnl_pct, pnl_usdt
 
     def update_stops(self, price, gv_normal, gv_lower):
+        self.max_price_seen = max(self.max_price_seen, price)
+        self.min_price_seen = min(self.min_price_seen, price)
         if self.side == "long":
-            self.trail_stop_30 = max(self.trail_stop_30, price-gv_normal*TRAIL_MULT)
+            self.trail_stop_30 = max(self.trail_stop_30, price-gv_normal*self.trail_mult)
             if not self.has_taken_partial_tp:
-                self.trail_stop_70 = max(self.trail_stop_70, price-gv_lower*TRAIL_MULT)
-            self.ping_stop = max(self.ping_stop, price-gv_normal*PING_STOP_MULT)
+                self.trail_stop_70 = max(self.trail_stop_70, price-gv_lower*self.trail_mult)
+            self.ping_stop = max(self.ping_stop, price-gv_normal*self.ping_stop_mult)
         elif self.side == "short":
-            self.trail_stop_30 = min(self.trail_stop_30, price+gv_normal*TRAIL_MULT)
+            self.trail_stop_30 = min(self.trail_stop_30, price+gv_normal*self.trail_mult)
             if not self.has_taken_partial_tp:
-                self.trail_stop_70 = min(self.trail_stop_70, price+gv_lower*TRAIL_MULT)
-            self.ping_stop = min(self.ping_stop, price+gv_normal*PING_STOP_MULT)
+                self.trail_stop_70 = min(self.trail_stop_70, price+gv_lower*self.trail_mult)
+            self.ping_stop = min(self.ping_stop, price+gv_normal*self.ping_stop_mult)
 
     def check_exits(self, price, info, force_close=False):
         if not self.is_open: return None
@@ -719,35 +2974,30 @@ class PositionManager:
                 if price <= self.trail_stop_30: return "Trail Stop (30%)"
                 return None
             
-            if self.entry_type == "OU-Ping":
-                if price <= self.ou_stop: return "Stop Loss (OU-Ping)"
-                if price >= self.ou_target: return "OU-Ping TP"
-            elif self.entry_type == "Ping":
-                if price <= self.ping_stop: return "Stop Loss (Ping)"
-                if price >= info['slow_gauss']: return "Ping TP"
-            elif self.entry_type == "Trend":
+            if self.entry_type in ("Ping", "OU-Ping"):
+                if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss (Ping)"
+                if price >= self.entry_price * (1 + self.tp_percent/100): return "Ping TP"
+            elif self.entry_type in ("Trend", "Geo"):
+                if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss (Trend)"
                 if price <= self.trail_stop_70:
                     if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss (Trend)"
                     return "PARTIAL_TP"
-                if price >= self.entry_price * (1 + TP_PERCENT/100): return f"Trend TP ({TP_PERCENT}%)"
+                if price >= self.entry_price * (1 + self.tp_percent/100): return f"Trend TP ({self.tp_percent:.2f}%)"
                 
         elif self.side == "short":
             if self.has_taken_partial_tp:
                 if price >= self.trail_stop_30: return "Trail Stop (30%)"
                 return None
             
-            if self.entry_type == "OU-Pong":
-                if price >= self.ou_stop: return "Stop Loss (OU-Pong)"
-                if price <= self.ou_target: return "OU-Pong TP"
-            elif self.entry_type == "Pong":
-                if price >= self.ping_stop: return "Stop Loss (Pong)"
-                if price <= info['slow_gauss']: return "Pong TP"
-            elif self.entry_type == "Trend":
+            if self.entry_type in ("Pong", "OU-Pong"):
+                if price >= self.entry_price * (1 + self.sl_percent/100): return "Stop Loss (Pong)"
+                if price <= self.entry_price * (1 - self.tp_percent/100): return "Pong TP"
+            elif self.entry_type in ("Trend", "Geo"):
+                if price >= self.entry_price * (1 + self.sl_percent/100): return "Stop Loss (Trend)"
                 if price >= self.trail_stop_70:
                     if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss (Trend)"
                     return "PARTIAL_TP"
-                if price <= self.entry_price * (1 - TP_PERCENT/100): return f"Trend TP ({TP_PERCENT}%)"
-                
+                if price <= self.entry_price * (1 - self.tp_percent/100): return f"Trend TP ({self.tp_percent:.2f}%)"
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -901,6 +3151,8 @@ class QuantBot:
         self.signal_engine = SignalEngine()
         self.position = PositionManager()
         self.telegram = TelegramController(self)
+        self.dynamic_target_optimizer = DynamicTargetOptimizer()
+        self.shadow_dynamic_target_optimizer = DynamicTargetOptimizer()
 
     def simulate_slippage(self, side, qty, orderbook):
         """
@@ -1062,6 +3314,36 @@ class QuantBot:
         ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, SYMBOL, bot_state["timeframe"], None, OHLCV_LIMIT)
         return pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume']).assign(timestamp=lambda d: pd.to_datetime(d['timestamp'], unit='ms'))
 
+    async def fetch_ohlcv_large(self, symbol, timeframe, limit=3000):
+        all_ohlcv = []
+        target_limit = limit
+        tf_ms = 60 * 1000  # 1m default
+        if timeframe == "5m": tf_ms = 5 * 60 * 1000
+        elif timeframe == "15m": tf_ms = 15 * 60 * 1000
+        elif timeframe == "1h": tf_ms = 60 * 60 * 1000
+        elif timeframe == "4h": tf_ms = 4 * 60 * 60 * 1000
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        since = now_ms - (target_limit * tf_ms)
+
+        for _ in range(5):
+            try:
+                batch = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, timeframe, since, 1000)
+                if not batch:
+                    break
+                all_ohlcv.extend(batch)
+                all_ohlcv = sorted({x[0]: x for x in all_ohlcv}.values(), key=lambda x: x[0])
+                if len(all_ohlcv) >= target_limit:
+                    break
+                since = all_ohlcv[-1][0] + tf_ms
+            except Exception as e:
+                log.error(f"Error in fetch_ohlcv_large page: {e}")
+                break
+
+        df = pd.DataFrame(all_ohlcv[-target_limit:], columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+
     async def close_position(self, reason, price):
         if not self.position.is_open: return
         try:
@@ -1073,6 +3355,9 @@ class QuantBot:
             pos_qty = self.position.qty
             stop_order_id = self.position.stop_order_id
             invested_amount = self.position.invested_amount
+            max_price_seen = self.position.max_price_seen
+            min_price_seen = self.position.min_price_seen
+            entry_volatility = self.position.entry_volatility
 
             # 1. Exchange stop order cancel
             if pos_mode == "REAL" and stop_order_id:
@@ -1123,6 +3408,17 @@ class QuantBot:
             # Update metrics using portfolio return
             update_portfolio_metrics(total_trade_pnl_usdt, pos_mode)
 
+            # Record completed trade metrics
+            max_excursion = (max_price_seen - saved_entry_price) / saved_entry_price * 100 if pos_side == "long" else (saved_entry_price - min_price_seen) / saved_entry_price * 100
+            max_drawdown = (saved_entry_price - min_price_seen) / saved_entry_price * 100 if pos_side == "long" else (max_price_seen - saved_entry_price) / saved_entry_price * 100
+            self.dynamic_target_optimizer.record_trade(
+                "ranging" if saved_entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
+                entry_volatility,
+                max_excursion,
+                max_drawdown,
+                pnl_pct
+            )
+
             bot_state["trades"].insert(0, {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "type": saved_entry_type, "side": "CLOSED",
@@ -1155,10 +3451,17 @@ class QuantBot:
             bot_state["timeframe_changed"] = False
             force_retrain = True
 
-        margin, band_mult = get_tf_params(bot_state["timeframe"])
+        active_params = get_active_parameters()
+        bot_state["active_parameters"] = active_params
+        
+        margin = float(active_params.get("MIN_PROFIT_MARGIN", 0.3))
+        band_mult = float(active_params.get("BAND_MULT", 2.5))
+        ping_stop_mult = float(active_params.get("PING_STOP_MULT", 0.5))
+        trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
+        
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
-        info = self.signal_engine.process(df_completed, margin=margin, band_mult=band_mult, force_retrain=force_retrain)
+        info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
         is_r = info['is_ranging']
         log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), Ranging={is_r}, Active={bot_state['is_trading_active']}, OBI={bot_state.get('obi', 0.0):.2f}")
@@ -1172,6 +3475,7 @@ class QuantBot:
         bot_state["signal"] = info['signal']
         bot_state["signal_type"] = info['type']
         
+        bot_state["geom"] = info.get("geom", bot_state.get("geom", {"status": "collecting", "signal": "HOLD"}))
         bot_state["hyp_direction"] = info["hyp_direction"]
         bot_state["ou_theta"] = info["ou_theta"]
         bot_state["ou_mu"] = info["ou_mu"]
@@ -1191,6 +3495,21 @@ class QuantBot:
             if index < len(lst): return float(lst[index])
             return float(lst[-1])
 
+        # Robust historical jump detection for chart markers
+        jumps_flag = np.zeros(len(df), dtype=bool)
+        if len(df) > 30:
+            c_vals = df['close'].values
+            returns = np.diff(c_vals)
+            median_ret = np.median(returns)
+            mad = np.median(np.abs(returns - median_ret))
+            robust_std = mad * 1.4826 if mad > 1e-8 else np.std(returns)
+            if robust_std < 1e-8: robust_std = 1e-8
+            jump_threshold = 3.0 * robust_std
+            for j in range(1, len(df)):
+                ret = float(df['close'].iloc[j] - df['close'].iloc[j-1])
+                if abs(ret - median_ret) > jump_threshold:
+                    jumps_flag[j] = True
+
         # OHLC chart data for Lightweight Charts (unix timestamps)
         chart_data = []
         for j in range(len(df)):
@@ -1205,7 +3524,8 @@ class QuantBot:
                 "upper": get_padded_val(info.get('ub_list'), j, price),
                 "lower": get_padded_val(info.get('lb_list'), j, price),
                 "ou_upper": float(info.get('ou_upper', 0)) if info.get('ou_valid', False) else float(df['close'].iloc[j]),
-                "ou_lower": float(info.get('ou_lower', 0)) if info.get('ou_valid', False) else float(df['close'].iloc[j])
+                "ou_lower": float(info.get('ou_lower', 0)) if info.get('ou_valid', False) else float(df['close'].iloc[j]),
+                "jump": bool(jumps_flag[j])
             })
         bot_state["chart_data"] = chart_data
 
@@ -1264,6 +3584,10 @@ class QuantBot:
 
             self.position.update_stops(price, gv_normal, gv_lower)
             reason = self.position.check_exits(price, info)
+            # Geometric positions also exit when the conformal score collapses while an
+            # anomalous episode with negative expected return is active
+            if reason is None and self.position.entry_type == "Geo" and info.get("geom", {}).get("exit_flag"):
+                reason = "Geo Exit (Conformal/Transition)"
 
             bot_state["position_side"] = self.position.side
             bot_state["position_entry"] = float(self.position.entry_price)
@@ -1381,12 +3705,21 @@ class QuantBot:
                     if info['type'] in ("OU-Ping", "OU-Pong"):
                         stop_dist = abs(price - info['ou_stop_lower'])
                     else:
-                        stop_dist = info['gauss_vol'] * (PING_STOP_MULT if info['type'] in ("Ping","Pong") else TRAIL_MULT)
+                        stop_dist = info['gauss_vol'] * (ping_stop_mult if info['type'] in ("Ping","Pong") else trail_mult)
                     if stop_dist <= 0: stop_dist = price * 0.01
 
                     ou_target = info.get('ou_mu', 0.0)
                     ou_stop = info.get('ou_stop_lower', 0.0)
 
+                    entry_vol = float(info['gauss_vol'])
+                    reg_key = "ranging" if info['type'] in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
+                    active_p = get_active_parameters()
+                    def_tp = float(active_p.get("TP_PERCENT", 0.3))
+                    opt_tp, opt_sl = self.dynamic_target_optimizer.get_optimal_targets(
+                        reg_key, entry_vol, 
+                        default_tp=def_tp if reg_key == "trend" else 0.3, 
+                        default_sl=def_tp if reg_key == "trend" else 0.3
+                    )
                     active_mode = bot_state["trading_mode"]
 
                     if active_mode == "REAL":
@@ -1433,13 +3766,13 @@ class QuantBot:
                             # Place Native Stop-loss Order on Exchange
                             stop_order_id = None
                             try:
-                                stop_price_val = ou_stop if info['type'] == "OU-Ping" else (price - info['gauss_vol'] * (PING_STOP_MULT if info['type'] == "Ping" else TRAIL_MULT))
+                                stop_price_val = ou_stop if info['type'] == "OU-Ping" else (price - info['gauss_vol'] * (ping_stop_mult if info['type'] == "Ping" else trail_mult))
                                 stop_order_id = await self.place_native_stop_loss(filled_qty, stop_price_val)
                             except Exception as ex_stop:
                                 log.error(f"Failed to place native exchange stop order: {ex_stop}")
 
                             pos_side = "long"
-                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="REAL", stop_order_id=stop_order_id)
+                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="REAL", stop_order_id=stop_order_id, tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol)
                             
                             # Send Telegram alert
                             msg = (
@@ -1471,7 +3804,7 @@ class QuantBot:
 
                             log.info(f"PAPER ORDER: buy {info['type']} (Qty: {qty:.6f}, Entry Price: {slippage_price:.2f}, Invest: ${invested:.2f})")
                             pos_side = "long"
-                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="PAPER")
+                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="PAPER", tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol)
 
                             bot_state["trades"].insert(0, {
                                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1493,6 +3826,144 @@ class QuantBot:
                             asyncio.create_task(self.telegram.send_message(msg))
 
                 except Exception as e: log.error(f"Siparis hatasi: {e}")
+
+        # Shadow Mode Processing
+        shadow_challenger = bot_state["parameters_store"].get("shadow_challenger")
+        if shadow_challenger:
+            bot_state["shadow_active"] = True
+            bot_state["shadow_parameters"] = shadow_challenger
+            if not hasattr(self, "shadow_signal_engine"):
+                # Shadow engine stays on the legacy core (no second geometry training)
+                self.shadow_signal_engine = SignalEngine(enable_geometry=False)
+                self.shadow_position = PositionManager()
+        else:
+            bot_state["shadow_active"] = False
+            bot_state["shadow_parameters"] = {}
+
+        if bot_state["shadow_active"]:
+            try:
+                shadow_info = self.shadow_signal_engine.process(df_completed, params=shadow_challenger, force_retrain=force_retrain)
+                
+                if self.shadow_position.is_open:
+                    gv_normal = shadow_info['gauss_vol']
+                    gv_lower = gv_normal
+                    self.shadow_position.update_stops(price, gv_normal, gv_lower)
+                    
+                    shadow_reason = self.shadow_position.check_exits(price, shadow_info)
+                    
+                    bot_state["shadow_position_side"] = self.shadow_position.side
+                    bot_state["shadow_position_entry"] = float(self.shadow_position.entry_price)
+                    bot_state["shadow_position_qty"] = float(self.shadow_position.qty)
+                    bot_state["shadow_position_pnl"] = float((price - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price-price)/self.shadow_position.entry_price*100)
+                    
+                    if shadow_reason == "PARTIAL_TP":
+                        close_qty = self.shadow_position.qty * 0.70
+                        exit_price_slippage = price * 0.9995 if self.shadow_position.side == "long" else price * 1.0005
+                        comm_exit = (close_qty * exit_price_slippage) * 0.001
+                        
+                        pnl_pct = (exit_price_slippage - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price - exit_price_slippage)/self.shadow_position.entry_price*100
+                        realized_pnl_usdt = (self.shadow_position.invested_amount * 0.70) * (pnl_pct / 100) - comm_exit
+                        
+                        bot_state["shadow_balance"] += realized_pnl_usdt
+                        self.shadow_position.realized_pnl_usdt += realized_pnl_usdt
+                        
+                        bot_state["shadow_trades"].insert(0, {
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "type": self.shadow_position.entry_type,
+                            "side": f"PART_TP_{self.shadow_position.side.upper()}",
+                            "entry": float(self.shadow_position.entry_price),
+                            "exit": float(exit_price_slippage),
+                            "pnl": f"{pnl_pct:+.2f}%",
+                            "reason": "First Trailing Stop Hit (70% TP)"
+                        })
+                        
+                        self.shadow_position.qty *= 0.30
+                        self.shadow_position.invested_amount *= 0.30
+                        self.shadow_position.has_taken_partial_tp = True
+                        bot_state["shadow_position_qty"] = float(self.shadow_position.qty)
+                        
+                    elif shadow_reason:
+                        exit_price_slippage = price * 0.9995 if self.shadow_position.side == "long" else price * 1.0005
+                        comm_exit = (self.shadow_position.qty * exit_price_slippage) * 0.001
+                        
+                        pnl_pct = (exit_price_slippage - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price - exit_price_slippage)/self.shadow_position.entry_price*100
+                        pnl_usdt = self.shadow_position.invested_amount * (pnl_pct / 100) - comm_exit
+                        
+                        total_trade_pnl_usdt = self.shadow_position.realized_pnl_usdt + pnl_usdt
+                        bot_state["shadow_balance"] += pnl_usdt
+                        
+                        bot_state["shadow_trade_count"] += 1
+                        bot_state["shadow_total_pnl"] += total_trade_pnl_usdt
+                        
+                        bot_state["shadow_trades"].insert(0, {
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "type": self.shadow_position.entry_type,
+                            "side": "CLOSED",
+                            "entry": float(self.shadow_position.entry_price),
+                            "exit": float(exit_price_slippage),
+                            "pnl": f"{(total_trade_pnl_usdt / (self.shadow_position.invested_amount / 0.30 if self.shadow_position.has_taken_partial_tp else self.shadow_position.invested_amount) * 100):+.2f}%",
+                            "reason": shadow_reason
+                        })
+                        
+                        # Record shadow completed trade metrics
+                        max_excursion = (self.shadow_position.max_price_seen - self.shadow_position.entry_price) / self.shadow_position.entry_price * 100 if self.shadow_position.side == "long" else (self.shadow_position.entry_price - self.shadow_position.min_price_seen) / self.shadow_position.entry_price * 100
+                        max_drawdown = (self.shadow_position.entry_price - self.shadow_position.min_price_seen) / self.shadow_position.entry_price * 100 if self.shadow_position.side == "long" else (self.shadow_position.max_price_seen - self.shadow_position.entry_price) / self.shadow_position.entry_price * 100
+                        self.shadow_dynamic_target_optimizer.record_trade(
+                            "ranging" if self.shadow_position.entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
+                            self.shadow_position.entry_volatility,
+                            max_excursion,
+                            max_drawdown,
+                            pnl_pct
+                        )
+                        
+                        self.shadow_position.close(shadow_reason, exit_price_slippage)
+                        bot_state["shadow_position_side"] = None
+                        bot_state["shadow_position_qty"] = 0.0
+                
+                if not self.shadow_position.is_open and shadow_info['signal'] == "BUY":
+                    shadow_obi_pass = True
+                    if bot_state.get("obi", 0) < -0.3:
+                        shadow_obi_pass = False
+                        
+                    if shadow_obi_pass:
+                        shadow_stop_dist = shadow_info['gauss_vol'] * (float(shadow_challenger.get('PING_STOP_MULT', 0.5)) if shadow_info['type'] in ("Ping","Pong") else float(shadow_challenger.get('TRAIL_MULT', 3.0)))
+                        if shadow_stop_dist <= 0:
+                            shadow_stop_dist = price * 0.01
+                            
+                        risk_amount = bot_state["shadow_balance"] * (TARGET_RISK_PERCENT / 100.0)
+                        target_qty = risk_amount / shadow_stop_dist
+                        max_qty = (bot_state["shadow_balance"] * MAX_CAPITAL_ALLOCATION) / price
+                        qty = min(target_qty, max_qty)
+                        invested = qty * price
+                        
+                        entry_fee = invested * 0.001
+                        bot_state["shadow_balance"] -= entry_fee
+                        
+                        shadow_entry_vol = float(shadow_info['gauss_vol'])
+                        shadow_reg_key = "ranging" if shadow_info['type'] in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
+                        shadow_def_tp = float(shadow_challenger.get("TP_PERCENT", 0.3))
+                        shadow_opt_tp, shadow_opt_sl = self.shadow_dynamic_target_optimizer.get_optimal_targets(
+                            shadow_reg_key, shadow_entry_vol, 
+                            default_tp=shadow_def_tp if shadow_reg_key == "trend" else 0.3, 
+                            default_sl=shadow_def_tp if shadow_reg_key == "trend" else 0.3
+                        )
+                        self.shadow_position.open("long", price, qty, shadow_info['type'], shadow_info['gauss_vol'], invested, params=shadow_challenger, tp_percent=shadow_opt_tp, sl_percent=shadow_opt_sl, entry_volatility=shadow_entry_vol)
+                        bot_state["shadow_position_side"] = "long"
+                        bot_state["shadow_position_entry"] = float(price)
+                        bot_state["shadow_position_qty"] = float(qty)
+                        bot_state["shadow_position_pnl"] = 0.0
+                        
+                        bot_state["shadow_trades"].insert(0, {
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "type": shadow_info['type'],
+                            "side": "LONG",
+                            "entry": float(price),
+                            "exit": 0.0,
+                            "pnl": "OPEN",
+                            "reason": f"Signal: {shadow_info['signal']}"
+                        })
+            except Exception as e_shadow:
+                log.error(f"Shadow Mode tick error: {e_shadow}")
 
     async def fast_orderbook_tick(self):
         while True:
@@ -1518,7 +3989,7 @@ class QuantBot:
             await asyncio.sleep(FAST_LOOP_INTERVAL)
 
     async def main_loop(self):
-        log.info("QUANT BOT V3.5 - Paper Trading Active")
+        log.info("QUANT BOT V3.6 (Learned Geometry) - Paper Trading Active")
         bot_state["loop"] = asyncio.get_running_loop()
         await asyncio.to_thread(self.exchange.load_markets)
 
@@ -1608,6 +4079,403 @@ class QuantBot:
                 log.error(f"Ana dongu hatasi: {e}")
                 await asyncio.sleep(5)
 
+class Backtester:
+    def __init__(self, df, commission_rate=0.001, slippage_rate=0.0005, spread_rate=0.0001):
+        self.df = df
+        self.commission_rate = commission_rate
+        self.slippage_rate = slippage_rate
+        self.spread_rate = spread_rate
+
+    def run(self, params, geo=None):
+        """geo: optional per-bar arrays from GeometricPipeline.batch_signals — when
+        given, entries/exits come from the learned-geometry decision chain."""
+        c = self.df['close'].values
+        h = self.df['high'].values
+        l = self.df['low'].values
+        o = self.df['open'].values
+        v = self.df['volume'].values
+        
+        balance = 1000.0
+        position_side = None
+        entry_price = 0.0
+        entry_type = ""
+        qty = 0.0
+        invested_amount = 0.0
+        has_taken_partial_tp = False
+        trail_stop_30 = 0.0
+        trail_stop_70 = 0.0
+        ping_stop = 0.0
+        
+        dynamic_target_optimizer = DynamicTargetOptimizer()
+        entry_volatility = 0.0
+        current_tp_percent = 0.3
+        current_sl_percent = 0.3
+        max_price_seen = 0.0
+        min_price_seen = 0.0
+        
+        trades = []
+        pnl_list = []
+        gross_profit = 0.0
+        gross_loss = 0.0
+        win_trades = 0
+        loss_trades = 0
+        
+        fast_len = int(params.get("FAST_LENGTH", 8))
+        slow_len = int(params.get("SLOW_LENGTH", 21))
+        vol_len = int(params.get("VOL_LENGTH", 14))
+        cvd_len = int(params.get("CVD_LENGTH", 14))
+        band_mult = float(params.get("BAND_MULT", 2.5))
+        margin = float(params.get("MIN_PROFIT_MARGIN", 0.3))
+        trail_mult = float(params.get("TRAIL_MULT", 3.0))
+        ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
+        tp_percent = float(params.get("TP_PERCENT", 3.0))
+        
+        fg = gaussian_filter(c, fast_len)
+        sg = gaussian_filter(c, slow_len)
+        gv = gaussian_filter(calc_true_range(h, l, c), vol_len)
+        delta = np.where(c > o, v, np.where(c < o, -v, 0.0))
+        cvd_g = gaussian_filter(np.cumsum(delta), cvd_len)
+        
+        rough_path_classifier = RoughPathClassifier()
+        features = rough_path_classifier._compute_signatures(c) if geo is None else None
+        ou = OUPingPong()
+
+        start_idx = max(slow_len + 100, 300) if geo is None else max(slow_len + 5, 65)
+        if start_idx >= len(self.df):
+            return {
+                "trade_count": 0, "total_pnl_pct": 0.0, "total_pnl_usdt": 0.0,
+                "profit_factor": 1.0, "max_drawdown_pct": 0.0, "calmar_ratio": 0.0,
+                "sharpe_ratio": 0.0, "sortino_ratio": 0.0, "recovery_factor": 0.0,
+                "win_rate": 0.0, "expectancy": 0.0, "trades": []
+            }
+            
+        if geo is None:
+            rough_path_classifier.fit(self.df.iloc[:start_idx])
+
+        for idx in range(start_idx, len(self.df)):
+            price = float(c[idx])
+            prev_price = float(c[idx-1])
+
+            if geo is None:
+                if rough_path_classifier.model is not None:
+                    feats_bias = np.append(features[idx-1], 1.0)
+                    pred_val = float(np.dot(feats_bias, rough_path_classifier.model))
+                    if pred_val > 0.35: pred_direction = 1
+                    elif pred_val < -0.35: pred_direction = -1
+                    else: pred_direction = 0
+                else:
+                    pred_direction = 0
+                is_r = (pred_direction == 0)
+                hyp_direction = pred_direction
+                ou.fit(c[max(0, idx - 100):idx])
+            else:
+                pred_direction = 0
+                hyp_direction = 0
+                is_r = False
+            
+            if position_side is not None:
+                max_price_seen = max(max_price_seen, price)
+                min_price_seen = min(min_price_seen, price)
+                gv_normal = float(gv[idx-1])
+                gv_lower = 0.7 * gv_normal
+                
+                if position_side == "long":
+                    trail_stop_30 = max(trail_stop_30, price - gv_normal * trail_mult)
+                    if not has_taken_partial_tp:
+                        trail_stop_70 = max(trail_stop_70, price - gv_lower * trail_mult)
+                    ping_stop = max(ping_stop, price - gv_normal * ping_stop_mult)
+                else:
+                    trail_stop_30 = min(trail_stop_30, price + gv_normal * trail_mult)
+                    if not has_taken_partial_tp:
+                        trail_stop_70 = min(trail_stop_70, price + gv_lower * trail_mult)
+                    ping_stop = min(ping_stop, price + gv_normal * ping_stop_mult)
+                    
+                exit_reason = None
+                if position_side == "long":
+                    if has_taken_partial_tp:
+                        if price <= trail_stop_30: exit_reason = "Trail Stop (30%)"
+                    elif entry_type in ("Ping", "OU-Ping"):
+                        if price <= entry_price * (1 - current_sl_percent/100): exit_reason = "Stop Loss (Ping)"
+                        elif price >= entry_price * (1 + current_tp_percent/100): exit_reason = "Ping TP"
+                    elif entry_type in ("Trend", "Geo"):
+                        if price <= entry_price * (1 - current_sl_percent/100): exit_reason = "Stop Loss (Trend)"
+                        elif price <= trail_stop_70: exit_reason = "PARTIAL_TP"
+                        elif price >= entry_price * (1 + current_tp_percent/100): exit_reason = f"Trend TP ({current_tp_percent:.2f}%)"
+                else:
+                    if has_taken_partial_tp:
+                        if price >= trail_stop_30: exit_reason = "Trail Stop (30%)"
+                    elif entry_type in ("Pong", "OU-Pong"):
+                        if price >= entry_price * (1 + current_sl_percent/100): exit_reason = "Stop Loss (Pong)"
+                        elif price <= entry_price * (1 - current_tp_percent/100): exit_reason = "Pong TP"
+                    elif entry_type in ("Trend", "Geo"):
+                        if price >= entry_price * (1 + current_sl_percent/100): exit_reason = "Stop Loss (Trend)"
+                        elif price >= trail_stop_70: exit_reason = "PARTIAL_TP"
+                        elif price <= entry_price * (1 - current_tp_percent/100): exit_reason = f"Trend TP ({current_tp_percent:.2f}%)"
+
+                if exit_reason is None:
+                    if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") and not is_r:
+                        exit_reason = "Acil Cikis (Rejim Degisti)"
+                    elif geo is not None and entry_type == "Geo" and bool(geo["exit_flag"][idx-1]):
+                        exit_reason = "Geo Exit (Conformal/Transition)"
+                        
+                if exit_reason == "PARTIAL_TP":
+                    close_qty = qty * 0.70
+                    slippage_factor = self.slippage_rate + self.spread_rate / 2
+                    exec_price = price * (1 - slippage_factor) if position_side == "long" else price * (1 + slippage_factor)
+                    pnl_pct = (exec_price - entry_price) / entry_price * 100 if position_side == "long" else (entry_price - exec_price) / entry_price * 100
+                    fee = close_qty * exec_price * self.commission_rate
+                    pnl_usdt = (invested_amount * 0.70) * (pnl_pct / 100) - fee
+                    
+                    balance += pnl_usdt
+                    pnl_list.append(pnl_pct)
+                    if pnl_pct > 0: gross_profit += pnl_usdt
+                    else: gross_loss += abs(pnl_usdt)
+                    
+                    qty *= 0.30
+                    invested_amount *= 0.30
+                    has_taken_partial_tp = True
+                elif exit_reason is not None:
+                    slippage_factor = self.slippage_rate + self.spread_rate / 2
+                    exec_price = price * (1 - slippage_factor) if position_side == "long" else price * (1 + slippage_factor)
+                    pnl_pct = (exec_price - entry_price) / entry_price * 100 if position_side == "long" else (entry_price - exec_price) / entry_price * 100
+                    fee = qty * exec_price * self.commission_rate
+                    pnl_usdt = invested_amount * (pnl_pct / 100) - fee
+                    
+                    balance += pnl_usdt
+                    pnl_list.append(pnl_pct)
+                    if pnl_pct > 0:
+                        gross_profit += pnl_usdt
+                        win_trades += 1
+                    else:
+                        gross_loss += abs(pnl_usdt)
+                        loss_trades += 1
+                        
+                    trades.append({
+                        "entry_price": float(entry_price),
+                        "exit_price": float(exec_price),
+                        "pnl_pct": float(pnl_pct),
+                        "pnl_usdt": float(pnl_usdt),
+                        "side": position_side,
+                        "type": entry_type,
+                        "reason": exit_reason
+                    })
+                    
+                    # Record completed trade
+                    max_excursion = (max_price_seen - entry_price) / entry_price * 100 if position_side == "long" else (entry_price - min_price_seen) / entry_price * 100
+                    max_drawdown = (entry_price - min_price_seen) / entry_price * 100 if position_side == "long" else (max_price_seen - entry_price) / entry_price * 100
+                    dynamic_target_optimizer.record_trade(
+                        "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
+                        entry_volatility,
+                        max_excursion,
+                        max_drawdown,
+                        pnl_pct
+                    )
+                    
+                    position_side = None
+                    qty = 0.0
+                    invested_amount = 0.0
+                    has_taken_partial_tp = False
+            
+            if position_side is None:
+                sig, st = "HOLD", ""
+                if geo is not None:
+                    # learned-geometry decision chain on the last completed bar
+                    if str(geo["signal"][idx-1]) == "BUY":
+                        sig, st = "BUY", "Geo"
+                else:
+                    ub, lb = sg[idx-1] + gv[idx-1] * band_mult, sg[idx-1] - gv[idx-1] * band_mult
+                    cu = fg[idx-1] > sg[idx-1] and fg[idx-2] <= sg[idx-2]
+                    cd = fg[idx-1] < sg[idx-1] and fg[idx-2] >= sg[idx-2]
+                    cb = cvd_g[idx-1] > cvd_g[idx-2]
+                    cbe = cvd_g[idx-1] < cvd_g[idx-2]
+
+                    ml = ((sg[idx-1] - lb) / lb * 100) >= margin if lb > 0 else False
+                    ms = ((ub - sg[idx-1]) / sg[idx-1] * 100) >= margin if sg[idx-1] > 0 else False
+
+                    if not is_r and cu and cb and hyp_direction == 1:
+                        sig, st = "BUY", "Trend"
+                    elif not is_r and cd and cbe and hyp_direction == -1:
+                        sig, st = "SELL", "Trend"
+                    elif is_r and ou.is_valid:
+                        ou_sig, ou_type = ou.get_signal(price)
+                        if ou_sig != "HOLD":
+                            sig, st = ou_sig, ou_type
+                    elif is_r and ml and l[idx-1] < lb and c[idx-1] > lb:
+                        sig, st = "BUY", "Ping"
+                    elif is_r and ms and h[idx-1] > ub and c[idx-1] < ub:
+                        sig, st = "SELL", "Pong"
+                    
+                if sig == "BUY" and balance >= 5.0:
+                    position_side = "long"
+                    entry_type = st
+                    
+                    slippage_factor = self.slippage_rate + self.spread_rate / 2
+                    entry_price = price * (1 + slippage_factor)
+                    
+                    entry_volatility = float(gv[idx-1])
+                    regime_key = "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
+                    current_tp_percent, current_sl_percent = dynamic_target_optimizer.get_optimal_targets(
+                        regime_key, entry_volatility, 
+                        default_tp=tp_percent if regime_key == "trend" else 0.3, 
+                        default_sl=tp_percent if regime_key == "trend" else 0.3
+                    )
+                    max_price_seen = entry_price
+                    min_price_seen = entry_price
+                    
+                    stop_dist = gv[idx-1] * (ping_stop_mult if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else trail_mult)
+                    if stop_dist <= 0: stop_dist = entry_price * 0.01
+                    
+                    risk_amount = balance * (TARGET_RISK_PERCENT / 100.0)
+                    target_qty = risk_amount / stop_dist
+                    max_qty = (balance * MAX_CAPITAL_ALLOCATION) / entry_price
+                    qty = min(target_qty, max_qty)
+                    invested_amount = qty * entry_price
+                    
+                    balance -= invested_amount * self.commission_rate
+                    has_taken_partial_tp = False
+                    trail_stop_30 = entry_price - gv[idx-1] * trail_mult
+                    trail_stop_70 = entry_price - gv[idx-1] * trail_mult
+                    ping_stop = entry_price - gv[idx-1] * ping_stop_mult
+
+        trade_count = len(trades)
+        total_pnl_pct = sum(pnl_list)
+        total_pnl_usdt = balance - 1000.0
+        
+        peak = 1000.0
+        max_dd_usdt = 0.0
+        current_balance = 1000.0
+        for t in trades:
+            current_balance += t['pnl_usdt']
+            if current_balance > peak: peak = current_balance
+            dd = peak - current_balance
+            if dd > max_dd_usdt: max_dd_usdt = dd
+        max_dd_pct = (max_dd_usdt / peak * 100) if peak > 0 else 0.0
+        
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 1.0)
+        calmar = (total_pnl_pct / max_dd_pct) if max_dd_pct > 0 else (999.0 if total_pnl_pct > 0 else 0.0)
+        
+        if len(pnl_list) > 1:
+            std_pnl = np.std(pnl_list)
+            sharpe = float(np.mean(pnl_list) / std_pnl) if std_pnl > 0 else 0.0
+            downside_returns = [r for r in pnl_list if r < 0]
+            std_downside = np.std(downside_returns) if downside_returns else 1e-8
+            sortino = float(np.mean(pnl_list) / std_downside) if std_downside > 0 else 0.0
+        else:
+            sharpe = sortino = 0.0
+            
+        win_rate = (win_trades / trade_count * 100) if trade_count > 0 else 0.0
+        expectancy = ((win_rate/100) * np.mean([t['pnl_pct'] for t in trades if t['pnl_pct'] > 0])) - ((1 - win_rate/100) * np.mean([abs(t['pnl_pct']) for t in trades if t['pnl_pct'] <= 0])) if trade_count > 0 and len([t for t in trades if t['pnl_pct'] > 0]) > 0 and len([t for t in trades if t['pnl_pct'] <= 0]) > 0 else 0.0
+        recovery_factor = (total_pnl_usdt / max_dd_usdt) if max_dd_usdt > 0 else 999.0
+        
+        return {
+            "trade_count": trade_count,
+            "total_pnl_pct": total_pnl_pct,
+            "total_pnl_usdt": total_pnl_usdt,
+            "profit_factor": profit_factor,
+            "max_drawdown_pct": max_dd_pct,
+            "calmar_ratio": calmar,
+            "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
+            "recovery_factor": recovery_factor,
+            "win_rate": win_rate,
+            "expectancy": expectancy,
+            "trades": trades
+        }
+
+class BacktestOptimizer:
+    def __init__(self, df):
+        self.df = df
+        
+    def run_wfo(self):
+        L = len(self.df)
+        window_size = int(L * 0.40)
+        n_slices = 10
+        step = int((L - window_size) / (n_slices - 1)) if n_slices > 1 else 0
+        
+        grid_fast = [5, 8, 12]
+        grid_slow = [18, 21, 28]
+        grid_band = [2.0, 2.5, 3.0]
+        grid_margin = [0.2, 0.3, 0.4]
+        
+        combos = []
+        for f in grid_fast:
+            for s in grid_slow:
+                for b in grid_band:
+                    for m in grid_margin:
+                        combos.append({
+                            "FAST_LENGTH": f,
+                            "SLOW_LENGTH": s,
+                            "BAND_MULT": b,
+                            "MIN_PROFIT_MARGIN": m,
+                            "VOL_LENGTH": 14,
+                            "CVD_LENGTH": 14,
+                            "TRAIL_MULT": 3.0,
+                            "PING_STOP_MULT": 0.5,
+                            "TP_PERCENT": 3.0
+                        })
+                        
+        best_candidate = None
+        best_stability_count = -1
+        lowest_variance = float('inf')
+        candidate_reports = []
+        
+        slices = []
+        for i in range(n_slices):
+            start = i * step
+            end = start + window_size
+            is_end = start + int(0.70 * window_size)
+            slices.append({
+                "is_df": self.df.iloc[start:is_end].copy(),
+                "oos_df": self.df.iloc[is_end:end].copy()
+            })
+            
+        for combo in combos:
+            slice_pfs = []
+            slice_calmars = []
+            stable_slices = 0
+            
+            for s_idx, sl in enumerate(slices):
+                bt = Backtester(sl["oos_df"])
+                res = bt.run(combo)
+                
+                pf = res["profit_factor"]
+                calmar = res["calmar_ratio"]
+                
+                slice_pfs.append(pf)
+                slice_calmars.append(calmar)
+                
+                if pf > 1.20 and calmar > 1.0:
+                    stable_slices += 1
+                    
+            if stable_slices >= 8:
+                pf_std = float(np.std(slice_pfs))
+                if stable_slices > best_stability_count or (stable_slices == best_stability_count and pf_std < lowest_variance):
+                    best_stability_count = stable_slices
+                    lowest_variance = pf_std
+                    best_candidate = combo
+                    best_candidate["slice_pfs"] = slice_pfs
+                    best_candidate["slice_calmars"] = slice_calmars
+                    
+            candidate_reports.append({
+                "parameters": combo,
+                "stable_slices": stable_slices,
+                "avg_pf": float(np.mean(slice_pfs))
+            })
+            
+        if best_candidate is None:
+            candidate_reports.sort(key=lambda x: (x["stable_slices"], x["avg_pf"]), reverse=True)
+            if candidate_reports:
+                best_candidate = candidate_reports[0]["parameters"]
+                best_candidate["slice_pfs"] = []
+                best_candidate["slice_calmars"] = []
+                best_stability_count = candidate_reports[0]["stable_slices"]
+                
+        return {
+            "challenger": best_candidate,
+            "stability_count": best_stability_count,
+            "variance": lowest_variance if lowest_variance != float('inf') else 0.0,
+            "slices_evaluated": n_slices
+        }
 app = Flask("QuantDesktopApp")
 
 HTML_TEMPLATE = """
@@ -1616,7 +4484,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Bot V3.5 - TradingView Charts</title>
+    <title>Quant Bot V3.6 - Learned Geometry</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="/static/lightweight-charts.js"></script>
@@ -1713,7 +4581,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <header>
-        <div class="header-title"><i class="fa-solid fa-robot" style="color: #2962ff;"></i> Quant Bot V3.5</div>
+        <div class="header-title"><i class="fa-solid fa-robot" style="color: #2962ff;"></i> Quant Bot V3.6 — Learned Geometry</div>
         <div class="mode-toggle">
             <button id="btn-mode-paper" class="mode-btn paper-active" onclick="setTradingMode('PAPER')"><i class="fa-solid fa-flask"></i> PAPER</button>
             <button id="btn-mode-real" class="mode-btn" onclick="setTradingMode('REAL')"><i class="fa-solid fa-fire"></i> REAL</button>
@@ -1747,7 +4615,15 @@ HTML_TEMPLATE = """
                 <div style="flex:1;"></div>
                 <div id="current-price" class="price-neutral" style="font-size:1.3rem; font-weight:700;">$0.00</div>
             </div>
-            <div class="chart-wrap"><div id="tv-chart-container"></div></div>
+            <div class="chart-wrap">
+                <div id="tv-chart-container"></div>
+                <div id="chart-legend" style="position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(30, 34, 45, 0.85); border: 1px solid var(--border-color); padding: 6px 10px; border-radius: 4px; font-size: 0.72rem; color: var(--text-main); pointer-events: none; display: flex; flex-direction: column; gap: 3px;">
+                    <div><span style="color:#f5b041; font-weight:700;">■</span> Gauss Slow (MA)</div>
+                    <div><span style="color:#2962ff; font-weight:700;">■</span> Gauss Bands (Volatility)</div>
+                    <div><span style="color:#e040fb; font-weight:700;">■</span> OU Corridor (Mean Reversion)</div>
+                    <div><span style="color:#ff5722; font-weight:700;">▲</span> JD Jump (Sıçrama)</div>
+                </div>
+            </div>
         </div>
 
         <div class="right-panel">
@@ -1771,6 +4647,20 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="panel-box">
+                <div class="box-title">Learned Geometry <span id="geom-status" style="font-size:0.65rem; color:var(--warning-yellow);">COLLECTING</span></div>
+                <div class="kv-row"><span class="kv-key">Schema M:</span><span class="kv-val" id="geom-schema" style="font-size:0.68rem;">-</span></div>
+                <div class="kv-row"><span class="kv-key">κ (learned/init):</span><span class="kv-val" id="geom-kappa">- / -</span></div>
+                <div class="kv-row"><span class="kv-key">η (speed):</span><span class="kv-val" id="geom-eta">-</span></div>
+                <div class="kv-row"><span class="kv-key">P(δ≠0):</span><span class="kv-val" id="geom-pdelta">-</span></div>
+                <div class="kv-row"><span class="kv-key">Episode:</span><span class="kv-val" id="geom-episode">NORMAL</span></div>
+                <div class="kv-row"><span class="kv-key">p GBM / Meta:</span><span class="kv-val" id="geom-p">- / -</span></div>
+                <div class="kv-row"><span class="kv-key">Conformal A:</span><span class="kv-val" id="geom-a">-</span></div>
+                <div class="kv-row"><span class="kv-key">D_anchor:</span><span class="kv-val" id="geom-danchor">-</span></div>
+                <div class="kv-row"><span class="kv-key">Anchor Panel:</span><span class="kv-val" id="geom-panel" style="font-size:0.7rem;">-</span></div>
+                <div class="kv-row"><span class="kv-key">Fold:</span><span class="kv-val" id="geom-fold">0</span></div>
+            </div>
+
+            <div class="panel-box">
                 <div class="box-title">OU Parameters (JD-OU)</div>
                 <div class="kv-row"><span class="kv-key">θ (Speed):</span><span class="kv-val" id="ou-theta">0.00</span></div>
                 <div class="kv-row"><span class="kv-key">μ (Equil.):</span><span class="kv-val" id="ou-mu">$0.00</span></div>
@@ -1780,6 +4670,35 @@ HTML_TEMPLATE = """
                 <div class="kv-row"><span class="kv-key">Jump Cooldown:</span><span class="kv-val" id="ou-cooldown">NO</span></div>
                 <div class="kv-row"><span class="kv-key">OU Valid:</span><span class="kv-val" id="ou-valid">NO</span></div>
                 <div class="kv-row"><span class="kv-key">Corridor:</span><span class="kv-val" id="ou-corridor" style="font-size:0.7rem;">-</span></div>
+            </div>
+
+            <div class="panel-box">
+                <div class="box-title">Champion Params (Live) <span style="font-size:0.65rem; color:var(--profit-green);" id="champion-version">v1</span></div>
+                <div id="champion-params" style="font-size:0.72rem; color:var(--text-main); display:grid; grid-template-columns:1fr 1fr; gap:2px 8px;">
+                    <!-- JS populated -->
+                </div>
+            </div>
+
+            <div class="panel-box">
+                <div class="box-title">Shadow Mode & WFO</div>
+                <div class="kv-row"><span class="kv-key">Challenger:</span><span class="kv-val color-blue" id="shadow-challenger-title">None</span></div>
+                <div id="challenger-params" style="font-size:0.7rem; color:var(--text-muted); display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; margin-bottom:6px; display:none;">
+                    <!-- JS populated -->
+                </div>
+                <div class="kv-row"><span class="kv-key">Shadow Bal:</span><span class="kv-val color-green" id="shadow-balance">$1000.00</span></div>
+                <div class="kv-row"><span class="kv-key">Shadow PnL:</span><span class="kv-val" id="shadow-pnl">$0.00</span></div>
+                <div class="kv-row"><span class="kv-key">Shadow Pos:</span><span class="kv-val" id="shadow-position">None</span></div>
+                
+                <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
+                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runBacktest()" id="btn-backtest">Run Backtest (3000b)</button>
+                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runWFO()" id="btn-wfo">Run WFO (10 slices)</button>
+                    <button class="btn" style="background:var(--tv-green); color:white; font-size:0.7rem; padding:4px; display:none;" onclick="promoteChallenger()" id="btn-promote">Promote Challenger</button>
+                </div>
+            </div>
+
+            <div class="panel-box" id="wfo-report-box" style="display:none; font-size:0.75rem;">
+                <div class="box-title">WFO / Backtest Report</div>
+                <div id="wfo-report-content"></div>
             </div>
         </div>
     </div>
@@ -1826,9 +4745,9 @@ HTML_TEMPLATE = """
             upperLine = tvChart.addLineSeries({ color: '#2962ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
             lowerLine = tvChart.addLineSeries({ color: '#2962ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
             
-            // OU Bands (orange dashed)
-            ouUpperLine = tvChart.addLineSeries({ color: '#ff9800', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
-            ouLowerLine = tvChart.addLineSeries({ color: '#ff9800', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
+            // OU Bands (magenta dashed)
+            ouUpperLine = tvChart.addLineSeries({ color: '#e040fb', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
+            ouLowerLine = tvChart.addLineSeries({ color: '#e040fb', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
 
             new ResizeObserver(entries => {
                 const { width, height } = entries[0].contentRect;
@@ -1924,6 +4843,37 @@ HTML_TEMPLATE = """
                     document.getElementById('regime-box').innerText = s.regime.toUpperCase();
                     document.getElementById('regime-box').className = "regime-box " + (s.is_ranging ? "regime-range" : "regime-trend");
 
+                    // Learned Geometry panel (V3.6)
+                    if (s.geom) {
+                        const g = s.geom;
+                        const gst = document.getElementById('geom-status');
+                        gst.innerText = (g.status || 'collecting').toUpperCase();
+                        gst.style.color = g.status === 'ready' ? 'var(--profit-green)' : 'var(--warning-yellow)';
+                        document.getElementById('geom-schema').innerText = g.schema || '-';
+                        document.getElementById('geom-kappa').innerText = (g.kappa || 0).toFixed(3) + ' / ' + (g.kappa_init || 0).toFixed(3);
+                        document.getElementById('geom-eta').innerText = (g.eta || 0).toFixed(3);
+                        const gd = g.diag || {};
+                        document.getElementById('geom-pdelta').innerText = (gd.p_delta_nonzero !== undefined) ? (gd.p_delta_nonzero * 100).toFixed(1) + '%' : '-';
+                        const epEl = document.getElementById('geom-episode');
+                        if (g.episode === 'EPISODE') {
+                            epEl.innerText = 'EPISODE' + (g.cluster >= 0 ? ' (A' + g.cluster + ')' : '');
+                            epEl.style.color = 'var(--warning-yellow)';
+                        } else {
+                            epEl.innerText = 'NORMAL';
+                            epEl.style.color = 'var(--profit-green)';
+                        }
+                        document.getElementById('geom-p').innerText = (g.p_gbm !== undefined ? g.p_gbm.toFixed(2) : '-') + ' / ' + (g.p_meta !== undefined ? g.p_meta.toFixed(2) : '-');
+                        const aEl = document.getElementById('geom-a');
+                        aEl.innerText = (g.a_score || 0).toFixed(2) + ' (gate ' + (g.a_gate !== undefined ? g.a_gate.toFixed(2) : '0.50') + ')';
+                        aEl.style.color = (g.a_score || 0) >= (g.a_gate || 0.5) ? 'var(--profit-green)' : 'var(--text-muted)';
+                        document.getElementById('geom-danchor').innerText = (gd.d_anchor !== undefined) ? gd.d_anchor.toFixed(4) : '-';
+                        const pn = g.panel || {};
+                        document.getElementById('geom-panel').innerText = (pn.core_active !== undefined)
+                            ? (pn.core_active + ' act / ' + (pn.core_retired || 0) + ' ret')
+                            : '-';
+                        document.getElementById('geom-fold').innerText = g.fold || 0;
+                    }
+
                     // OU Parameters panel details
                     document.getElementById('ou-theta').innerText = s.ou_theta.toFixed(4);
                     document.getElementById('ou-mu').innerText = "$" + s.ou_mu.toFixed(2);
@@ -1953,6 +4903,111 @@ HTML_TEMPLATE = """
                         pInfo.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:4px 0; font-size:0.8rem;">No Open Position</div>';
                     }
 
+                    // Champion Params
+                    const champPStore = s.parameters_store || {};
+                    document.getElementById('champion-version').innerText = 'v' + (champPStore.active_version || 1);
+                    const activeP = s.active_parameters || {};
+                    document.getElementById('champion-params').innerHTML = Object.entries(activeP).map(([k, v]) => 
+                        '<div><span class="kv-key">' + k.replace('_LENGTH', '').replace('_MULT', '') + ':</span> <span class="kv-val">' + v + '</span></div>'
+                    ).join('');
+
+                    // Shadow challenger & buttons
+                    const challengerP = champPStore.shadow_challenger;
+                    const cTitle = document.getElementById('shadow-challenger-title');
+                    const cParams = document.getElementById('challenger-params');
+                    const promoteBtn = document.getElementById('btn-promote');
+                    if (challengerP) {
+                        cTitle.innerText = "Active Challenger";
+                        cTitle.className = "kv-val color-blue";
+                        cParams.style.display = "grid";
+                        cParams.innerHTML = Object.entries(challengerP).map(([k, v]) => 
+                            '<div><span class="kv-key">' + k.replace('_LENGTH', '').replace('_MULT', '') + ':</span> <span class="kv-val">' + v + '</span></div>'
+                        ).join('');
+                        
+                        if (!s.position_side) {
+                            promoteBtn.style.display = "block";
+                        } else {
+                            promoteBtn.style.display = "none";
+                        }
+                    } else {
+                        cTitle.innerText = "None";
+                        cTitle.className = "kv-val color-red";
+                        cParams.style.display = "none";
+                        promoteBtn.style.display = "none";
+                    }
+
+                    // Shadow metrics
+                    document.getElementById('shadow-balance').innerText = "$" + s.shadow_balance.toFixed(2);
+                    document.getElementById('shadow-pnl').innerText = (s.shadow_total_pnl >= 0 ? "+" : "") + s.shadow_total_pnl.toFixed(2) + " USDT (" + s.shadow_trade_count + " trades)";
+                    document.getElementById('shadow-pnl').className = "kv-val " + (s.shadow_total_pnl >= 0 ? "color-green" : "color-red");
+                    
+                    if (s.shadow_position_side) {
+                        document.getElementById('shadow-position').innerHTML = '<span class="' + (s.shadow_position_side === 'long' ? 'badge-long' : 'badge-short') + '">' + s.shadow_position_side.toUpperCase() + '</span> @ $' + s.shadow_position_entry.toFixed(2) + ' (' + (s.shadow_position_pnl >= 0 ? '+' : '') + s.shadow_position_pnl.toFixed(2) + '%)';
+                    } else {
+                        document.getElementById('shadow-position').innerText = "None";
+                    }
+
+                    // Task spinners
+                    const btBtn = document.getElementById('btn-backtest');
+                    if (s.backtest_running) {
+                        btBtn.innerText = "Running Backtest...";
+                        btBtn.disabled = true;
+                    } else {
+                        btBtn.innerText = "Run Backtest (3000b)";
+                        btBtn.disabled = false;
+                    }
+
+                    const wfoBtn = document.getElementById('btn-wfo');
+                    if (s.wfo_running) {
+                        wfoBtn.innerText = "Running WFO Grid...";
+                        wfoBtn.disabled = true;
+                    } else {
+                        wfoBtn.innerText = "Run WFO (10 slices)";
+                        wfoBtn.disabled = false;
+                    }
+
+                    // Reports display
+                    const wfoBox = document.getElementById('wfo-report-box');
+                    const wfoContent = document.getElementById('wfo-report-content');
+                    if (s.wfo_report) {
+                        wfoBox.style.display = "block";
+                        let wfoHtml =
+                            '<div style="font-weight:600; color:var(--paper-blue); margin-bottom:4px;">WFO Result (Challenger Chosen):</div>' +
+                            '<div class="kv-row"><span class="kv-key">Engine:</span><span class="kv-val" style="font-size:0.65rem;">' + (s.wfo_report.engine || 'legacy-grid') + '</span></div>' +
+                            '<div class="kv-row"><span class="kv-key">Stability folds:</span><span class="kv-val">' + s.wfo_report.stability_count + '/' + (s.wfo_report.slices_evaluated || 10) + '</span></div>' +
+                            '<div class="kv-row"><span class="kv-key">PF Variance:</span><span class="kv-val">' + s.wfo_report.variance.toFixed(4) + '</span></div>';
+                        if (s.wfo_report.schema && s.wfo_report.schema !== '-') {
+                            wfoHtml += '<div class="kv-row"><span class="kv-key">Geometry:</span><span class="kv-val" style="font-size:0.65rem;">' + s.wfo_report.schema + '</span></div>';
+                        }
+                        const dg = (s.wfo_report.diagnostics || []);
+                        if (dg.length > 0) {
+                            const dl = dg[dg.length - 1];
+                            wfoHtml += '<div style="font-size:0.65rem; color:var(--text-muted); margin-top:3px;">' +
+                                'P(δ≠0)=' + (dl.p_delta_nonzero * 100).toFixed(1) + '% · κ=' + dl.kappa.toFixed(2) +
+                                ' · heldout=' + dl.heldout_recon.toFixed(3) +
+                                ' · D_anchor=' + dl.d_anchor.toFixed(4) + '</div>';
+                        }
+                        wfoHtml += '<div style="font-size:0.65rem; color:var(--text-muted); margin-top:4px; word-break:break-all;">' + JSON.stringify(s.wfo_report.challenger) + '</div>';
+                        wfoContent.innerHTML = wfoHtml;
+                    } else if (s.backtest_report) {
+                        wfoBox.style.display = "block";
+                        const r = s.backtest_report;
+                        if (r.status === "error") {
+                            wfoContent.innerHTML = '<div style="color:var(--loss-red);">' + r.message + '</div>';
+                        } else {
+                            wfoContent.innerHTML =
+                                '<div style="font-weight:600; color:var(--profit-green); margin-bottom:4px;">Backtest Result (' + (r.engine || 'legacy') + '):</div>' +
+                                (r.schema && r.schema !== '-' ? '<div class="kv-row"><span class="kv-key">Geometry:</span><span class="kv-val" style="font-size:0.65rem;">' + r.schema + '</span></div>' : '') +
+                                '<div class="kv-row"><span class="kv-key">Trades / Win rate:</span><span class="kv-val">' + r.trade_count + ' / ' + r.win_rate.toFixed(1) + '%</span></div>' +
+                                '<div class="kv-row"><span class="kv-key">Net Profit:</span><span class="kv-val ' + (r.total_pnl_usdt >= 0 ? "color-green" : "color-red") + '">' + (r.total_pnl_usdt >= 0 ? "+" : "") + r.total_pnl_usdt.toFixed(2) + ' USDT (' + (r.total_pnl_pct >= 0 ? "+" : "") + r.total_pnl_pct.toFixed(2) + '%)</span></div>' +
+                                '<div class="kv-row"><span class="kv-key">Profit Factor:</span><span class="kv-val">' + r.profit_factor.toFixed(2) + '</span></div>' +
+                                '<div class="kv-row"><span class="kv-key">Calmar / Sharpe:</span><span class="kv-val">' + r.calmar_ratio.toFixed(2) + ' / ' + r.sharpe_ratio.toFixed(2) + '</span></div>' +
+                                '<div class="kv-row"><span class="kv-key">Max Drawdown:</span><span class="kv-val color-red">' + r.max_drawdown_pct.toFixed(2) + '%</span></div>';
+                        }
+                    } else {
+                        wfoBox.style.display = "none";
+                    }
+
                     // Trades
                     if (s.trades.length > 0) {
                         document.getElementById('trades-body').innerHTML = s.trades.map(t =>
@@ -1972,6 +5027,21 @@ HTML_TEMPLATE = """
                         lowerLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.lower })));
                         ouUpperLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.ou_upper })));
                         ouLowerLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.ou_lower })));
+                        
+                        // Set markers for Jump Diffusion jumps
+                        let markers = [];
+                        s.chart_data.forEach(d => {
+                            if (d.jump) {
+                                markers.push({
+                                    time: d.time,
+                                    position: 'aboveBar',
+                                    color: '#ff5722',
+                                    shape: 'arrowDown',
+                                    text: 'JD Jump'
+                                });
+                            }
+                        });
+                        candleSeries.setMarkers(markers);
                     }
 
                     // Order Book
@@ -1993,6 +5063,26 @@ HTML_TEMPLATE = """
                 }).catch(err => {});
         }
 
+        function runBacktest() {
+            fetch('/api/backtest', { method: 'POST' }).then(() => updateUI());
+        }
+
+        function runWFO() {
+            fetch('/api/run_wfo', { method: 'POST' }).then(() => updateUI());
+        }
+
+        function promoteChallenger() {
+            if(!confirm("Are you sure you want to promote the shadow challenger parameters to champion (active live parameter set)?")) return;
+            fetch('/api/promote_challenger', { method: 'POST' }).then(r => r.json()).then(data => {
+                if (data.status === 'success') {
+                    alert('Challenger successfully promoted!');
+                } else {
+                    alert('Promotion failed: ' + data.message);
+                }
+                updateUI();
+            });
+        }
+
         setTimeout(() => { updateUI(); setInterval(updateUI, 500); }, 300);
     </script>
 </body>
@@ -2010,7 +5100,9 @@ def serve_lw_charts():
 @app.route('/api/state')
 def get_state():
     with state_lock:
-        return jsonify(bot_state)
+        state_copy = bot_state.copy()
+        state_copy.pop("loop", None)
+        return jsonify(state_copy)
 
 @app.route('/api/toggle_bot', methods=['POST'])
 def toggle_bot():
@@ -2045,14 +5137,187 @@ def set_trading_mode():
             mode_val = bot_state["trading_mode"]
     return jsonify({"status": "success", "mode": mode_val})
 
+@app.route('/api/backtest', methods=['POST'])
+def run_backtest_endpoint():
+    global bot_instance
+    if not bot_instance:
+        return jsonify({"status": "error", "message": "Bot not initialized"}), 400
+        
+    def _worker():
+        try:
+            log.info("Backtest worker thread started. Fetching historical OHLCV data...")
+            bot_state["backtest_running"] = True
+            bot_state["backtest_report"] = None
+            
+            loop = bot_state.get("loop")
+            if loop:
+                future = asyncio.run_coroutine_threadsafe(
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000),
+                    loop
+                )
+                df = future.result()
+            else:
+                import asyncio as local_asyncio
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000))
+                
+            log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
+            active_params = get_active_parameters()
+            # V3.6: geometric backtest (train on first window, trade the purged
+            # remainder); legacy engine only as fallback for short histories.
+            try:
+                report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
+            except Exception as e_geo_bt:
+                log.error(f"Geometric backtest unavailable ({e_geo_bt}); falling back to legacy engine.")
+                report = Backtester(df).run(active_params)
+                report["engine"] = "legacy"
+            log.info(f"Backtest simulation completed ({report.get('engine','legacy')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
+
+            bot_state["backtest_report"] = {
+                "trade_count": report["trade_count"],
+                "total_pnl_pct": float(report["total_pnl_pct"]),
+                "total_pnl_usdt": float(report["total_pnl_usdt"]),
+                "profit_factor": float(report["profit_factor"]),
+                "max_drawdown_pct": float(report["max_drawdown_pct"]),
+                "calmar_ratio": float(report["calmar_ratio"]),
+                "sharpe_ratio": float(report["sharpe_ratio"]),
+                "win_rate": float(report["win_rate"]),
+                "expectancy": float(report["expectancy"]),
+                "engine": report.get("engine", "legacy"),
+                "schema": report.get("schema", "-"),
+                "trades": report["trades"][-10:]
+            }
+        except Exception as e:
+            log.error(f"Backtest API error: {e}")
+            bot_state["backtest_report"] = {"status": "error", "message": str(e)}
+        finally:
+            bot_state["backtest_running"] = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"status": "running"})
+
+@app.route('/api/run_wfo', methods=['POST'])
+def run_wfo_endpoint():
+    global bot_instance
+    if not bot_instance:
+        return jsonify({"status": "error", "message": "Bot not initialized"}), 400
+        
+    def _worker():
+        try:
+            log.info("WFO worker thread started. Fetching historical OHLCV data...")
+            bot_state["wfo_running"] = True
+            bot_state["wfo_report"] = None
+            
+            loop = bot_state.get("loop")
+            if loop:
+                future = asyncio.run_coroutine_threadsafe(
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000),
+                    loop
+                )
+                df = future.result()
+            else:
+                import asyncio as local_asyncio
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000))
+                
+            log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
+            # V3.6: purged walk-forward over the geometric pipeline (warm start +
+            # neighbour-fold RKD, geometry schema fixed). Legacy grid as fallback.
+            try:
+                engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
+                result = engine.run()
+            except Exception as e_geo_wfo:
+                log.error(f"Purged WFO unavailable ({e_geo_wfo}); falling back to legacy grid WFO.")
+                result = BacktestOptimizer(df).run_wfo()
+                result["engine"] = "legacy-grid"
+            log.info(f"WFO completed ({result.get('engine','legacy-grid')}). Challenger: {result['challenger']}, "
+                     f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
+
+            challenger = result["challenger"]
+            if challenger:
+                challenger = {k: v for k, v in challenger.items() if not k.startswith("slice_")}
+
+            p_store = get_all_parameters()
+            p_store["shadow_challenger"] = challenger
+
+            with open(PARAMETERS_STORE_PATH, "w", encoding="utf-8") as f:
+                import json
+                json.dump(p_store, f, indent=4)
+
+            bot_state["parameters_store"] = p_store
+
+            bot_state["wfo_report"] = {
+                "stability_count": result["stability_count"],
+                "variance": float(result["variance"]),
+                "slices_evaluated": result["slices_evaluated"],
+                "challenger": challenger,
+                "engine": result.get("engine", "legacy-grid"),
+                "schema": result.get("schema", "-"),
+                "diagnostics": result.get("diagnostics", []),
+                "d_anchor_log": result.get("d_anchor_log", []),
+                "delta_hat_series": result.get("delta_hat_series", [])
+            }
+        except Exception as e:
+            log.error(f"WFO API error: {e}")
+            bot_state["wfo_report"] = {"status": "error", "message": str(e)}
+        finally:
+            bot_state["wfo_running"] = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"status": "running"})
+
+@app.route('/api/promote_challenger', methods=['POST'])
+def promote_challenger_endpoint():
+    global bot_instance
+    if not bot_instance:
+        return jsonify({"status": "error", "message": "Bot not initialized"}), 400
+        
+    if bot_instance.position.is_open:
+        return jsonify({"status": "error", "message": "Açık pozisyon varken parametre değişikliği yapılamaz!"}), 400
+        
+    try:
+        p_store = get_all_parameters()
+        shadow = p_store.get("shadow_challenger")
+        if not shadow:
+            return jsonify({"status": "error", "message": "Aktif Challenger parametresi bulunamadı!"}), 400
+            
+        p_store["history"].append({
+            "version": p_store.get("active_version", 1),
+            "parameters": p_store.get("champion"),
+            "retired_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        p_store["champion"] = shadow
+        p_store["shadow_challenger"] = None
+        p_store["active_version"] = p_store.get("active_version", 1) + 1
+        
+        with open(PARAMETERS_STORE_PATH, "w", encoding="utf-8") as f:
+            import json
+            json.dump(p_store, f, indent=4)
+            
+        bot_state["parameters_store"] = p_store
+        bot_state["active_parameters"] = shadow
+        
+        msg = (
+            f"🔄 *CHALLENGER PARAMETRESİ ŞAMPİYON YAPILDI!*\n\n"
+            f"📈 *Yeni Versiyon:* v{p_store['active_version']}\n"
+            f"Parameters: {shadow}"
+        )
+        if bot_state.get("loop"):
+            asyncio.run_coroutine_threadsafe(bot_instance.telegram.send_message(msg), bot_state["loop"])
+            
+        return jsonify({"status": "success", "parameters": shadow})
+    except Exception as e:
+        log.error(f"Error promoting challenger: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+bot_instance = None
+
 def run_bot():
-    bot = QuantBot()
+    global bot_instance
+    bot_instance = QuantBot()
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(bot.main_loop())
+    asyncio.run(bot_instance.main_loop())
 
 if __name__ == "__main__":
     import subprocess
-    # Port Çakışmasını Önleme: 5001 portunu kullanan başka bir süreç varsa otomatik sonlandırır
     try:
         cmd = "netstat -ano | findstr LISTENING | findstr :5001"
         output = subprocess.check_output(cmd, shell=True).decode()
@@ -2068,5 +5333,5 @@ if __name__ == "__main__":
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-    webview.create_window(title='Quant Bot V3.5 - TradingView', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
-    webview.start()
+    webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
+    webview.start() 
