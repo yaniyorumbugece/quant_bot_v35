@@ -2583,6 +2583,7 @@ class GeometricPipeline:
         geo = self.batch_signals(tail.reset_index(drop=True))
         i = len(tail) - 1
         st = int(geo["state"][i])
+        gate = float(self.conformal.a_min if self.conformal else 0.5)
         state = {
             "status": "ready",
             "signal": str(geo["signal"][i]),
@@ -2590,9 +2591,19 @@ class GeometricPipeline:
             "p_gbm": float(geo["p"][i]),
             "p_meta": float(geo["p_meta"][i]),
             "a_score": float(geo["A"][i]),
-            "a_gate": float(self.conformal.a_min if self.conformal else 0.5),
+            "a_gate": gate,
             "episode": "EPISODE" if geo["episode"][i] else "NORMAL",
             "cluster": st - 1,
+            # per-bar tail arrays for the chart overlay (same computation, no extra cost)
+            "chart": {
+                "n": int(len(tail)),
+                "gate": gate,
+                "A": [round(float(x), 4) for x in geo["A"]],
+                "episode": [bool(x) for x in geo["episode"]],
+                "state": [int(x) for x in geo["state"]],
+                "buy": [bool(sg == "BUY") for sg in geo["signal"]],
+                "exit": [bool(x) for x in geo["exit_flag"]],
+            },
         }
         return state
 
@@ -3489,43 +3500,31 @@ class QuantBot:
         bot_state["ou_jump_detected"] = info["ou_jump_detected"]
         bot_state["ou_jump_cooldown"] = info["ou_jump_cooldown"]
 
-        # Safely pad the indicator list for the final open bar to prevent index errors
-        def get_padded_val(lst, index, default=0.0):
-            if lst is None or len(lst) == 0: return default
-            if index < len(lst): return float(lst[index])
-            return float(lst[-1])
-
-        # Robust historical jump detection for chart markers
-        jumps_flag = np.zeros(len(df), dtype=bool)
-        if len(df) > 30:
-            c_vals = df['close'].values
-            returns = np.diff(c_vals)
-            median_ret = np.median(returns)
-            mad = np.median(np.abs(returns - median_ret))
-            robust_std = mad * 1.4826 if mad > 1e-8 else np.std(returns)
-            if robust_std < 1e-8: robust_std = 1e-8
-            jump_threshold = 3.0 * robust_std
-            for j in range(1, len(df)):
-                ret = float(df['close'].iloc[j] - df['close'].iloc[j-1])
-                if abs(ret - median_ret) > jump_threshold:
-                    jumps_flag[j] = True
-
-        # OHLC chart data for Lightweight Charts (unix timestamps)
+        # OHLC chart data for Lightweight Charts (unix timestamps) with the
+        # learned-geometry overlay: Conformal A, episodes, GEO entries/exits.
+        # The geometry arrays cover the tail of the COMPLETED bars.
+        gchart = (info.get("geom") or {}).get("chart") or {}
+        g_n = int(gchart.get("n", 0))
+        completed_len = len(df) - 1 if len(df) > 30 else len(df)
+        g_off = completed_len - g_n
+        g_gate = float(gchart.get("gate", 0.5))
         chart_data = []
         for j in range(len(df)):
             t_val = int(df['timestamp'].iloc[j].timestamp()) + UTC_OFFSET
+            gi = j - g_off
+            has_geo = 0 <= gi < g_n
             chart_data.append({
                 "time": t_val,
                 "open": float(df['open'].iloc[j]),
                 "high": float(df['high'].iloc[j]),
                 "low": float(df['low'].iloc[j]),
                 "close": float(df['close'].iloc[j]),
-                "slow": get_padded_val(info.get('sg_list'), j, price),
-                "upper": get_padded_val(info.get('ub_list'), j, price),
-                "lower": get_padded_val(info.get('lb_list'), j, price),
-                "ou_upper": float(info.get('ou_upper', 0)) if info.get('ou_valid', False) else float(df['close'].iloc[j]),
-                "ou_lower": float(info.get('ou_lower', 0)) if info.get('ou_valid', False) else float(df['close'].iloc[j]),
-                "jump": bool(jumps_flag[j])
+                "geo_a": float(gchart["A"][gi]) if has_geo else None,
+                "geo_gate": g_gate,
+                "geo_episode": bool(gchart["episode"][gi]) if has_geo else False,
+                "geo_state": int(gchart["state"][gi]) if has_geo else 0,
+                "geo_buy": bool(gchart["buy"][gi]) if has_geo else False,
+                "geo_exit": bool(gchart["exit"][gi]) if has_geo else False,
             })
         bot_state["chart_data"] = chart_data
 
@@ -4618,10 +4617,11 @@ HTML_TEMPLATE = """
             <div class="chart-wrap">
                 <div id="tv-chart-container"></div>
                 <div id="chart-legend" style="position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(30, 34, 45, 0.85); border: 1px solid var(--border-color); padding: 6px 10px; border-radius: 4px; font-size: 0.72rem; color: var(--text-main); pointer-events: none; display: flex; flex-direction: column; gap: 3px;">
-                    <div><span style="color:#f5b041; font-weight:700;">■</span> Gauss Slow (MA)</div>
-                    <div><span style="color:#2962ff; font-weight:700;">■</span> Gauss Bands (Volatility)</div>
-                    <div><span style="color:#e040fb; font-weight:700;">■</span> OU Corridor (Mean Reversion)</div>
-                    <div><span style="color:#ff5722; font-weight:700;">▲</span> JD Jump (Sıçrama)</div>
+                    <div><span style="color:#089981; font-weight:700;">▮</span> Conformal A ≥ kapı</div>
+                    <div><span style="color:#787b86; font-weight:700;">▮</span> Conformal A &lt; kapı</div>
+                    <div><span style="color:#f5b041; font-weight:700;">●</span> Epizot başlangıcı (δ≠0, A-küme)</div>
+                    <div><span style="color:#089981; font-weight:700;">▲</span> GEO BUY &nbsp;·&nbsp; <span style="color:#f23645; font-weight:700;">▼</span> Geo Exit</div>
+                    <div id="legend-geo-status" style="color:#787b86;">Geometri: -</div>
                 </div>
             </div>
         </div>
@@ -4656,20 +4656,11 @@ HTML_TEMPLATE = """
                 <div class="kv-row"><span class="kv-key">p GBM / Meta:</span><span class="kv-val" id="geom-p">- / -</span></div>
                 <div class="kv-row"><span class="kv-key">Conformal A:</span><span class="kv-val" id="geom-a">-</span></div>
                 <div class="kv-row"><span class="kv-key">D_anchor:</span><span class="kv-val" id="geom-danchor">-</span></div>
+                <div class="kv-row"><span class="kv-key">δ̂ (5/15/30/60):</span><span class="kv-val" id="geom-dhat" style="font-size:0.68rem;">-</span></div>
+                <div class="kv-row"><span class="kv-key">r·√|κ| (5/15/30/60):</span><span class="kv-val" id="geom-reff" style="font-size:0.68rem;">-</span></div>
+                <div class="kv-row"><span class="kv-key">Heldout Recon:</span><span class="kv-val" id="geom-recon">-</span></div>
                 <div class="kv-row"><span class="kv-key">Anchor Panel:</span><span class="kv-val" id="geom-panel" style="font-size:0.7rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">Fold:</span><span class="kv-val" id="geom-fold">0</span></div>
-            </div>
-
-            <div class="panel-box">
-                <div class="box-title">OU Parameters (JD-OU)</div>
-                <div class="kv-row"><span class="kv-key">θ (Speed):</span><span class="kv-val" id="ou-theta">0.00</span></div>
-                <div class="kv-row"><span class="kv-key">μ (Equil.):</span><span class="kv-val" id="ou-mu">$0.00</span></div>
-                <div class="kv-row"><span class="kv-key">Half-Life:</span><span class="kv-val" id="ou-halflife">∞ bars</span></div>
-                <div class="kv-row"><span class="kv-key">Jump Intensity:</span><span class="kv-val" id="ou-jump-intensity">0.00%</span></div>
-                <div class="kv-row"><span class="kv-key">Jump Mean/Std:</span><span class="kv-val" id="ou-jump-stats">0/0</span></div>
-                <div class="kv-row"><span class="kv-key">Jump Cooldown:</span><span class="kv-val" id="ou-cooldown">NO</span></div>
-                <div class="kv-row"><span class="kv-key">OU Valid:</span><span class="kv-val" id="ou-valid">NO</span></div>
-                <div class="kv-row"><span class="kv-key">Corridor:</span><span class="kv-val" id="ou-corridor" style="font-size:0.7rem;">-</span></div>
             </div>
 
             <div class="panel-box">
@@ -4716,11 +4707,7 @@ HTML_TEMPLATE = """
     <script>
         let tvChart = null;
         let candleSeries = null;
-        let slowLine = null;
-        let upperLine = null;
-        let lowerLine = null;
-        let ouUpperLine = null;
-        let ouLowerLine = null;
+        let aHist = null;          // Conformal A histogram (learned-geometry overlay)
         let lastPrice = 0;
         let activeTF = '1m';
 
@@ -4741,13 +4728,14 @@ HTML_TEMPLATE = """
                 wickUpColor: '#089981', wickDownColor: '#f23645'
             });
 
-            slowLine = tvChart.addLineSeries({ color: '#f5b041', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
-            upperLine = tvChart.addLineSeries({ color: '#2962ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
-            lowerLine = tvChart.addLineSeries({ color: '#2962ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
-            
-            // OU Bands (magenta dashed)
-            ouUpperLine = tvChart.addLineSeries({ color: '#e040fb', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
-            ouLowerLine = tvChart.addLineSeries({ color: '#e040fb', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, crosshairMarkerVisible: false, priceLineVisible: false });
+            // Learned-geometry overlay: Conformal A score as a bottom histogram pane
+            aHist = tvChart.addHistogramSeries({
+                priceScaleId: 'geo',
+                priceLineVisible: false,
+                lastValueVisible: false,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
+            });
+            tvChart.priceScale('geo').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
 
             new ResizeObserver(entries => {
                 const { width, height } = entries[0].contentRect;
@@ -4840,8 +4828,18 @@ HTML_TEMPLATE = """
                     document.getElementById('signal-val').innerHTML = sigText + hypText;
                     document.getElementById('signal-val').style.color = s.signal === 'BUY' ? 'var(--profit-green)' : (s.signal === 'SELL' ? 'var(--loss-red)' : 'var(--text-main)');
                     
-                    document.getElementById('regime-box').innerText = s.regime.toUpperCase();
-                    document.getElementById('regime-box').className = "regime-box " + (s.is_ranging ? "regime-range" : "regime-trend");
+                    // Regime box: geometric episode state once the pipeline is ready,
+                    // legacy trend/ranging only during warm-up
+                    if (s.geom && s.geom.status === 'ready') {
+                        const inEp = s.geom.episode === 'EPISODE';
+                        document.getElementById('regime-box').innerText = inEp
+                            ? ('EPİZOT' + (s.geom.cluster >= 0 ? ' (A' + s.geom.cluster + ')' : ''))
+                            : 'NORMAL (GEO)';
+                        document.getElementById('regime-box').className = "regime-box " + (inEp ? "regime-range" : "regime-trend");
+                    } else {
+                        document.getElementById('regime-box').innerText = s.regime.toUpperCase();
+                        document.getElementById('regime-box').className = "regime-box " + (s.is_ranging ? "regime-range" : "regime-trend");
+                    }
 
                     // Learned Geometry panel (V3.6)
                     if (s.geom) {
@@ -4867,30 +4865,21 @@ HTML_TEMPLATE = """
                         aEl.innerText = (g.a_score || 0).toFixed(2) + ' (gate ' + (g.a_gate !== undefined ? g.a_gate.toFixed(2) : '0.50') + ')';
                         aEl.style.color = (g.a_score || 0) >= (g.a_gate || 0.5) ? 'var(--profit-green)' : 'var(--text-muted)';
                         document.getElementById('geom-danchor').innerText = (gd.d_anchor !== undefined) ? gd.d_anchor.toFixed(4) : '-';
+                        const resKeys = ['5', '15', '30', '60'];
+                        const dh = g.delta_hat || {};
+                        document.getElementById('geom-dhat').innerText = resKeys.every(k => dh[k] !== undefined)
+                            ? resKeys.map(k => dh[k].toFixed(2)).join(' / ') : '-';
+                        const re = gd.r_eff || {};
+                        document.getElementById('geom-reff').innerText = resKeys.every(k => re[k] !== undefined)
+                            ? resKeys.map(k => re[k].toFixed(2)).join(' / ') : '-';
+                        document.getElementById('geom-recon').innerText = (gd.heldout_recon !== undefined) ? gd.heldout_recon.toFixed(4) : '-';
                         const pn = g.panel || {};
                         document.getElementById('geom-panel').innerText = (pn.core_active !== undefined)
                             ? (pn.core_active + ' act / ' + (pn.core_retired || 0) + ' ret')
                             : '-';
                         document.getElementById('geom-fold').innerText = g.fold || 0;
-                    }
-
-                    // OU Parameters panel details
-                    document.getElementById('ou-theta').innerText = s.ou_theta.toFixed(4);
-                    document.getElementById('ou-mu').innerText = "$" + s.ou_mu.toFixed(2);
-                    document.getElementById('ou-halflife').innerText = s.ou_valid ? s.ou_half_life.toFixed(1) + " bars" : "∞ bars";
-                    document.getElementById('ou-jump-intensity').innerText = (s.ou_jump_intensity * 100).toFixed(1) + "%";
-                    document.getElementById('ou-jump-stats').innerText = s.ou_jump_mean.toFixed(2) + " / " + s.ou_jump_std.toFixed(2);
-                    document.getElementById('ou-cooldown').innerText = s.ou_jump_cooldown > 0 ? "YES (" + s.ou_jump_cooldown + "b)" : (s.ou_jump_detected ? "DETECTED" : "NO");
-                    document.getElementById('ou-cooldown').style.color = (s.ou_jump_cooldown > 0 || s.ou_jump_detected) ? "var(--loss-red)" : "var(--text-muted)";
-                    document.getElementById('ou-valid').innerText = s.ou_valid ? "YES" : "NO";
-                    document.getElementById('ou-valid').style.color = s.ou_valid ? "var(--profit-green)" : "var(--text-muted)";
-                    
-                    if (s.ou_valid) {
-                        document.getElementById('ou-corridor').innerHTML = 
-                            "<span style='color:var(--paper-blue);'>$" + s.ou_lower.toFixed(2) + "</span> - " +
-                            "<span style='color:var(--paper-blue);'>$" + s.ou_upper.toFixed(2) + "</span>";
-                    } else {
-                        document.getElementById('ou-corridor').innerText = "-";
+                        document.getElementById('legend-geo-status').innerText = 'Geometri: ' + (g.status || '-').toUpperCase() +
+                            (g.status === 'ready' && g.schema ? ' · ' + g.schema : '');
                     }
 
                     // Position
@@ -5018,27 +5007,39 @@ HTML_TEMPLATE = """
                         ).join('');
                     }
 
-                    // TradingView Chart
+                    // TradingView Chart — learned-geometry overlay
                     if (!tvChart) initChart();
                     if (s.chart_data && s.chart_data.length > 0) {
                         candleSeries.setData(s.chart_data.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close })));
-                        slowLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.slow })));
-                        upperLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.upper })));
-                        lowerLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.lower })));
-                        ouUpperLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.ou_upper })));
-                        ouLowerLine.setData(s.chart_data.map(d => ({ time: d.time, value: d.ou_lower })));
-                        
-                        // Set markers for Jump Diffusion jumps
+
+                        // Conformal A histogram: yellow = episode, green = A above the gate
+                        aHist.setData(s.chart_data
+                            .filter(d => d.geo_a !== null && d.geo_a !== undefined)
+                            .map(d => ({
+                                time: d.time,
+                                value: d.geo_a,
+                                color: d.geo_episode
+                                    ? 'rgba(245, 176, 65, 0.55)'
+                                    : (d.geo_a >= d.geo_gate ? 'rgba(8, 153, 129, 0.65)' : 'rgba(120, 123, 134, 0.40)')
+                            })));
+
+                        // Markers: episode starts (with anomaly cluster), GEO entries, geometric exits
                         let markers = [];
+                        let prevEp = false;
                         s.chart_data.forEach(d => {
-                            if (d.jump) {
+                            if (d.geo_episode && !prevEp) {
                                 markers.push({
-                                    time: d.time,
-                                    position: 'aboveBar',
-                                    color: '#ff5722',
-                                    shape: 'arrowDown',
-                                    text: 'JD Jump'
+                                    time: d.time, position: 'aboveBar', color: '#f5b041',
+                                    shape: 'circle',
+                                    text: d.geo_state > 0 ? 'A' + (d.geo_state - 1) : 'EP'
                                 });
+                            }
+                            prevEp = !!d.geo_episode;
+                            if (d.geo_buy) {
+                                markers.push({ time: d.time, position: 'belowBar', color: '#089981', shape: 'arrowUp', text: 'GEO' });
+                            }
+                            if (d.geo_exit) {
+                                markers.push({ time: d.time, position: 'aboveBar', color: '#f23645', shape: 'arrowDown', text: 'EXIT' });
                             }
                         });
                         candleSeries.setMarkers(markers);
@@ -5334,4 +5335,4 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
-    webview.start() 
+    webview.start()
