@@ -5653,6 +5653,782 @@ def promote_challenger_endpoint():
         log.error(f"Error promoting challenger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# EMBEDDED TEST SUITES
+#
+# The three test files live inside this module so a single-file workflow keeps
+# them in sync. Run any suite with the CLI flags below; with no flag the app
+# launches normally (the pywebview desktop UI).
+#
+#   python quant_bot_v35.py                # launch the bot (default)
+#   python quant_bot_v35.py --test         # run every suite
+#   python quant_bot_v35.py --test-geom    # V3.6 learned-geometry tests only
+#   python quant_bot_v35.py --test-comp    # V3.5 component tests only
+#   python quant_bot_v35.py --test-safe    # V3.5 safety/execution tests only
+#
+# The suites don't need extra installs — same NumPy/pandas the bot already uses.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_synth_df(n=900, seed=42):
+    """Regime-switching synthetic OHLCV: trends, mean reversion and jumps."""
+    rng = np.random.default_rng(seed)
+    closes = [100.0]
+    drift = 0.0
+    for i in range(1, n):
+        if i % 180 == 0:
+            drift = rng.choice([-0.05, 0.0, 0.08])
+        shock = rng.normal(0, 0.35)
+        if rng.random() < 0.01:
+            shock += rng.choice([-1, 1]) * rng.uniform(1.5, 3.0)
+        mr = 0.03 * (100.0 - closes[-1]) if abs(drift) < 1e-9 else 0.0
+        closes.append(max(closes[-1] + drift + mr + shock, 5.0))
+    closes = np.array(closes)
+    spread = np.abs(rng.normal(0.15, 0.05, n))
+    highs = closes + spread
+    lows = closes - spread
+    opens = closes + rng.normal(0, 0.08, n)
+    vols = np.abs(rng.normal(50, 15, n)) * (1 + 3 * (np.abs(np.diff(closes, prepend=closes[0])) > 0.8))
+    ts = pd.date_range("2026-01-01", periods=n, freq="1min")
+    return pd.DataFrame({"timestamp": ts, "open": opens, "high": highs,
+                         "low": lows, "close": closes, "volume": vols})
+
+
+# ── V3.6 learned-geometry tests ──────────────────────────────────────────────
+def test_chen_identity():
+    print("Testing Chen identity (fine → coarse combination is exact)...")
+    rng = np.random.default_rng(0)
+    dX = rng.normal(0, 1, (15, 3))
+    direct = ChenSignature.of_increments(dX)
+    blocks = [ChenSignature.of_increments(dX[i * 5:(i + 1) * 5]) for i in range(3)]
+    combined = ChenSignature.combine(ChenSignature.combine(blocks[0], blocks[1]), blocks[2])
+    for a, b in zip(direct, combined):
+        assert np.allclose(a, b, atol=1e-10), "Chen identity violated"
+    print("  levels 1..3 of concat path == tensor combination of block signatures ✓")
+
+
+def test_multires_matches_direct():
+    print("Testing multi-resolution end-aligned windows vs direct signatures...")
+    df = _make_synth_df(200)
+    vol = VolatilityNormalizer().transform(df)
+    sigs, valid = MultiResolutionSignatures().compute(vol["increments"])
+    t = 150
+    assert valid[t]
+    for r in GEOM_RESOLUTIONS:
+        direct = ChenSignature.flatten(
+            ChenSignature.of_increments(vol["increments"][t - r + 1:t + 1]))
+        assert np.allclose(sigs[r][t], direct, atol=1e-8), f"res {r} mismatch"
+    print(f"  all resolutions {GEOM_RESOLUTIONS} agree with direct computation ✓")
+
+
+def test_delta_hat_and_schema():
+    print("Testing δ̂ diagnostic → κ_init + factor budget (first-window protocol)...")
+    df = _make_synth_df(600)
+    vol = VolatilityNormalizer().transform(df)
+    sigs, valid = MultiResolutionSignatures().compute(vol["increments"])
+    diag = DeltaHatDiagnostic()
+    schema = diag.build_schema(sigs, valid, vol["norm_ret"], "1m", version=1)
+    print(f"  schema: {schema.label()} | δ̂ = {schema.delta_hat}")
+    assert schema.kappa_init < 0, "κ sign must come from theory: dyadic tree → κ<0"
+    assert schema.kappa_init <= schema.kappa_max < 0, "κ ≤ κ_max < 0 bound violated"
+    assert -DeltaHatDiagnostic.KAPPA_ABS_MAX <= schema.kappa_init
+    for r in GEOM_RESOLUTIONS:
+        assert 0 < schema.delta_hat[str(r)] < 2.0
+    assert schema.budget["a"] >= 4
+    assert isinstance(schema.budget["S_active"], bool)
+    assert isinstance(schema.budget["E_active"], bool)
+
+
+def test_soft_threshold_sparsity():
+    print("Testing soft-threshold proximal operator (exact zeros)...")
+    x = np.array([-0.5, -0.1, 0.0, 0.05, 0.3])
+    st = _soft_threshold(x, 0.2)
+    assert np.allclose(st, [-0.3, 0.0, 0.0, 0.0, 0.1])
+    assert np.sum(st == 0.0) == 3, "soft-threshold must produce exact zeros (P(δ≠0) defined)"
+    print("  exact zeros inside the threshold band ✓")
+
+
+def test_encoder_gradients():
+    print("Testing encoder backprop against numerical gradients (per loss term)...")
+    rng = np.random.default_rng(0)
+    schema = GeometrySchema(1, "1m", list(GEOM_RESOLUTIONS), -0.8, -0.1, {"5": 0.2},
+                            {"a": 6, "b": 0, "c": 0, "S_active": False, "E_active": False})
+    T, n_res = 7, len(GEOM_RESOLUTIONS)
+    X = rng.normal(0, 1, (T * n_res, GEOM_SIG_DIM))
+    ridx = np.concatenate([np.full(T, i) for i in range(n_res)])
+    tgrid = np.tile(np.arange(T), n_res)
+    speed = np.abs(rng.normal(0.5, 0.2, T * n_res))
+    w = np.abs(rng.normal(1.0, 0.1, T * n_res))
+
+    def check(active, use_rkd=False, zero_dec=False):
+        enc = LearnedGeometryEncoder(GEOM_SIG_DIM, schema, hidden=10, seed=1)
+        for k in enc.lambdas:
+            enc.lambdas[k] = 0.0
+        enc.lambdas.update(active)
+        rkd = None
+        if use_rkd:
+            teacher = LearnedGeometryEncoder(GEOM_SIG_DIM, schema, hidden=10, seed=7)
+            Xp = rng.normal(0, 1, (9, GEOM_SIG_DIM))
+            ridxp = rng.integers(0, n_res, 9)
+            rel = teacher.panel_relations(Xp, ridxp)
+            rkd = {"Xp": Xp, "ridxp": ridxp, "Dt": rel["Dt"], "Ct": rel["Ct"]}
+        if zero_dec:
+            enc.params["Wdec"][:] = 0.0
+            enc.params["bdec"][:] = 0.0
+            enc.params["g"][:] = -30.0
+            enc.params["beta"][:] = 0.0
+        _, _, grads, _ = enc._loss_and_grads(X, ridx, tgrid, speed, w, rkd=rkd)
+        eps, worst = 1e-6, 0.0
+        for name in ["W1", "b1", "Wu", "wd", "bd", "rho", "g", "beta", "Wdec", "bdec"]:
+            P = np.asarray(enc.params[name], dtype=float)
+            flatP = P.reshape(-1)
+            flatG = np.asarray(grads[name], dtype=float).reshape(-1)
+            for i in rng.choice(flatP.size, size=min(4, flatP.size), replace=False):
+                orig = flatP[i]
+                flatP[i] = orig + eps
+                enc.params[name] = flatP.reshape(P.shape)
+                lp = enc._loss_and_grads(X, ridx, tgrid, speed, w, rkd=rkd)[0]
+                flatP[i] = orig - eps
+                enc.params[name] = flatP.reshape(P.shape)
+                lm = enc._loss_and_grads(X, ridx, tgrid, speed, w, rkd=rkd)[0]
+                flatP[i] = orig
+                enc.params[name] = flatP.reshape(P.shape)
+                num = (lp - lm) / (2 * eps)
+                worst = max(worst, abs(num - flatG[i]) / max(abs(num), abs(flatG[i]), 1e-7))
+        return worst
+
+    for label, kwargs in [
+        ("recon", dict(active={})),
+        ("l1", dict(active={"l1": 0.05}, zero_dec=True)),
+        ("cone", dict(active={"cone": 0.5}, zero_dec=True)),
+        ("speed", dict(active={"speed": 0.2}, zero_dec=True)),
+        ("rkd", dict(active={"rkd": 1.0}, use_rkd=True, zero_dec=True)),
+    ]:
+        err = check(**kwargs)
+        print(f"  {label:6s} worst rel err {err:.2e}")
+        assert err < 5e-4, f"gradient mismatch in {label} term: {err:.2e}"
+
+
+def test_encoder_training():
+    print("Testing encoder training (loss ↓, κ bounded, sparse δ, FiLM monotone γ)...")
+    df = _make_synth_df(500)
+    pipe = GeometricPipeline("1m", encoder_epochs=30)
+    vol, sigs, valid = pipe.preprocess(df)
+    diag = DeltaHatDiagnostic()
+    pipe.schema = diag.build_schema(sigs, valid, vol["norm_ret"], "1m", version=1)
+    pipe.feat_mu, pipe.feat_sd = pipe._fit_feature_stats(sigs, valid)
+    X, ridx, tgrid, speed, w, vidx = pipe._stack_training(vol, sigs, valid)
+    enc = LearnedGeometryEncoder(GEOM_SIG_DIM, pipe.schema, seed=42)
+    heldout = enc.train(X, ridx, tgrid, speed, w, epochs=30)
+    hist = enc.train_history
+    assert hist[-1]["rec"] < hist[0]["rec"], "reconstruction loss must decrease"
+    assert -DeltaHatDiagnostic.KAPPA_ABS_MAX <= enc.kappa <= -DeltaHatDiagnostic.KAPPA_ABS_MIN, \
+        "κ escaped its bounds"
+    fw = enc.forward(X, ridx)
+    p_dnz = float(np.mean(fw["delta"] != 0))
+    print(f"  recon {hist[0]['rec']:.4f} → {hist[-1]['rec']:.4f} | heldout {heldout:.4f} "
+          f"| κ={enc.kappa:.3f} η={enc.eta:.3f} | P(δ≠0)={p_dnz:.3f}")
+    assert 0.0 <= p_dnz < 1.0
+    assert np.any(fw["delta"] == 0.0), "δ head must produce exact zeros"
+    assert np.all(np.abs(np.linalg.norm(fw["u"], axis=1) - 1.0) < 1e-6), "u must be unit"
+    assert np.all(_softplus(enc.params["g"]) >= 0.0)   # γ(r) monotone
+    it = enc.e_res_intervention(X, ridx)
+    print(f"  e_res intervention degradation: {it['degradation']*100:.2f}%")
+    r_eff = enc.r_eff()
+    assert all(v > 0 for v in r_eff.values())
+
+
+def test_delta_hat_outlier_robustness():
+    print("Testing δ̂ scale normalization robustness to jump outliers...")
+    rng = np.random.default_rng(4)
+    P = rng.normal(0, 1, (120, GEOM_SIG_DIM))
+    diag = DeltaHatDiagnostic(n_quadruples=800, seed=4)
+    d1 = diag.measure(P)
+    P2 = np.vstack([P, np.full((2, GEOM_SIG_DIM), 60.0)])
+    d2 = diag.measure(P2)
+    print(f"  δ̂ clean {d1:.4f} vs with outliers {d2:.4f}")
+    assert d2 > 0.5 * d1, "outliers must not collapse δ̂ (κ saturation guard)"
+
+
+def test_cost_floors():
+    print("Testing cost wall: roundtrip cost + barrier target floors...")
+    c = roundtrip_cost_pct()
+    print(f"  roundtrip cost ≈ {c:.3f}%  → TP floor {3*c:.2f}%  SL floor {1.5*c:.2f}%")
+    assert 0.25 < c < 0.40
+    pipe = GeometricPipeline("1m")
+    vol_low = {"rv": np.full(100, 0.0003)}
+    tp, sl = pipe._barrier_pcts(vol_low, np.arange(100))
+    assert np.all(tp >= 3 * c - 1e-9), "TP must clear 3× roundtrip cost"
+    assert np.all(sl >= 1.5 * c - 1e-9)
+    assert np.all(sl <= tp + 1e-9), "risk must not exceed the target"
+    vol_hi = {"rv": np.full(10, 0.005)}
+    tp2, sl2 = pipe._barrier_pcts(vol_hi, np.arange(10))
+    assert np.all(tp2 > 3 * c), "high vol must widen targets beyond the cost floor"
+    assert np.all(np.isclose(sl2, 0.5 * tp2)), "SL tracks half the vol-scaled target"
+    be = (1.5 * c + c) / (3 * c + 1.5 * c)
+    print(f"  breakeven win rate at floors: {be*100:.0f}%")
+    assert be < 0.60
+
+
+def test_geo_trailing_floor():
+    print("Testing Geo trailing-stop floor (min_trail_dist)...")
+    pm = PositionManager()
+    pm.open("long", 100.0, 1.0, "Geo", 0.01, 100.0,
+            tp_percent=1.0, sl_percent=0.5, min_trail_dist=0.5)
+    assert abs(pm.trail_stop_70 - 99.5) < 1e-9, "initial trail must respect the floor, not 3×gv"
+    pm.update_stops(100.4, 0.01, 0.01)
+    assert abs(pm.trail_stop_70 - 99.9) < 1e-9, "ratchet must keep the floored distance"
+    pm2 = PositionManager()
+    pm2.open("long", 100.0, 1.0, "Trend", 0.01, 100.0)
+    assert abs(pm2.trail_stop_70 - (100.0 - 0.03)) < 1e-9
+    print("  floored at 0.5 for Geo, legacy 3×gv unchanged ✓")
+
+
+def test_episode_hysteresis():
+    print("Testing episode segmentation hysteresis...")
+    seg = EpisodeSegmenter(min_active=2, on_bars=2, off_bars=3)
+    counts = np.array([0, 0, 3, 3, 0, 0, 0, 0])
+    flags, episodes = seg.segment(counts)
+    assert list(flags) == [False, False, False, True, True, True, False, False]
+    assert episodes == [(2, 3)]
+    flags2, eps2 = seg.segment(np.array([0, 3, 0, 0, 0, 0]))
+    assert not any(flags2) and eps2 == []
+    print("  ON after 2 consecutive active bars, OFF after 3 clean bars ✓")
+
+
+def test_cluster_and_graph():
+    print("Testing anomaly clustering + normal-centric transition graph...")
+    rng = np.random.default_rng(1)
+    S = np.vstack([rng.normal(0, 0.2, (10, AnomalyClusterer.SUMMARY_DIM)),
+                   rng.normal(3, 0.2, (10, AnomalyClusterer.SUMMARY_DIM))])
+    cl = AnomalyClusterer(k=2, seed=1).fit(S)
+    a = cl.assign(S[0]); b = cl.assign(S[15])
+    assert a != b, "well-separated episode summaries must land in different clusters"
+    g = TransitionGraph(k=2)
+    seq = np.array([0, 0, 1, 1, 0, 2, 0, 0, 1, 0])
+    fwd = [(int(s), 0.01 if s == 0 else -0.02) for s in seq]
+    g.fit(seq, fwd)
+    tm = g.transmat()
+    assert np.allclose(tm.sum(axis=1), 1.0)
+    assert 0.0 <= g.p_return_to_normal(1) <= 1.0
+    assert g.expected_return(1) < 0 < g.expected_return(0)
+    f = g.features(True, 0)
+    assert len(f) == g.n_features
+    print("  transition rows normalized, state statistics observational ✓")
+
+
+def test_gbm_learner():
+    print("Testing pure-NumPy gradient boosting (LightGBM slot)...")
+    rng = np.random.default_rng(2)
+    X = rng.normal(0, 1, (600, 8))
+    y = ((X[:, 0] + 0.5 * X[:, 1] + 0.1 * rng.normal(size=600)) > 0).astype(float)
+    gb = PureGradientBoosting(n_trees=30, depth=3, seed=2).fit(X[:450], y[:450])
+    p = gb.predict_proba(X[450:])
+    auc = PureGradientBoosting.auc(y[450:], p)
+    print(f"  holdout AUC = {auc:.3f}")
+    assert auc > 0.85
+    assert np.all((p > 0) & (p < 1))
+
+
+def test_meta_and_conformal():
+    print("Testing meta labeling + conformal gate...")
+    closes = np.array([100.0, 100.2, 100.5, 100.1, 99.4, 99.0, 101.0, 102.0])
+    assert MetaLabeler.barrier_outcome(closes, 0, tp_pct=0.4, sl_pct=0.4, max_hold=6) == 1
+    assert MetaLabeler.barrier_outcome(closes, 2, tp_pct=0.4, sl_pct=0.4, max_hold=4) == 0
+    rng = np.random.default_rng(3)
+    X = rng.normal(0, 1, (300, 5))
+    y = (X[:, 0] > 0).astype(float)
+    ml = MetaLabeler().fit(X, y)
+    p = ml.predict_proba(X)
+    assert PureGradientBoosting.auc(y, p) > 0.9
+    gate = ConformalGate(alpha=0.6, beta=0.4)
+    pm_cal = rng.uniform(0.2, 0.9, 60)
+    dm_cal = rng.uniform(0.1, 2.0, 60)
+    gate.calibrate(pm_cal, dm_cal, target_accept=0.6)
+    assert gate.a_pred(0.95) > gate.a_pred(0.05)
+    assert gate.a_geom(0.05) > gate.a_geom(5.0)
+    A = gate.combined(0.8, 0.3)
+    assert 0.0 < A <= 1.0
+    accept_rate = np.mean([gate.combined(p_, d_) >= gate.a_min
+                           for p_, d_ in zip(pm_cal, dm_cal)])
+    print(f"  calibrated acceptance on cal window: {accept_rate*100:.0f}% (target 60%)")
+    assert 0.4 <= accept_rate <= 0.8
+
+
+def test_barrier_directional():
+    print("Testing directional barrier helpers (symmetric label + long/short race)...")
+    up = np.array([100.0, 100.1, 100.6, 101.0])
+    dn = np.array([100.0, 99.9, 99.3, 99.0])
+    assert MetaLabeler.barrier_dir(up, 0, tp_pct=0.4, max_hold=4) == 1.0
+    assert MetaLabeler.barrier_dir(dn, 0, tp_pct=0.4, max_hold=4) == 0.0
+    assert MetaLabeler.barrier_outcome_dir(dn, 0, tp_pct=0.4, sl_pct=0.4, side="short", max_hold=4) == 1
+    assert MetaLabeler.barrier_outcome_dir(up, 0, tp_pct=0.4, sl_pct=0.4, side="short", max_hold=4) == 0
+    assert MetaLabeler.barrier_outcome_dir(up, 0, tp_pct=0.4, sl_pct=0.4, side="long", max_hold=4) == 1
+    print("  symmetric direction + long/short TP-before-SL correct ✓")
+
+
+def test_two_sided_and_short_gate():
+    print("Testing two-sided signals + allow_short gate (spot safety default)...")
+    df = _make_synth_df(900, seed=13)
+    pipe = GeometricPipeline("1m", encoder_epochs=25)
+    pipe.fit(df.iloc[:600])
+    pipe.allow_short = False
+    geo_off = pipe.batch_signals(df, start_at=660)
+    assert not np.any(geo_off["signal"] == "SELL"), "allow_short off must never emit SELL"
+    assert np.all(geo_off["dir"] >= 0)
+    pipe.allow_short = True
+    geo_on = pipe.batch_signals(df, start_at=660)
+    sell_bars = np.where(geo_on["signal"] == "SELL")[0]
+    buy_bars = np.where(geo_on["signal"] == "BUY")[0]
+    for bars in (buy_bars, sell_bars):
+        assert np.all(geo_on["exp_net"][bars] > 0), "every signal needs E[net]>0"
+    assert np.all(geo_on["dir"][sell_bars] == -1)
+    assert np.all(geo_on["dir"][buy_bars] == 1)
+    assert set(buy_bars.tolist()) == set(np.where(geo_off["signal"] == "BUY")[0].tolist())
+    print(f"  off→0 SELL, on→{len(sell_bars)} SELL / {len(buy_bars)} BUY, longs unchanged ✓")
+
+
+def test_backtester_short():
+    print("Testing backtester short entries in geo mode...")
+    df = _make_synth_df(900, seed=5)
+    pipe = GeometricPipeline("1m", encoder_epochs=25)
+    pipe.fit(df.iloc[:600])
+    pipe.allow_short = True
+    geo = pipe.batch_signals(df, start_at=660)
+    if not np.any(geo["signal"] == "SELL"):
+        idx = 700
+        geo["signal"][idx] = "SELL"; geo["dir"][idx] = -1
+        geo["exp_net"][idx] = 1.0
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
+        params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
+    shorts = [t for t in rep["trades"] if t["side"] == "short"]
+    assert len(shorts) >= 1, "geo SELL must open short positions in the backtester"
+    for t in shorts:
+        if t["exit_price"] < t["entry_price"]:
+            assert t["pnl_pct"] > 0, "short PnL sign wrong"
+    print(f"  {len(shorts)} short trades executed, PnL signs correct ✓")
+
+
+def test_overfit_diagnostic():
+    print("Testing overfitting diagnostics (IS vs OOS AUC gap)...")
+    df = _make_synth_df(1250, seed=9)
+    pipe = GeometricPipeline("1m", encoder_epochs=25)
+    diag = pipe.fit(df.iloc[:700])
+    for k in ("train_auc", "oos_auc", "overfit_gap"):
+        assert k in diag, f"missing {k}"
+    assert abs(diag["overfit_gap"] - (diag["train_auc"] - diag["oos_auc"])) < 1e-9
+    eng = PurgedWalkForwardEngine(df, timeframe="1m", n_folds=3)
+    res = eng.run()
+    assert "overfit" in res and "mean_gap" in res["overfit"]
+    assert res["overfit"]["verdict"] in ("low", "moderate", "high")
+    print(f"  fold gap {diag['overfit_gap']:+.3f} | WFO mean gap {res['overfit']['mean_gap']:+.3f} "
+          f"[{res['overfit']['verdict']}] ✓")
+
+
+def test_anchor_panel():
+    print("Testing anchor panel (append-only ledger, retire-not-delete, A_geom feed)...")
+    df = _make_synth_df(500)
+    vol = VolatilityNormalizer().transform(df)
+    sigs, valid = MultiResolutionSignatures().compute(vol["increments"])
+    panel = AnchorPanel()
+    panel.build_core(sigs, valid, vol["strata"], fold=0)
+    n0 = len(panel.core)
+    assert n0 > 0
+    strata_seen = {a["stratum"] for a in panel.core}
+    assert len(strata_seen) > 3, "strata must be model-free and diverse"
+    for a in panel.core:
+        a["last_seen_fold"] = 0
+        a["ood"] = 9.9
+    panel.refresh(sigs, valid, fold=5)
+    assert len(panel.core) == n0, "ledger is append-only: anchors are never deleted"
+    assert any(a["status"] == "retired" for a in panel.core), "stale+OOD anchors must retire"
+    dmin = panel.dmin({r: sigs[r][450] for r in GEOM_RESOLUTIONS})
+    assert dmin >= 0.0
+    Xp, ridxp = panel.panel_matrix()
+    assert Xp.shape[1] == GEOM_SIG_DIM and len(ridxp) == len(Xp)
+    print(f"  {n0} anchors, retired={sum(1 for a in panel.core if a['status']=='retired')}, "
+          f"dmin={dmin:.3f} ✓")
+
+
+def test_pipeline_end_to_end():
+    print("Testing GeometricPipeline end-to-end (fit → batch signals → live state)...")
+    df = _make_synth_df(900)
+    pipe = GeometricPipeline("1m", encoder_epochs=25)
+    diag = pipe.fit(df.iloc[:600])
+    for key in ("p_delta_nonzero", "var_r", "e_res_test", "heldout_recon",
+                "r_eff", "d_anchor", "delta_hat_data", "feature_stability", "kappa", "eta"):
+        assert key in diag, f"missing mandatory diagnostic: {key}"
+    assert pipe.status == "ready"
+    assert pipe.schema is not None and pipe.schema.kappa_init < 0
+    geo = pipe.batch_signals(df, start_at=660)
+    assert len(geo["signal"]) == len(df)
+    assert set(np.unique(geo["signal"][:660])) <= {"HOLD"}
+    assert np.all((geo["p"] >= 0) & (geo["p"] <= 1))
+    assert np.all((geo["A"] >= 0) & (geo["A"] <= 1))
+    c_rt = roundtrip_cost_pct()
+    assert np.all(geo["tp"][660:] >= 3 * c_rt - 1e-9)
+    assert np.all(geo["sl"][660:] >= 1.5 * c_rt - 1e-9)
+    buy_bars = np.where(geo["signal"] == "BUY")[0]
+    assert np.all(geo["exp_net"][buy_bars] > 0), "BUY only when E[net]>0"
+    n_buy = int(len(buy_bars))
+    print(f"  schema={pipe.schema.label()} | BUY signals on OOS: {n_buy} "
+          f"| P(δ≠0)={diag['p_delta_nonzero']:.3f}")
+    live = pipe.live_state(pipe.infer_latest(df))
+    for key in ("status", "signal", "p_gbm", "p_meta", "a_score", "a_gate",
+                "episode", "cluster", "schema", "kappa", "panel", "chart"):
+        assert key in live, f"missing live state key: {key}"
+    assert live["status"] == "ready"
+    ch = live["chart"]
+    assert ch["n"] == len(ch["A"]) == len(ch["episode"]) == len(ch["buy"]) \
+        == len(ch["exit"]) == len(ch["state"]), "chart overlay arrays must align"
+    assert all(0.0 <= a <= 1.0 for a in ch["A"])
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
+        params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
+    assert "trade_count" in rep and "profit_factor" in rep
+    print(f"  geo backtest slice: {rep['trade_count']} trades, PF={rep['profit_factor']:.2f}")
+
+
+def test_geometric_backtest_and_purged_wfo():
+    print("Testing run_geometric_backtest + PurgedWalkForwardEngine...")
+    df = _make_synth_df(1250, seed=7)
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    rep = run_geometric_backtest(df, params, timeframe="1m")
+    assert rep["engine"] == "geometric"
+    assert rep["train_bars"] > 0 and "schema" in rep
+    print(f"  geometric backtest: {rep['trade_count']} trades | schema {rep['schema']}")
+    eng = PurgedWalkForwardEngine(df, timeframe="1m", n_folds=3)
+    res = eng.run()
+    assert res["engine"] == "geometric-purged-wfo"
+    assert res["slices_evaluated"] == 3
+    assert res["challenger"] is not None and "TP_PERCENT" in res["challenger"]
+    assert len(res["diagnostics"]) >= 2
+    versions = {d["schema"] for d in res["diagnostics"]}
+    assert len(versions) == 1, "geometry schema must stay fixed across folds"
+    assert len(res["d_anchor_log"]) >= 2
+    d0 = res["d_anchor_log"][0]["d_anchor"]
+    assert abs(d0) < 1e-9, "fold-0 D_anchor is the baseline (0)"
+    assert len(res["delta_hat_series"]) >= 2
+    print(f"  purged WFO: stability {res['stability_count']}/3 | "
+          f"D_anchor log {[round(e['d_anchor'], 4) for e in res['d_anchor_log']]}")
+
+
+def test_signal_engine_contract():
+    print("Testing SignalEngine info contract (legacy keys preserved + geom block)...")
+    df = _make_synth_df(300)
+    eng = SignalEngine(enable_geometry=True)
+    info = eng.process(df)
+    for key in ("signal", "type", "price", "gauss_vol", "slow_gauss", "upper_band",
+                "lower_band", "is_ranging", "fast_gauss", "hyp_direction",
+                "ou_theta", "ou_mu", "ou_valid", "geom"):
+        assert key in info, f"missing info key: {key}"
+    assert info["geom"]["status"] in ("collecting", "training")
+    assert info["signal"] in ("BUY", "SELL", "HOLD")
+    eng2 = SignalEngine(enable_geometry=False)
+    info2 = eng2.process(df)
+    assert info2["geom"] == {}
+    print("  legacy contract intact, geometry block attached ✓")
+
+
+# ── V3.5 component tests ─────────────────────────────────────────────────────
+def test_ou_component():
+    print("Testing OUPingPong...")
+    ou = OUPingPong()
+    np.random.seed(42)
+    prices = [100.0]
+    mu = 100.0; theta = 0.1; sigma = 0.2
+    for _ in range(150):
+        dp = theta * (mu - prices[-1]) + np.random.normal(0, sigma)
+        prices.append(prices[-1] + dp)
+    prices = np.array(prices)
+    ou.fit(prices)
+    print(f"Fit results: theta={ou.theta:.4f}, mu={ou.mu:.2f}, half_life={ou.half_life:.2f}, valid={ou.is_valid}")
+    print(f"Corridor: lower={ou.ou_lower:.2f}, upper={ou.ou_upper:.2f}")
+    sig, sig_type = ou.get_signal(ou.ou_lower - 1.0)
+    print(f"Price below lower band signal: {sig} ({sig_type})")
+    assert sig == "BUY"
+
+
+def test_jump_diffusion_component():
+    print("Testing Jump Diffusion detection...")
+    ou = OUPingPong()
+    np.random.seed(42)
+    prices = [100.0]
+    mu = 100.0; theta = 0.1; sigma = 0.2
+    for _ in range(150):
+        dp = theta * (mu - prices[-1]) + np.random.normal(0, sigma)
+        prices.append(prices[-1] + dp)
+    ou.fit(np.array(prices))
+    print(f"Clean fit valid: {ou.is_valid}, upper_band: {ou.ou_upper:.2f}")
+    prices.append(prices[-1] + 5.0)
+    ou.fit(np.array(prices))
+    print(f"Post-jump valid (should be False due to cooldown): {ou.is_valid}")
+    print(f"Jump detected: {ou.jump_detected}, cooldown: {ou.jump_cooldown}")
+    print(f"Jump intensity (lambda): {ou.jump_intensity:.4f}, Jump Mean: {ou.jump_mean:.4f}, Jump Std: {ou.jump_std:.4f}")
+    assert ou.jump_intensity > 0.0
+    assert ou.jump_mean > 0.0
+    sig, sig_type = ou.get_signal(90.0)
+    print(f"Signal during cooldown (should be HOLD): {sig}")
+    assert sig == "HOLD"
+
+
+def test_rough_path_classifier():
+    print("Testing RoughPathClassifier...")
+    clf = RoughPathClassifier(window=14)
+    np.random.seed(42)
+    n = 100
+    closes = 100 + np.cumsum(np.random.normal(0, 0.5, n))
+    sigs = clf._compute_signatures(closes)
+    print(f"Computed signatures shape: {sigs.shape}")
+    assert sigs.shape == (n, 9)
+    df = pd.DataFrame({'close': closes})
+    clf.fit(df)
+    pred = clf.predict(closes)
+    print(f"Predicted direction: {pred}")
+    assert pred in (-1, 0, 1)
+
+
+def test_dynamic_target_optimizer():
+    print("Testing DynamicTargetOptimizer...")
+    dto = DynamicTargetOptimizer()
+    tp, sl = dto.get_optimal_targets("trend", 1.5, default_tp=0.5, default_sl=0.5)
+    print(f"Default targets: tp={tp:.2f}, sl={sl:.2f}")
+    assert tp == 0.5
+    assert sl == 0.5
+    dto.record_trade("trend", 1.0, 1.2, 0.5, 1.0)
+    dto.record_trade("trend", 1.1, 1.0, 0.4, 0.8)
+    dto.record_trade("trend", 0.9, 1.4, 0.6, 1.2)
+    dto.record_trade("trend", 1.0, 1.1, 0.5, 0.9)
+    tp, sl = dto.get_optimal_targets("trend", 1.0)
+    print(f"Optimal targets for vol 1.0: tp={tp:.4f}, sl={sl:.4f}")
+    assert abs(tp - 0.94) < 1e-5
+    assert abs(sl - 0.60) < 1e-5
+
+
+def test_backtester_and_wfo():
+    print("Testing Backtester and BacktestOptimizer...")
+    np.random.seed(42)
+    n = 500
+    closes = 100 + np.cumsum(np.random.normal(0, 0.5, n))
+    highs = closes + np.random.uniform(0.05, 0.2, n)
+    lows = closes - np.random.uniform(0.05, 0.2, n)
+    opens = closes + np.random.uniform(-0.1, 0.1, n)
+    volumes = np.random.uniform(10, 100, n)
+    df = pd.DataFrame({'open': opens, 'high': highs, 'low': lows,
+                       'close': closes, 'volume': volumes})
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 3.0}
+    bt = Backtester(df)
+    report = bt.run(params)
+    print(f"Backtest run complete: Trade Count={report['trade_count']}, Net PnL={report['total_pnl_usdt']:.2f}")
+    assert "trade_count" in report
+    assert "total_pnl_pct" in report
+    assert "total_pnl_usdt" in report
+    assert "profit_factor" in report
+    optimizer = BacktestOptimizer(df)
+    wfo_res = optimizer.run_wfo()
+    print(f"WFO run complete: Challenger={wfo_res['challenger']}, Stability={wfo_res['stability_count']}/10")
+    assert "challenger" in wfo_res
+    assert "stability_count" in wfo_res
+
+
+# ── V3.5 safety/execution tests with a mock CCXT exchange ───────────────────
+class _MockExchange:
+    def __init__(self):
+        self.apiKey = "mock_key"
+        self.secret = "mock_secret"
+        self.orders = []
+        self.canceled_orders = []
+        self.balance = {"USDT": {"free": 100.0}}
+
+    def load_markets(self): pass
+    def amount_to_precision(self, symbol, qty): return f"{qty:.4f}"
+    def price_to_precision(self, symbol, price): return f"{price:.2f}"
+    def fetch_balance(self): return self.balance
+    def fetch_order_book(self, symbol, limit=None):
+        return {"bids": [[59990.0, 10.0]], "asks": [[60010.0, 10.0]]}
+    def fetch_order(self, order_id, symbol):
+        for o in self.orders:
+            if o['id'] == order_id:
+                o['status'] = 'closed'; o['filled'] = o['qty']
+                return o
+        return {"id": order_id, "status": "closed", "filled": 0.0, "average": 60000.0}
+    def fetch_ticker(self, symbol): return {"last": 60000.0, "close": 60000.0}
+    def create_order(self, symbol, type, side, qty, price=None, params=None):
+        order = {"id": f"mock_order_{len(self.orders)+1}", "symbol": symbol, "type": type,
+                 "side": side, "qty": qty, "price": price, "params": params or {},
+                 "average": price or 60000.0}
+        self.orders.append(order)
+        return order
+    def cancel_order(self, order_id, symbol):
+        self.canceled_orders.append(order_id)
+        return {"status": "canceled", "id": order_id}
+
+
+async def _run_safety_tests_async():
+    print("--------------------------------------------------")
+    print("RUNNING QUANT BOT V3.5 SAFETY AND METRIC TESTS...")
+    print("--------------------------------------------------")
+    # placeholder API creds so QuantBot() init doesn't raise in a fresh env
+    os.environ.setdefault("BORSANIN_API_KEY", "mock_key")
+    os.environ.setdefault("BORSANIN_SECRET_KEY", "mock_secret")
+    bot = QuantBot()
+    mock_ex = _MockExchange()
+    bot.exchange = mock_ex
+    bot_state["trading_mode"] = "PAPER"
+    bot_state["virtual_balance"] = 10000.0
+    bot_state["is_trading_active"] = True
+    bot_state["trades"] = []
+    bot_state["trade_count"] = 0
+    bot_state["total_pnl"] = 0.0
+    bot_state["pnl_list"] = []
+    bot_state["winning_trades"] = 0
+    bot_state["losing_trades"] = 0
+
+    print("Testing Spot Long-only restriction:")
+    info = {
+        'signal': 'SELL', 'type': 'Trend', 'gauss_vol': 200.0, 'slow_gauss': 60000.0,
+        'upper_band': 60500.0, 'lower_band': 59500.0, 'is_ranging': False, 'fast_gauss': 60000.0,
+        'sg_list': [60000.0] * 100, 'ub_list': [60500.0] * 100, 'lb_list': [59500.0] * 100,
+        'hyp_direction': 0, 'ou_theta': 0.0, 'ou_mu': 0.0, 'ou_half_life': 999.0,
+        'ou_upper': 0.0, 'ou_lower': 0.0, 'ou_stop_lower': 0.0, 'ou_stop_upper': 0.0,
+        'ou_valid': False, 'ou_jump_intensity': 0.0, 'ou_jump_mean': 0.0,
+        'ou_jump_std': 0.0, 'ou_jump_detected': False, 'ou_jump_cooldown': 0
+    }
+    df = pd.DataFrame({
+        'timestamp': [pd.Timestamp.now()] * 100,
+        'open': [60000.0] * 100, 'high': [60100.0] * 100, 'low': [59900.0] * 100,
+        'close': [60000.0] * 100, 'volume': [10.0] * 100
+    })
+
+    async def mock_fetch_ohlcv():
+        return df
+
+    bot.fetch_ohlcv = mock_fetch_ohlcv
+    bot.signal_engine.process = lambda *args, **kwargs: info
+
+    await bot.main_tick()
+    print(f"  Position open after SELL signal? {bot.position.is_open} (Expected: False)")
+    assert not bot.position.is_open, "Error: Opened position on SELL signal!"
+
+    print("Testing Paper entry slippage and fee calculation:")
+    info['signal'] = 'BUY'
+    await bot.main_tick()
+    print(f"  Position open? {bot.position.is_open} (Expected: True)")
+    print(f"  Position mode: {bot.position.mode} (Expected: PAPER)")
+    print(f"  Position entry price: {bot.position.entry_price:.2f} (Expected: 60030.00)")
+    assert abs(bot.position.entry_price - 60030.0) < 1e-5
+    invested = bot.position.invested_amount
+    expected_fee = invested * 0.001
+    expected_balance = 10000.0 - expected_fee
+    print(f"  Virtual Balance after entry: {bot_state['virtual_balance']:.2f} (Expected: {expected_balance:.2f})")
+    assert abs(bot_state["virtual_balance"] - expected_balance) < 1e-2
+
+    print("Testing Mode Isolation:")
+    bot_state["trading_mode"] = "REAL"
+    await bot.close_position("Test manual close", 61000.0)
+    print(f"  Exchange orders placed on close? {len(mock_ex.orders)} (Expected: 0 - since position was PAPER)")
+    assert len(mock_ex.orders) == 0, "Error: Placed order on exchange to close PAPER position!"
+    print(f"  Virtual Balance after close: {bot_state['virtual_balance']:.2f}")
+
+    print("Testing REAL mode stop-loss order placement:")
+    mock_ex.orders = []
+    bot_state["trading_mode"] = "REAL"
+    mock_ex.balance = {"USDT": {"free": 100.0}}
+    bot_state["real_balance"] = 100.0
+    bot_state["start_real_balance"] = 100.0
+    info['signal'] = 'BUY'
+    info['type'] = 'Ping'
+    await bot.main_tick()
+    print(f"  Position mode: {bot.position.mode} (Expected: REAL)")
+    print(f"  Borsa orders count: {len(mock_ex.orders)} (Expected: 2 - 1 entry and 1 stop-loss)")
+    assert len(mock_ex.orders) == 2, f"Expected 2 orders, got {len(mock_ex.orders)}"
+    assert mock_ex.orders[0]['side'] == "buy"
+    assert mock_ex.orders[1]['side'] == "sell"
+    assert "stopPrice" in mock_ex.orders[1]['params']
+
+    print("Testing stop-loss order cancelation on exit:")
+    stop_id = bot.position.stop_order_id
+    await bot.close_position("Exit hit", 61000.0)
+    print(f"  Canceled orders list: {mock_ex.canceled_orders} (Expected: ['{stop_id}'])")
+    assert stop_id in mock_ex.canceled_orders, "Error: Stop order was not canceled on exit!"
+
+    print("Testing Minimum Order Size enforcement (5 USDT):")
+    mock_ex.orders = []
+    mock_ex.balance = {"USDT": {"free": 3.0}}
+    bot_state["real_balance"] = 3.0
+    info['signal'] = 'BUY'
+    await bot.main_tick()
+    print(f"  Position open with low balance? {bot.position.is_open} (Expected: False)")
+    assert not bot.position.is_open
+    mock_ex.balance = {"USDT": {"free": 6.0}}
+    bot_state["real_balance"] = 6.0
+    await bot.main_tick()
+    print(f"  Position open with 6 USDT balance? {bot.position.is_open} (Expected: True)")
+    if bot.position.is_open:
+        invested = bot.position.qty * 60000.0
+        print(f"  Real order quantity: {bot.position.qty:.6f}, Value: {invested:.2f} USDT (Expected: >= 5.0)")
+        assert invested >= 5.0
+
+    print("--------------------------------------------------")
+    print("ALL SAFETY AND EXECUTION TESTS PASSED SUCCESSFULLY!")
+    print("--------------------------------------------------")
+
+
+# ── suite dispatchers ────────────────────────────────────────────────────────
+def _run_geom_suite():
+    test_chen_identity()
+    test_multires_matches_direct()
+    test_delta_hat_and_schema()
+    test_soft_threshold_sparsity()
+    test_encoder_gradients()
+    test_encoder_training()
+    test_delta_hat_outlier_robustness()
+    test_cost_floors()
+    test_geo_trailing_floor()
+    test_episode_hysteresis()
+    test_cluster_and_graph()
+    test_gbm_learner()
+    test_meta_and_conformal()
+    test_barrier_directional()
+    test_two_sided_and_short_gate()
+    test_backtester_short()
+    test_overfit_diagnostic()
+    test_anchor_panel()
+    test_pipeline_end_to_end()
+    test_geometric_backtest_and_purged_wfo()
+    test_signal_engine_contract()
+    print("\nAll V3.6 learned-geometry tests passed!")
+
+
+def _run_components_suite():
+    test_ou_component()
+    test_jump_diffusion_component()
+    test_rough_path_classifier()
+    test_dynamic_target_optimizer()
+    test_backtester_and_wfo()
+    print("All component tests passed!")
+
+
+def _run_safety_suite():
+    asyncio.run(_run_safety_tests_async())
+
+
+def _run_all_tests():
+    _run_geom_suite()
+    print()
+    _run_components_suite()
+    print()
+    _run_safety_suite()
+
+
 bot_instance = None
 
 def run_bot():
@@ -5662,6 +6438,18 @@ def run_bot():
     asyncio.run(bot_instance.main_loop())
 
 if __name__ == "__main__":
+    # ── CLI: --test / --test-geom / --test-comp / --test-safe run the embedded
+    # test suites and exit. No flag = launch the desktop bot as before.
+    _flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if _flags & {"--test", "--test-all"}:
+        _run_all_tests(); sys.exit(0)
+    if "--test-geom" in _flags:
+        _run_geom_suite(); sys.exit(0)
+    if "--test-comp" in _flags:
+        _run_components_suite(); sys.exit(0)
+    if "--test-safe" in _flags:
+        _run_safety_suite(); sys.exit(0)
+
     import subprocess
     try:
         cmd = "netstat -ano | findstr LISTENING | findstr :5001"
