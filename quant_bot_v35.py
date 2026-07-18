@@ -85,6 +85,15 @@ LOOP_INTERVAL = 10
 FAST_LOOP_INTERVAL = 0.5
 COMMISSION_RATE = 0.001  # MEXC standard spot taker fee (0.1%). Set to 0.0 if you have a 0-fee promotion.
 
+# ── Two-sided trading (futures) ──────────────────────────────────────────────
+# Short selling is OPT-IN. Default is long-only so spot behaviour is unchanged.
+# ALLOW_SHORT enables SELL signals in the decision layer, the backtester and
+# PAPER trading. REAL live short execution additionally requires a futures
+# venue and is intentionally NOT auto-armed (see main_tick) — validate in
+# PAPER/backtest/WFO first.
+ALLOW_SHORT = os.environ.get("ALLOW_SHORT", "0").strip() in ("1", "true", "True", "yes")
+TRADING_VENUE = os.environ.get("TRADING_VENUE", "spot").strip().lower()  # "spot" | "futures"
+
 # Yerel saat dilimi farkini hesapla (Turkiye = UTC+3 = 10800 saniye)
 from datetime import timezone as _tz
 UTC_OFFSET = int(datetime.now(_tz.utc).astimezone().utcoffset().total_seconds())
@@ -224,7 +233,11 @@ bot_state = {
     # V3.6 Learned Geometry state
     "geom": {"status": "collecting", "signal": "HOLD", "schema": "-", "kappa": 0.0,
              "a_score": 0.0, "a_gate": 0.5, "p_gbm": 0.5, "p_meta": 0.5,
-             "episode": "NORMAL", "cluster": -1, "fold": 0}
+             "episode": "NORMAL", "cluster": -1, "fold": 0, "dir": 0},
+
+    # Two-sided trading toggles (opt-in short)
+    "allow_short": ALLOW_SHORT,
+    "trading_venue": TRADING_VENUE,
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1989,6 +2002,40 @@ class MetaLabeler:
                 return 0
         return 1 if closes[min(t + max_hold, len(closes) - 1)] > entry else 0
 
+    @staticmethod
+    def barrier_dir(closes, t, tp_pct, max_hold=30):
+        """Symmetric directional label for the primary model: 1 if the +tp barrier
+        is touched before the -tp barrier, else 0. Final-sign fallback if neither.
+        Symmetric (equal up/down targets) so P(up) is unbiased for a two-sided model."""
+        entry = closes[t]
+        for j in range(t + 1, min(t + max_hold + 1, len(closes))):
+            r = (closes[j] - entry) / entry * 100.0
+            if r >= tp_pct:
+                return 1.0
+            if r <= -tp_pct:
+                return 0.0
+        return 1.0 if closes[min(t + max_hold, len(closes) - 1)] > entry else 0.0
+
+    @staticmethod
+    def barrier_outcome_dir(closes, t, tp_pct, sl_pct, side, max_hold=30):
+        """Directional TP-before-SL race for the meta model / trade outcome.
+        long:  +tp before -sl.   short: -tp before +sl (price falls tp% first)."""
+        entry = closes[t]
+        for j in range(t + 1, min(t + max_hold + 1, len(closes))):
+            r = (closes[j] - entry) / entry * 100.0
+            if side == "long":
+                if r >= tp_pct:
+                    return 1
+                if r <= -sl_pct:
+                    return 0
+            else:
+                if r <= -tp_pct:
+                    return 1
+                if r >= sl_pct:
+                    return 0
+        fin = closes[min(t + max_hold, len(closes) - 1)] - entry
+        return int((fin > 0) == (side == "long"))
+
     def fit(self, X, y):
         self.mu = X.mean(0)
         self.sigma = X.std(0) + 1e-9
@@ -2249,6 +2296,8 @@ class GeometricPipeline:
             self.panel = AnchorPanel()
             self.fold = 0
             self.p_hi = 0.6
+            self.p_lo = 0.4
+            self.allow_short = bool(bot_state.get("allow_short", ALLOW_SHORT))
             self.cost_pct = roundtrip_cost_pct()
             self.feat_mu = None            # fold-local per-resolution feature stats
             self.feat_sd = None
@@ -2424,17 +2473,17 @@ class GeometricPipeline:
         Xf, flags, states, active_counts = self._decision_features(
             embeds, vidx2, vol, Xin, fit_mode=True, closes=closes)
 
-        # labels: COST-AWARE barrier race (TP-before-SL over cost-floored,
-        # vol-scaled targets) — the classifier learns the same game the trades
-        # play, not a cost-blind 4-bar direction. Tail purged for the full hold.
+        # labels: COST-AWARE, SYMMETRIC directional barrier (does +tp get touched
+        # before -tp over the hold) → clean P(up) for a two-sided model, not a
+        # cost-blind 4-bar direction. Tail purged for the full hold.
         T = len(vidx2)
         tp_arr, sl_arr = self._barrier_pcts(vol, vidx2)
         usable = np.array([vidx2[t] + GEO_BARRIER_HOLD < len(closes) for t in range(T)])
         y = np.zeros(T)
         for t in range(T):
             if usable[t]:
-                y[t] = float(MetaLabeler.barrier_outcome(
-                    closes, vidx2[t], tp_arr[t], sl_arr[t], max_hold=GEO_BARRIER_HOLD))
+                y[t] = MetaLabeler.barrier_dir(
+                    closes, vidx2[t], tp_arr[t], max_hold=GEO_BARRIER_HOLD)
 
         cal_start = int(T * 0.80)          # recent, chronological, NOT stratified
         tr_mask = usable.copy(); tr_mask[cal_start:] = False
@@ -2457,33 +2506,57 @@ class GeometricPipeline:
             if stab.get(f"{gname}_auc", 0.5) < 0.47:
                 self.feature_mask[np.where(np.concatenate([gmask, np.zeros(Xf.shape[1] - n_innov, dtype=bool)]))[0]] = False
 
-        # main classifier (LightGBM slot)
+        # main classifier (LightGBM slot) — predicts P(up)
         self.gbm = PureGradientBoosting(n_trees=40, depth=3, seed=self.seed)
         self.gbm.fit(Xf[tr_mask][:, self.feature_mask], y[tr_mask])
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
+        # symmetric directional thresholds: long if p_up high, short if p_up low
         self.p_hi = float(np.quantile(p_all[:cal_start], 0.70))
+        self.p_lo = float(np.quantile(p_all[:cal_start], 0.30))
 
-        # meta labeling on the primary model's own signals (train part),
-        # against the same cost-floored per-bar barriers
-        fired_tr = [t for t in range(cal_start) if usable[t] and p_all[t] >= self.p_hi]
+        # OVERFITTING diagnostic: primary-model AUC in-sample vs on the held-out
+        # chronological tail. A large positive gap = the model memorized the train
+        # window. Purely observational, surfaced in the dashboards.
+        va_mask = usable & (np.arange(T) >= cal_start)
+        train_auc = PureGradientBoosting.auc(y[tr_mask], p_all[tr_mask]) if np.any(tr_mask) else 0.5
+        oos_auc = PureGradientBoosting.auc(y[va_mask], p_all[va_mask]) if np.any(va_mask) else 0.5
+        overfit_gap = float(train_auc - oos_auc)
+
+        def _side_of(p):
+            if p >= self.p_hi:
+                return "long", 1, float(p)
+            if p <= self.p_lo:
+                return "short", -1, float(1.0 - p)
+            return None, 0, 0.0
+
+        # meta labeling on the primary model's own signals (train part), directional
+        # TP-before-SL over the cost-floored barriers. Trained TWO-SIDED regardless of
+        # allow_short so toggling short on needs no refit; emission is gated later.
         meta_X, meta_y = [], []
-        for t in fired_tr:
-            meta_X.append(self._meta_features(p_all[t], Xin[t], flags[t], states[t]))
-            meta_y.append(MetaLabeler.barrier_outcome(
-                closes, vidx2[t], tp_arr[t], sl_arr[t], max_hold=GEO_BARRIER_HOLD))
+        for t in range(cal_start):
+            if not usable[t]:
+                continue
+            side, dsign, conf = _side_of(p_all[t])
+            if side is None:
+                continue
+            meta_X.append(self._meta_features(conf, dsign, Xin[t], flags[t], states[t]))
+            meta_y.append(MetaLabeler.barrier_outcome_dir(
+                closes, vidx2[t], tp_arr[t], sl_arr[t], side, max_hold=GEO_BARRIER_HOLD))
         self.meta = MetaLabeler()
         if len(meta_X) >= 12 and 0 < np.mean(meta_y) < 1:
             self.meta.fit(np.stack(meta_X), np.array(meta_y))
 
-        # conformal calibration on the chronological tail
+        # conformal calibration on the chronological tail (both sides)
         self.conformal = ConformalGate()
-        fired_cal = [t for t in range(cal_start, T) if p_all[t] >= self.p_hi]
-        if len(fired_cal) >= 5:
-            pm, dm = [], []
-            for t in fired_cal:
-                pm.append(float(self.meta.predict_proba(
-                    self._meta_features(p_all[t], Xin[t], flags[t], states[t])[None, :])[0]))
-                dm.append(self.panel.dmin({r: sigs[r][vidx2[t]] for r in GEOM_RESOLUTIONS}))
+        pm, dm = [], []
+        for t in range(cal_start, T):
+            side, dsign, conf = _side_of(p_all[t])
+            if side is None:
+                continue
+            pm.append(float(self.meta.predict_proba(
+                self._meta_features(conf, dsign, Xin[t], flags[t], states[t])[None, :])[0]))
+            dm.append(self.panel.dmin({r: sigs[r][vidx2[t]] for r in GEOM_RESOLUTIONS}))
+        if len(pm) >= 5:
             self.conformal.calibrate(pm, dm)
 
         # panel bookkeeping + drift series
@@ -2518,6 +2591,9 @@ class GeometricPipeline:
             "d_anchor": (d_anchor or {}).get("d_anchor", 0.0),
             "delta_hat_data": dh_data,
             "feature_stability": stab,
+            "train_auc": float(train_auc),
+            "oos_auc": float(oos_auc),
+            "overfit_gap": overfit_gap,
             "lambda_l1": encoder.lambdas["l1"],
             "n_episodes": int(len([1 for f_ in np.diff(flags.astype(int)) if f_ == 1]) + (1 if flags[0] else 0)),
             "schema": self.schema.label(),
@@ -2562,8 +2638,10 @@ class GeometricPipeline:
         sl = np.maximum(1.5 * cost, 0.5 * tp)
         return tp, sl
 
-    def _meta_features(self, p, xin_row, flag, state):
-        return np.concatenate([[p, float(flag), float(state)],
+    def _meta_features(self, conf, dir_sign, xin_row, flag, state):
+        """conf = directional confidence of the chosen side (p_up for long,
+        1-p_up for short); dir_sign = +1 long / -1 short."""
+        return np.concatenate([[conf, float(dir_sign), float(flag), float(state)],
                                xin_row[:8]])
 
     # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
@@ -2572,6 +2650,7 @@ class GeometricPipeline:
         n = len(df)
         out = {
             "signal": np.array(["HOLD"] * n, dtype=object),
+            "dir": np.zeros(n, dtype=int),          # +1 long, -1 short, 0 flat
             "exit_flag": np.zeros(n, dtype=bool),
             "p": np.full(n, 0.5), "p_meta": np.full(n, 0.5),
             "A": np.zeros(n), "episode": np.zeros(n, dtype=bool),
@@ -2600,26 +2679,51 @@ class GeometricPipeline:
             bar = vidx[t]
             if bar < start_at:
                 continue
-            p = float(p_all[t])
-            mf = self._meta_features(p, Xin[t], flags[t], states[t])
-            pm = float(self.meta.predict_proba(mf[None, :])[0]) if self.meta else 0.5
+            p = float(p_all[t])                     # P(up)
             dm = self.panel.dmin({r: sigs[r][bar] for r in GEOM_RESOLUTIONS})
-            A = self.conformal.combined(pm, dm) if self.conformal else 0.5
             tp_t, sl_t = float(tp_arr[t]), float(sl_arr[t])
-            # expected NET return of the barrier race — trades must clear costs
-            exp_net = pm * (tp_t - cost) - (1.0 - pm) * (sl_t + cost)
+
+            # evaluate each admissible side; BUY/SELL taken on the best positive
+            # expected NET return (barrier race, costs subtracted). Short is only
+            # a candidate when allow_short is set.
+            candidates = []
+            sides = [("long", 1, p, "BUY")]
+            if self.allow_short:
+                sides.append(("short", -1, 1.0 - p, "SELL"))
+            for side, dsign, conf, sig_name in sides:
+                thr_ok = (p >= self.p_hi) if side == "long" else (p <= self.p_lo)
+                if not thr_ok:
+                    continue
+                mf = self._meta_features(conf, dsign, Xin[t], flags[t], states[t])
+                pm = float(self.meta.predict_proba(mf[None, :])[0]) if self.meta else 0.5
+                A = self.conformal.combined(pm, dm) if self.conformal else 0.5
+                exp_net = pm * (tp_t - cost) - (1.0 - pm) * (sl_t + cost)
+                candidates.append((exp_net, A, pm, dsign, sig_name))
+
+            # default display fields come from the long hypothesis
+            long_pm = 0.5
+            if self.meta:
+                long_pm = float(self.meta.predict_proba(
+                    self._meta_features(p, 1, Xin[t], flags[t], states[t])[None, :])[0])
             out["p"][bar] = p
-            out["p_meta"][bar] = pm
-            out["A"][bar] = A
+            out["p_meta"][bar] = long_pm
+            out["A"][bar] = self.conformal.combined(long_pm, dm) if self.conformal else 0.5
             out["tp"][bar] = tp_t
             out["sl"][bar] = sl_t
-            out["exp_net"][bar] = exp_net
+            out["exp_net"][bar] = long_pm * (tp_t - cost) - (1.0 - long_pm) * (sl_t + cost)
             out["episode"][bar] = bool(flags[t])
             out["state"][bar] = int(states[t])
-            if p >= self.p_hi and A >= a_gate and exp_net > 0.0:
-                out["signal"][bar] = "BUY"
+
+            fired = [c for c in candidates if c[0] > 0.0 and c[1] >= a_gate]
+            if fired:
+                exp_net, A_sel, pm, dsign, sig_name = max(fired, key=lambda c: c[0])
+                out["signal"][bar] = sig_name
+                out["dir"][bar] = dsign
+                out["p_meta"][bar] = pm
+                out["A"][bar] = A_sel
+                out["exp_net"][bar] = exp_net
             exp_ret = self.graph.expected_return(states[t]) if self.graph else 0.0
-            out["exit_flag"][bar] = bool(flags[t] and exp_ret < 0.0 and A < 0.8 * a_gate)
+            out["exit_flag"][bar] = bool(flags[t] and exp_ret < 0.0 and float(out["A"][bar]) < 0.8 * a_gate)
         return out
 
     # ── live path ─────────────────────────────────────────────────────────────
@@ -2632,11 +2736,13 @@ class GeometricPipeline:
         state = {
             "status": "ready",
             "signal": str(geo["signal"][i]),
+            "dir": int(geo["dir"][i]),
             "exit_flag": bool(geo["exit_flag"][i]),
             "p_gbm": float(geo["p"][i]),
             "p_meta": float(geo["p_meta"][i]),
             "a_score": float(geo["A"][i]),
             "a_gate": gate,
+            "allow_short": bool(self.allow_short),
             "episode": "EPISODE" if geo["episode"][i] else "NORMAL",
             "cluster": st - 1,
             "tp_pct": float(geo["tp"][i]),
@@ -2650,6 +2756,7 @@ class GeometricPipeline:
                 "episode": [bool(x) for x in geo["episode"]],
                 "state": [int(x) for x in geo["state"]],
                 "buy": [bool(sg == "BUY") for sg in geo["signal"]],
+                "sell": [bool(sg == "SELL") for sg in geo["signal"]],
                 "exit": [bool(x) for x in geo["exit_flag"]],
             },
         }
@@ -2665,8 +2772,9 @@ class GeometricPipeline:
             "eta": float(self.encoder.eta) if self.encoder else 0.0,
             "delta_hat": self.schema.delta_hat if self.schema else {},
             "fold": self.fold,
-            "signal": "HOLD", "exit_flag": False,
+            "signal": "HOLD", "dir": 0, "exit_flag": False,
             "p_gbm": 0.5, "p_meta": 0.5, "a_score": 0.0, "a_gate": 0.5,
+            "allow_short": bool(self.allow_short),
             "tp_pct": 0.0, "sl_pct": 0.0, "exp_net": 0.0,
             "episode": "NORMAL", "cluster": -1,
             "panel": self.panel.summary() if self.panel else {},
@@ -2681,6 +2789,8 @@ class GeometricPipeline:
     def on_bar(self, df, force_retrain=False, timeframe=None):
         """Live tick entry point — schedules background (re)training, never blocks."""
         tf = timeframe or self.timeframe
+        # runtime opt-in short toggle (no refit needed — the meta is trained two-sided)
+        self.allow_short = bool(bot_state.get("allow_short", ALLOW_SHORT))
         if tf != self.timeframe:
             log.info(f"[GEOM] timeframe changed {self.timeframe} → {tf}: resetting geometry (new first window)")
             self.reset(tf)
@@ -2799,6 +2909,18 @@ class PurgedWalkForwardEngine:
             if stable > best_stable or (stable == best_stable and var < best_var):
                 best_ci, best_stable, best_var = ci, stable, var
         challenger = dict(combos[best_ci])
+        # overfitting readout: mean primary-model IS→OOS AUC gap across folds
+        gaps = [d.get("overfit_gap", 0.0) for d in pipeline.diagnostics]
+        oos_aucs = [d.get("oos_auc", 0.5) for d in pipeline.diagnostics]
+        overfit = {
+            "mean_gap": float(np.mean(gaps)) if gaps else 0.0,
+            "max_gap": float(np.max(gaps)) if gaps else 0.0,
+            "mean_oos_auc": float(np.mean(oos_aucs)) if oos_aucs else 0.5,
+            "verdict": ("high" if (gaps and np.mean(gaps) > 0.15) else
+                        "moderate" if (gaps and np.mean(gaps) > 0.08) else "low"),
+        }
+        log.info(f"[WFO] overfit: mean IS-OOS AUC gap {overfit['mean_gap']:.3f} "
+                 f"({overfit['verdict']}), mean OOS AUC {overfit['mean_oos_auc']:.3f}")
         return {
             "challenger": challenger,
             "stability_count": int(best_stable),
@@ -2808,6 +2930,8 @@ class PurgedWalkForwardEngine:
             "diagnostics": pipeline.diagnostics,
             "d_anchor_log": pipeline.panel.d_anchor_log,
             "delta_hat_series": pipeline.delta_hat_series,
+            "overfit": overfit,
+            "allow_short": bool(pipeline.allow_short),
             "schema": pipeline.schema.label() if pipeline.schema else "-",
             "fold_results": {str(ci): fold_results[ci] for ci in fold_results},
         }
@@ -2903,8 +3027,8 @@ class SignalEngine:
                 geom_state = self.geometry.live_state() if self.geometry else {}
             if geom_state.get("status") == "ready":
                 gsig = geom_state.get("signal", "HOLD")
-                if gsig == "BUY":
-                    sig, st = "BUY", "Geo"
+                if gsig in ("BUY", "SELL"):
+                    sig, st = gsig, "Geo"
                 else:
                     sig, st = "HOLD", ""
 
@@ -3581,6 +3705,7 @@ class QuantBot:
                 "geo_episode": bool(gchart["episode"][gi]) if has_geo else False,
                 "geo_state": int(gchart["state"][gi]) if has_geo else 0,
                 "geo_buy": bool(gchart["buy"][gi]) if has_geo else False,
+                "geo_sell": bool(gchart.get("sell", [])[gi]) if (has_geo and gchart.get("sell")) else False,
                 "geo_exit": bool(gchart["exit"][gi]) if has_geo else False,
             })
         bot_state["chart_data"] = chart_data
@@ -3748,11 +3873,15 @@ class QuantBot:
         else:
             bot_state["position_side"] = None
 
-        # OBI & Risk Parity filtering (Spot is Long-Only, so BUY only)
+        # OBI & Risk Parity filtering
         obi_filter_pass = True
-        if info['signal'] == "BUY" and bot_state.get("obi", 0) < -0.3:
+        obi_now = bot_state.get("obi", 0)
+        if info['signal'] == "BUY" and obi_now < -0.3:
             obi_filter_pass = False
-            log.info(f"BUY blocked by OBI ({bot_state['obi']:.2f} Sell Wall)")
+            log.info(f"BUY blocked by OBI ({obi_now:.2f} Sell Wall)")
+        elif info['signal'] == "SELL" and obi_now > 0.3:
+            obi_filter_pass = False
+            log.info(f"SELL blocked by OBI ({obi_now:.2f} Buy Wall)")
 
         # CRITICAL Spot Restructure: Only open on BUY (no shorting on Spot)
         if not self.position.is_open and info['signal'] == "BUY" and obi_filter_pass:
@@ -3894,6 +4023,66 @@ class QuantBot:
                             asyncio.create_task(self.telegram.send_message(msg))
 
                 except Exception as e: log.error(f"Siparis hatasi: {e}")
+
+        # ── SHORT entry (two-sided / futures). Opt-in via allow_short. PAPER is
+        # fully simulated; REAL live short is intentionally NOT auto-executed —
+        # futures order/margin/liquidation handling must be validated first. ──
+        if (not self.position.is_open and info['signal'] == "SELL"
+                and bot_state.get("allow_short") and obi_filter_pass
+                and bot_state["is_trading_active"]):
+            try:
+                entry_vol = float(info['gauss_vol'])
+                cost = roundtrip_cost_pct()
+                g_state = info.get("geom", {}) or {}
+                bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
+                opt_tp = max(float(g_state.get("tp_pct") or 0.0), 3.0 * cost,
+                             2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
+                opt_sl = max(float(g_state.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
+                min_trail_dist = price * opt_tp / 100.0 * 0.5
+                stop_dist = max(entry_vol * trail_mult, min_trail_dist)
+                if stop_dist <= 0:
+                    stop_dist = price * 0.01
+
+                if bot_state["trading_mode"] == "REAL":
+                    log.warning("Geo SELL (short) received in REAL mode: live futures short "
+                                "execution is not auto-armed. Validate in PAPER/backtest/WFO, "
+                                "then wire futures orders deliberately. Signal skipped.")
+                    if not bot_state.get("_short_real_warned"):
+                        bot_state["_short_real_warned"] = True
+                        asyncio.create_task(self.telegram.send_message(
+                            "⚠️ *Geo SHORT sinyali (REAL)*: Canlı futures short otomatik açılmıyor. "
+                            "Önce PAPER/backtest ile doğrula; futures emirleri bilinçli olarak devreye alınmalı."))
+                elif bot_state["virtual_balance"] >= 5:
+                    risk_amount = bot_state["virtual_balance"] * (TARGET_RISK_PERCENT / 100.0)
+                    target_qty = risk_amount / stop_dist
+                    max_qty = (bot_state["virtual_balance"] * MAX_CAPITAL_ALLOCATION) / price
+                    qty = min(target_qty, max_qty)
+
+                    slippage_price = price * 0.9995          # short fills below mid
+                    invested = qty * slippage_price
+                    bot_state["virtual_balance"] -= invested * 0.001   # entry fee
+
+                    log.info(f"PAPER SHORT: sell Geo (Qty: {qty:.6f}, Entry: {slippage_price:.2f}, "
+                             f"Invest: ${invested:.2f}, TP {opt_tp:.2f}% / SL {opt_sl:.2f}%)")
+                    self.position.open("short", slippage_price, qty, info['type'],
+                                       entry_vol, invested, mode="PAPER",
+                                       tp_percent=opt_tp, sl_percent=opt_sl,
+                                       entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
+                    bot_state["trades"].insert(0, {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "type": info['type'], "side": "SHORT",
+                        "entry": float(slippage_price), "exit": 0.0,
+                        "pnl": "OPEN", "reason": f"Signal: {info['signal']}"
+                    })
+                    asyncio.create_task(self.telegram.send_message(
+                        f"🔻 *YENİ SHORT AÇILDI (PAPER)*\n\n"
+                        f"🪙 *Parite:* {SYMBOL}\n"
+                        f"📉 *Yön:* SHORT\n"
+                        f"🔍 *Tip:* {info['type']}\n"
+                        f"💵 *Giriş:* {slippage_price:.2f} USDT\n"
+                        f"🎯 *TP/SL:* {opt_tp:.2f}% / {opt_sl:.2f}%"))
+            except Exception as e_short:
+                log.error(f"Short entry error: {e_short}")
 
         # Shadow Mode Processing
         shadow_challenger = bot_state["parameters_store"].get("shadow_challenger")
@@ -4352,8 +4541,9 @@ class Backtester:
                 sig, st = "HOLD", ""
                 if geo is not None:
                     # learned-geometry decision chain on the last completed bar
-                    if str(geo["signal"][idx-1]) == "BUY":
-                        sig, st = "BUY", "Geo"
+                    gsig_bt = str(geo["signal"][idx-1])
+                    if gsig_bt in ("BUY", "SELL"):
+                        sig, st = gsig_bt, "Geo"
                 else:
                     ub, lb = sg[idx-1] + gv[idx-1] * band_mult, sg[idx-1] - gv[idx-1] * band_mult
                     cu = fg[idx-1] > sg[idx-1] and fg[idx-2] <= sg[idx-2]
@@ -4377,13 +4567,17 @@ class Backtester:
                     elif is_r and ms and h[idx-1] > ub and c[idx-1] < ub:
                         sig, st = "SELL", "Pong"
                     
-                if sig == "BUY" and balance >= 5.0:
-                    position_side = "long"
+                # SELL opens a short only in geo mode (futures/two-sided); legacy
+                # spot SELL stays flat as before.
+                open_long = sig == "BUY" and balance >= 5.0
+                open_short = sig == "SELL" and geo is not None and balance >= 5.0
+                if open_long or open_short:
+                    position_side = "long" if open_long else "short"
                     entry_type = st
-                    
+
                     slippage_factor = self.slippage_rate + self.spread_rate / 2
-                    entry_price = price * (1 + slippage_factor)
-                    
+                    entry_price = price * (1 + slippage_factor) if open_long else price * (1 - slippage_factor)
+
                     entry_volatility = float(gv[idx-1])
                     regime_key = "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
                     current_tp_percent, current_sl_percent = dynamic_target_optimizer.get_optimal_targets(
@@ -4413,9 +4607,14 @@ class Backtester:
                     balance -= invested_amount * self.commission_rate
                     has_taken_partial_tp = False
                     trail_dist_init = max(gv[idx-1] * trail_mult, min_trail_dist)
-                    trail_stop_30 = entry_price - trail_dist_init
-                    trail_stop_70 = entry_price - trail_dist_init
-                    ping_stop = entry_price - gv[idx-1] * ping_stop_mult
+                    if position_side == "long":
+                        trail_stop_30 = entry_price - trail_dist_init
+                        trail_stop_70 = entry_price - trail_dist_init
+                        ping_stop = entry_price - gv[idx-1] * ping_stop_mult
+                    else:
+                        trail_stop_30 = entry_price + trail_dist_init
+                        trail_stop_70 = entry_price + trail_dist_init
+                        ping_stop = entry_price + gv[idx-1] * ping_stop_mult
 
         trade_count = len(trades)
         total_pnl_pct = sum(pnl_list)
@@ -4701,7 +4900,7 @@ HTML_TEMPLATE = """
                     <div><span style="color:#089981; font-weight:700;">▮</span> Conformal A ≥ kapı</div>
                     <div><span style="color:#787b86; font-weight:700;">▮</span> Conformal A &lt; kapı</div>
                     <div><span style="color:#f5b041; font-weight:700;">●</span> Epizot başlangıcı (δ≠0, A-küme)</div>
-                    <div><span style="color:#089981; font-weight:700;">▲</span> GEO BUY &nbsp;·&nbsp; <span style="color:#f23645; font-weight:700;">▼</span> Geo Exit</div>
+                    <div><span style="color:#089981; font-weight:700;">▲</span> GEO Long &nbsp;·&nbsp; <span style="color:#e040fb; font-weight:700;">▼</span> GEO Short &nbsp;·&nbsp; <span style="color:#f23645; font-weight:700;">▼</span> Exit</div>
                     <div id="legend-geo-status" style="color:#787b86;">Geometri: -</div>
                 </div>
             </div>
@@ -4734,15 +4933,22 @@ HTML_TEMPLATE = """
                 <div class="kv-row"><span class="kv-key">η (speed):</span><span class="kv-val" id="geom-eta">-</span></div>
                 <div class="kv-row"><span class="kv-key">P(δ≠0):</span><span class="kv-val" id="geom-pdelta">-</span></div>
                 <div class="kv-row"><span class="kv-key">Episode:</span><span class="kv-val" id="geom-episode">NORMAL</span></div>
+                <div class="kv-row"><span class="kv-key">Direction:</span><span class="kv-val" id="geom-dir">FLAT</span></div>
                 <div class="kv-row"><span class="kv-key">p GBM / Meta:</span><span class="kv-val" id="geom-p">- / -</span></div>
                 <div class="kv-row"><span class="kv-key">Conformal A:</span><span class="kv-val" id="geom-a">-</span></div>
                 <div class="kv-row"><span class="kv-key">E[net] · TP/SL:</span><span class="kv-val" id="geom-expnet" style="font-size:0.7rem;">-</span></div>
+                <div class="kv-row"><span class="kv-key">Overfit gap:</span><span class="kv-val" id="geom-overfit">-</span></div>
                 <div class="kv-row"><span class="kv-key">D_anchor:</span><span class="kv-val" id="geom-danchor">-</span></div>
                 <div class="kv-row"><span class="kv-key">δ̂ (5/15/30/60):</span><span class="kv-val" id="geom-dhat" style="font-size:0.68rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">r·√|κ| (5/15/30/60):</span><span class="kv-val" id="geom-reff" style="font-size:0.68rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">Heldout Recon:</span><span class="kv-val" id="geom-recon">-</span></div>
                 <div class="kv-row"><span class="kv-key">Anchor Panel:</span><span class="kv-val" id="geom-panel" style="font-size:0.7rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">Fold:</span><span class="kv-val" id="geom-fold">0</span></div>
+                <div class="kv-row" style="margin-top:6px; border-top:1px dashed var(--border-color); padding-top:6px;">
+                    <span class="kv-key">Short (Futures):</span>
+                    <button id="short-toggle" onclick="toggleShort()" class="btn" style="padding:2px 8px; font-size:0.68rem; background:#2a2e39; color:var(--text-muted);">OFF</button>
+                </div>
+                <div style="font-size:0.6rem; color:var(--text-muted); margin-top:3px;">REAL futures short otomatik açılmaz — önce PAPER/backtest.</div>
             </div>
 
             <div class="panel-box">
@@ -4827,6 +5033,13 @@ HTML_TEMPLATE = """
 
         function toggleBot() {
             fetch('/api/toggle_bot', {method: 'POST'}).then(r => r.json()).then(() => updateUI());
+        }
+
+        function toggleShort() {
+            if (!window._shortOn) {
+                if(!confirm("SHORT sinyallerini aç (futures / iki yönlü)?\n\nPAPER'da ve backtest'te tam simüle edilir. REAL modda canlı futures short OTOMATİK AÇILMAZ — önce doğrula.")) return;
+            }
+            fetch('/api/toggle_short', {method: 'POST'}).then(r => r.json()).then(() => updateUI());
         }
 
         function setTF(tf) {
@@ -4969,6 +5182,25 @@ HTML_TEMPLATE = """
                             ? (pn.core_active + ' act / ' + (pn.core_retired || 0) + ' ret')
                             : '-';
                         document.getElementById('geom-fold').innerText = g.fold || 0;
+
+                        // Direction badge
+                        const dirEl = document.getElementById('geom-dir');
+                        if (g.dir === 1) { dirEl.innerText = '▲ LONG'; dirEl.style.color = 'var(--profit-green)'; }
+                        else if (g.dir === -1) { dirEl.innerText = '▼ SHORT'; dirEl.style.color = 'var(--loss-red)'; }
+                        else { dirEl.innerText = 'FLAT'; dirEl.style.color = 'var(--text-muted)'; }
+
+                        // Overfit gap (train-OOS AUC)
+                        const ofEl = document.getElementById('geom-overfit');
+                        if (gd.overfit_gap !== undefined) {
+                            ofEl.innerText = gd.overfit_gap.toFixed(3) + ' (OOS ' + (gd.oos_auc !== undefined ? gd.oos_auc.toFixed(2) : '-') + ')';
+                            ofEl.style.color = gd.overfit_gap > 0.15 ? 'var(--loss-red)' : (gd.overfit_gap > 0.08 ? 'var(--warning-yellow)' : 'var(--profit-green)');
+                        } else { ofEl.innerText = '-'; ofEl.style.color = 'var(--text-muted)'; }
+
+                        // Short toggle button reflects backend state
+                        const stEl = document.getElementById('short-toggle');
+                        if (g.allow_short) { stEl.innerText = 'ON'; stEl.style.background = 'rgba(242,54,69,0.2)'; stEl.style.color = 'var(--loss-red)'; }
+                        else { stEl.innerText = 'OFF'; stEl.style.background = '#2a2e39'; stEl.style.color = 'var(--text-muted)'; }
+
                         document.getElementById('legend-geo-status').innerText = 'Geometri: ' + (g.status || '-').toUpperCase() +
                             (g.status === 'ready' && g.schema ? ' · ' + g.schema : '');
                     }
@@ -5059,6 +5291,12 @@ HTML_TEMPLATE = """
                         if (s.wfo_report.schema && s.wfo_report.schema !== '-') {
                             wfoHtml += '<div class="kv-row"><span class="kv-key">Geometry:</span><span class="kv-val" style="font-size:0.65rem;">' + s.wfo_report.schema + '</span></div>';
                         }
+                        const ov = s.wfo_report.overfit;
+                        if (ov && ov.mean_gap !== undefined) {
+                            const ovColor = ov.verdict === 'high' ? 'var(--loss-red)' : (ov.verdict === 'moderate' ? 'var(--warning-yellow)' : 'var(--profit-green)');
+                            wfoHtml += '<div class="kv-row"><span class="kv-key">Overfit (IS-OOS AUC):</span><span class="kv-val" style="color:' + ovColor + ';">' +
+                                ov.mean_gap.toFixed(3) + ' · OOS ' + ov.mean_oos_auc.toFixed(2) + ' [' + ov.verdict + ']</span></div>';
+                        }
                         const dg = (s.wfo_report.diagnostics || []);
                         if (dg.length > 0) {
                             const dl = dg[dg.length - 1];
@@ -5127,7 +5365,10 @@ HTML_TEMPLATE = """
                             }
                             prevEp = !!d.geo_episode;
                             if (d.geo_buy) {
-                                markers.push({ time: d.time, position: 'belowBar', color: '#089981', shape: 'arrowUp', text: 'GEO' });
+                                markers.push({ time: d.time, position: 'belowBar', color: '#089981', shape: 'arrowUp', text: 'GEO L' });
+                            }
+                            if (d.geo_sell) {
+                                markers.push({ time: d.time, position: 'aboveBar', color: '#e040fb', shape: 'arrowDown', text: 'GEO S' });
                             }
                             if (d.geo_exit) {
                                 markers.push({ time: d.time, position: 'aboveBar', color: '#f23645', shape: 'arrowDown', text: 'EXIT' });
@@ -5202,6 +5443,17 @@ def toggle_bot():
         bot_state["is_trading_active"] = not bot_state["is_trading_active"]
         is_active = bot_state["is_trading_active"]
     return jsonify({"status": "success", "is_active": is_active})
+
+@app.route('/api/toggle_short', methods=['POST'])
+def toggle_short():
+    """Opt-in short (two-sided / futures). Affects the decision layer, backtest
+    and PAPER trading immediately (no refit — the meta is trained two-sided).
+    REAL live futures short remains non-auto-armed regardless of this flag."""
+    with state_lock:
+        bot_state["allow_short"] = not bot_state.get("allow_short", False)
+        allow = bot_state["allow_short"]
+    log.info(f"allow_short toggled → {allow}")
+    return jsonify({"status": "success", "allow_short": allow})
 
 @app.route('/api/set_timeframe', methods=['POST'])
 def set_timeframe():
@@ -5343,6 +5595,7 @@ def run_wfo_endpoint():
                 "challenger": challenger,
                 "engine": result.get("engine", "legacy-grid"),
                 "schema": result.get("schema", "-"),
+                "overfit": result.get("overfit", {}),
                 "diagnostics": result.get("diagnostics", []),
                 "d_anchor_log": result.get("d_anchor_log", []),
                 "delta_hat_series": result.get("delta_hat_series", [])
