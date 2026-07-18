@@ -9,7 +9,7 @@
 ║  Grafı → GBM → Meta Labeling → Conformal (A = α·A_pred + β·A_geom)         ║
 ║  + Anchor Panel (append-only defter) + Purged WFO (warm start + RKD)       ║
 ║                                                                            ║
-║  Mimarlar: Profesör + Antigravity AI + Kullanıcı                           ║
+║  Mimarlar: Fable + Antigravity AI + Kullanıcı                           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -861,8 +861,15 @@ class RoughPathClassifier:
 GEOM_RESOLUTIONS = (5, 15, 30, 60)     # bars per window, fine → coarse (dyadic tree 5→15→30→60)
 GEOM_PATH_DIM = 3                      # (t, vol-normalized log price, normalized signed flow)
 GEOM_SIG_DIM = GEOM_PATH_DIM + GEOM_PATH_DIM**2 + GEOM_PATH_DIM**3   # levels 1..3 = 39
-GEOM_HORIZON = 4                       # label horizon in bars (matches legacy classifiers)
+GEOM_HORIZON = 4                       # short-horizon stats (transition graph, drift series)
+GEO_BARRIER_HOLD = 30                  # barrier-race horizon: labels, meta and trade targets
 GEOMETRY_STORE_PATH = Path(__file__).parent / "geometry_store.json"
+
+
+def roundtrip_cost_pct(commission_rate=COMMISSION_RATE, slippage_rate=0.0005, spread_rate=0.0001):
+    """Total roundtrip trading cost in percent: commission both ways plus
+    entry/exit slippage and half-spread — the floor every target must clear."""
+    return 2.0 * commission_rate * 100.0 + 2.0 * (slippage_rate + spread_rate / 2.0) * 100.0
 
 
 def _softplus(x):
@@ -1057,7 +1064,12 @@ class DeltaHatDiagnostic:
         self.seed = seed
 
     def measure(self, feats):
-        """feats: (n, F) signature features of ONE resolution. Returns scale-normalized δ̂_rel."""
+        """feats: (n, F) signature features of ONE resolution. Returns scale-normalized δ̂_rel.
+
+        Scale normalization is ROBUST: p95 of pairwise distances instead of the max
+        diameter. On real 1m data jump bars stretch the diameter, which drives
+        δ̂_rel → 0 and slams κ_init into its bound (the κ̂=-4.00 saturation);
+        a robust scale keeps 'magnitude from data' meaningful."""
         n = len(feats)
         if n < 16:
             return 0.35
@@ -1067,8 +1079,9 @@ class DeltaHatDiagnostic:
         P = feats[idx]
         D = np.sqrt(np.maximum(
             np.sum(P ** 2, axis=1)[:, None] + np.sum(P ** 2, axis=1)[None, :] - 2.0 * (P @ P.T), 0.0))
-        diam = float(np.max(D))
-        if diam <= 1e-12:
+        off = D[np.triu_indices(m, 1)]
+        scale = float(np.quantile(off, 0.95))
+        if scale <= 1e-12:
             return 0.35
         deltas = np.empty(self.n_quadruples)
         quad = rng.integers(0, m, size=(self.n_quadruples, 4))
@@ -1079,8 +1092,8 @@ class DeltaHatDiagnostic:
             s3 = D[x, w] + D[y, z]
             a, b, _ = sorted((s1, s2, s3), reverse=True)
             deltas[q] = (a - b) / 2.0
-        # p90 of the four-point defect, normalized by diameter (robust version of max-δ)
-        delta_rel = float(2.0 * np.quantile(deltas, 0.90) / diam)
+        # p90 of the four-point defect over the robust scale
+        delta_rel = float(2.0 * np.quantile(deltas, 0.90) / scale)
         return max(delta_rel, 1e-4)
 
     def kappa_from_delta(self, delta_rel):
@@ -2236,6 +2249,7 @@ class GeometricPipeline:
             self.panel = AnchorPanel()
             self.fold = 0
             self.p_hi = 0.6
+            self.cost_pct = roundtrip_cost_pct()
             self.feat_mu = None            # fold-local per-resolution feature stats
             self.feat_sd = None
             self._panel_std0 = None        # frozen fold-0 standardizer for D_anchor
@@ -2410,14 +2424,17 @@ class GeometricPipeline:
         Xf, flags, states, active_counts = self._decision_features(
             embeds, vidx2, vol, Xin, fit_mode=True, closes=closes)
 
-        # labels (direction over the horizon) with purged tail
-        HZ = GEOM_HORIZON
+        # labels: COST-AWARE barrier race (TP-before-SL over cost-floored,
+        # vol-scaled targets) — the classifier learns the same game the trades
+        # play, not a cost-blind 4-bar direction. Tail purged for the full hold.
         T = len(vidx2)
-        usable = np.array([vidx2[t] + HZ < len(closes) for t in range(T)])
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx2)
+        usable = np.array([vidx2[t] + GEO_BARRIER_HOLD < len(closes) for t in range(T)])
         y = np.zeros(T)
         for t in range(T):
             if usable[t]:
-                y[t] = 1.0 if closes[vidx2[t] + HZ] > closes[vidx2[t]] else 0.0
+                y[t] = float(MetaLabeler.barrier_outcome(
+                    closes, vidx2[t], tp_arr[t], sl_arr[t], max_hold=GEO_BARRIER_HOLD))
 
         cal_start = int(T * 0.80)          # recent, chronological, NOT stratified
         tr_mask = usable.copy(); tr_mask[cal_start:] = False
@@ -2446,15 +2463,14 @@ class GeometricPipeline:
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
         self.p_hi = float(np.quantile(p_all[:cal_start], 0.70))
 
-        # meta labeling on the primary model's own signals (train part)
-        params_now = get_active_parameters()
-        tp_pct = float(params_now.get("TP_PERCENT", 0.3))
-        sl_pct = tp_pct
+        # meta labeling on the primary model's own signals (train part),
+        # against the same cost-floored per-bar barriers
         fired_tr = [t for t in range(cal_start) if usable[t] and p_all[t] >= self.p_hi]
         meta_X, meta_y = [], []
         for t in fired_tr:
             meta_X.append(self._meta_features(p_all[t], Xin[t], flags[t], states[t]))
-            meta_y.append(MetaLabeler.barrier_outcome(closes, vidx2[t], tp_pct, sl_pct))
+            meta_y.append(MetaLabeler.barrier_outcome(
+                closes, vidx2[t], tp_arr[t], sl_arr[t], max_hold=GEO_BARRIER_HOLD))
         self.meta = MetaLabeler()
         if len(meta_X) >= 12 and 0 < np.mean(meta_y) < 1:
             self.meta.fit(np.stack(meta_X), np.array(meta_y))
@@ -2528,6 +2544,24 @@ class GeometricPipeline:
         hist = store.get("schemas", {}).get(self.timeframe, [])
         return (hist[-1]["version"] + 1) if hist else 1
 
+    def _barrier_pcts(self, vol, vidx):
+        """Cost-floored, volatility-scaled barrier targets per bar (percent).
+
+        TP must clear the cost wall with room to spare (≥ 3× roundtrip) or track the
+        realized vol of the barrier horizon; SL risks less than the target so the
+        payoff matrix can be positive at achievable hit rates.
+        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
+        base_tp = float(get_active_parameters().get("TP_PERCENT", 0.3))
+        cost = self.cost_pct
+        bar_vol_pct = vol["rv"][vidx] * 100.0
+        tp = np.maximum.reduce([
+            np.full(len(vidx), base_tp),
+            np.full(len(vidx), 3.0 * cost),
+            2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD),
+        ])
+        sl = np.maximum(1.5 * cost, 0.5 * tp)
+        return tp, sl
+
     def _meta_features(self, p, xin_row, flag, state):
         return np.concatenate([[p, float(flag), float(state)],
                                xin_row[:8]])
@@ -2542,6 +2576,9 @@ class GeometricPipeline:
             "p": np.full(n, 0.5), "p_meta": np.full(n, 0.5),
             "A": np.zeros(n), "episode": np.zeros(n, dtype=bool),
             "state": np.zeros(n, dtype=int),
+            "tp": np.full(n, max(3.0 * self.cost_pct, 0.3)),
+            "sl": np.full(n, 1.5 * self.cost_pct),
+            "exp_net": np.zeros(n),
         }
         if self.encoder is None:
             return out
@@ -2556,7 +2593,9 @@ class GeometricPipeline:
         Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
                                                        fit_mode=False, closes=closes)
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx)
         a_gate = self.conformal.a_min if self.conformal else 0.5
+        cost = self.cost_pct
         for t in range(len(vidx)):
             bar = vidx[t]
             if bar < start_at:
@@ -2566,12 +2605,18 @@ class GeometricPipeline:
             pm = float(self.meta.predict_proba(mf[None, :])[0]) if self.meta else 0.5
             dm = self.panel.dmin({r: sigs[r][bar] for r in GEOM_RESOLUTIONS})
             A = self.conformal.combined(pm, dm) if self.conformal else 0.5
+            tp_t, sl_t = float(tp_arr[t]), float(sl_arr[t])
+            # expected NET return of the barrier race — trades must clear costs
+            exp_net = pm * (tp_t - cost) - (1.0 - pm) * (sl_t + cost)
             out["p"][bar] = p
             out["p_meta"][bar] = pm
             out["A"][bar] = A
+            out["tp"][bar] = tp_t
+            out["sl"][bar] = sl_t
+            out["exp_net"][bar] = exp_net
             out["episode"][bar] = bool(flags[t])
             out["state"][bar] = int(states[t])
-            if p >= self.p_hi and A >= a_gate:
+            if p >= self.p_hi and A >= a_gate and exp_net > 0.0:
                 out["signal"][bar] = "BUY"
             exp_ret = self.graph.expected_return(states[t]) if self.graph else 0.0
             out["exit_flag"][bar] = bool(flags[t] and exp_ret < 0.0 and A < 0.8 * a_gate)
@@ -2594,6 +2639,9 @@ class GeometricPipeline:
             "a_gate": gate,
             "episode": "EPISODE" if geo["episode"][i] else "NORMAL",
             "cluster": st - 1,
+            "tp_pct": float(geo["tp"][i]),
+            "sl_pct": float(geo["sl"][i]),
+            "exp_net": float(geo["exp_net"][i]),
             # per-bar tail arrays for the chart overlay (same computation, no extra cost)
             "chart": {
                 "n": int(len(tail)),
@@ -2619,6 +2667,7 @@ class GeometricPipeline:
             "fold": self.fold,
             "signal": "HOLD", "exit_flag": False,
             "p_gbm": 0.5, "p_meta": 0.5, "a_score": 0.0, "a_gate": 0.5,
+            "tp_pct": 0.0, "sl_pct": 0.0, "exp_net": 0.0,
             "episode": "NORMAL", "cluster": -1,
             "panel": self.panel.summary() if self.panel else {},
             "delta_hat_series": self.delta_hat_series[-12:],
@@ -2688,7 +2737,7 @@ class PurgedWalkForwardEngine:
         self.timeframe = timeframe
         self.n_folds = n_folds
         self.seed = seed
-        self.embargo = max(GEOM_RESOLUTIONS) + GEOM_HORIZON
+        self.embargo = max(GEOM_RESOLUTIONS) + GEO_BARRIER_HOLD
 
     def run(self):
         df = self.df
@@ -2708,7 +2757,7 @@ class PurgedWalkForwardEngine:
 
         base = get_active_parameters()
         combos = []
-        for tp in (0.3, 0.6, 1.0):
+        for tp in (0.6, 1.0, 1.6):
             for tm in (2.0, 3.0, 4.0):
                 cmb = dict(base)
                 cmb["TP_PERCENT"] = tp
@@ -2769,7 +2818,7 @@ def run_geometric_backtest(df, params, timeframe="1m", seed=42):
     df = df.reset_index(drop=True)
     n = len(df)
     split = max(GeometricPipeline.MIN_TRAIN_BARS, int(n * 0.35))
-    embargo = max(GEOM_RESOLUTIONS) + GEOM_HORIZON
+    embargo = max(GEOM_RESOLUTIONS) + GEO_BARRIER_HOLD
     if n < split + embargo + 120:
         raise ValueError(f"Not enough bars for geometric backtest ({n})")
     pipeline = GeometricPipeline(timeframe, seed=seed, encoder_epochs=45)
@@ -2918,11 +2967,12 @@ class PositionManager:
         self.entry_volatility = 0.0
         self.tp_percent = 0.3
         self.sl_percent = 0.3
+        self.min_trail_dist = 0.0
 
     @property
     def is_open(self): return self.side is not None
 
-    def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0):
+    def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0, min_trail_dist=0.0):
         if params is None:
             params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
@@ -2938,17 +2988,21 @@ class PositionManager:
         self.entry_volatility = entry_volatility
         self.max_price_seen = price
         self.min_price_seen = price
-        
+        # floor for the trailing distance so tight low-TF volatility cannot pull
+        # the stops inside the cost wall (used by learned-geometry entries)
+        self.min_trail_dist = float(min_trail_dist)
+
         self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
         self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
-        
+
+        trail_dist = max(gauss_vol*self.trail_mult, self.min_trail_dist)
         if side == "long":
-            self.trail_stop_30 = price - gauss_vol*self.trail_mult
-            self.trail_stop_70 = price - gauss_vol*self.trail_mult
+            self.trail_stop_30 = price - trail_dist
+            self.trail_stop_70 = price - trail_dist
             self.ping_stop = price - gauss_vol*self.ping_stop_mult
         else:
-            self.trail_stop_30 = price + gauss_vol*self.trail_mult
-            self.trail_stop_70 = price + gauss_vol*self.trail_mult
+            self.trail_stop_30 = price + trail_dist
+            self.trail_stop_70 = price + trail_dist
             self.ping_stop = price + gauss_vol*self.ping_stop_mult
 
     def close(self, reason, price):
@@ -2959,20 +3013,23 @@ class PositionManager:
         self.mode = "PAPER"
         self.stop_order_id = None
         self.realized_pnl_usdt = 0.0
+        self.min_trail_dist = 0.0
         return pnl_pct, pnl_usdt
 
     def update_stops(self, price, gv_normal, gv_lower):
         self.max_price_seen = max(self.max_price_seen, price)
         self.min_price_seen = min(self.min_price_seen, price)
+        d30 = max(gv_normal*self.trail_mult, self.min_trail_dist)
+        d70 = max(gv_lower*self.trail_mult, self.min_trail_dist)
         if self.side == "long":
-            self.trail_stop_30 = max(self.trail_stop_30, price-gv_normal*self.trail_mult)
+            self.trail_stop_30 = max(self.trail_stop_30, price-d30)
             if not self.has_taken_partial_tp:
-                self.trail_stop_70 = max(self.trail_stop_70, price-gv_lower*self.trail_mult)
+                self.trail_stop_70 = max(self.trail_stop_70, price-d70)
             self.ping_stop = max(self.ping_stop, price-gv_normal*self.ping_stop_mult)
         elif self.side == "short":
-            self.trail_stop_30 = min(self.trail_stop_30, price+gv_normal*self.trail_mult)
+            self.trail_stop_30 = min(self.trail_stop_30, price+d30)
             if not self.has_taken_partial_tp:
-                self.trail_stop_70 = min(self.trail_stop_70, price+gv_lower*self.trail_mult)
+                self.trail_stop_70 = min(self.trail_stop_70, price+d70)
             self.ping_stop = min(self.ping_stop, price+gv_normal*self.ping_stop_mult)
 
     def check_exits(self, price, info, force_close=False):
@@ -3715,10 +3772,22 @@ class QuantBot:
                     active_p = get_active_parameters()
                     def_tp = float(active_p.get("TP_PERCENT", 0.3))
                     opt_tp, opt_sl = self.dynamic_target_optimizer.get_optimal_targets(
-                        reg_key, entry_vol, 
-                        default_tp=def_tp if reg_key == "trend" else 0.3, 
+                        reg_key, entry_vol,
+                        default_tp=def_tp if reg_key == "trend" else 0.3,
                         default_sl=def_tp if reg_key == "trend" else 0.3
                     )
+                    min_trail_dist = 0.0
+                    if info['type'] == "Geo":
+                        # cost wall: learned-geometry targets are floored above the
+                        # roundtrip cost and scaled to barrier-horizon volatility;
+                        # the DTO can widen but never shrink them below the floor
+                        g_state = info.get("geom", {}) or {}
+                        cost = roundtrip_cost_pct()
+                        bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
+                        opt_tp = max(opt_tp, float(g_state.get("tp_pct") or 0.0), 3.0 * cost,
+                                     2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
+                        opt_sl = max(float(g_state.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
+                        min_trail_dist = price * opt_tp / 100.0 * 0.5
                     active_mode = bot_state["trading_mode"]
 
                     if active_mode == "REAL":
@@ -3771,7 +3840,7 @@ class QuantBot:
                                 log.error(f"Failed to place native exchange stop order: {ex_stop}")
 
                             pos_side = "long"
-                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="REAL", stop_order_id=stop_order_id, tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol)
+                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="REAL", stop_order_id=stop_order_id, tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
                             
                             # Send Telegram alert
                             msg = (
@@ -3803,7 +3872,7 @@ class QuantBot:
 
                             log.info(f"PAPER ORDER: buy {info['type']} (Qty: {qty:.6f}, Entry Price: {slippage_price:.2f}, Invest: ${invested:.2f})")
                             pos_side = "long"
-                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="PAPER", tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol)
+                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="PAPER", tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
 
                             bot_state["trades"].insert(0, {
                                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4104,7 +4173,8 @@ class Backtester:
         trail_stop_30 = 0.0
         trail_stop_70 = 0.0
         ping_stop = 0.0
-        
+        min_trail_dist = 0.0
+
         dynamic_target_optimizer = DynamicTargetOptimizer()
         entry_volatility = 0.0
         current_tp_percent = 0.3
@@ -4177,16 +4247,18 @@ class Backtester:
                 min_price_seen = min(min_price_seen, price)
                 gv_normal = float(gv[idx-1])
                 gv_lower = 0.7 * gv_normal
-                
+                d30 = max(gv_normal * trail_mult, min_trail_dist)
+                d70 = max(gv_lower * trail_mult, min_trail_dist)
+
                 if position_side == "long":
-                    trail_stop_30 = max(trail_stop_30, price - gv_normal * trail_mult)
+                    trail_stop_30 = max(trail_stop_30, price - d30)
                     if not has_taken_partial_tp:
-                        trail_stop_70 = max(trail_stop_70, price - gv_lower * trail_mult)
+                        trail_stop_70 = max(trail_stop_70, price - d70)
                     ping_stop = max(ping_stop, price - gv_normal * ping_stop_mult)
                 else:
-                    trail_stop_30 = min(trail_stop_30, price + gv_normal * trail_mult)
+                    trail_stop_30 = min(trail_stop_30, price + d30)
                     if not has_taken_partial_tp:
-                        trail_stop_70 = min(trail_stop_70, price + gv_lower * trail_mult)
+                        trail_stop_70 = min(trail_stop_70, price + d70)
                     ping_stop = min(ping_stop, price + gv_normal * ping_stop_mult)
                     
                 exit_reason = None
@@ -4274,6 +4346,7 @@ class Backtester:
                     qty = 0.0
                     invested_amount = 0.0
                     has_taken_partial_tp = False
+                    min_trail_dist = 0.0
             
             if position_side is None:
                 sig, st = "HOLD", ""
@@ -4314,26 +4387,34 @@ class Backtester:
                     entry_volatility = float(gv[idx-1])
                     regime_key = "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
                     current_tp_percent, current_sl_percent = dynamic_target_optimizer.get_optimal_targets(
-                        regime_key, entry_volatility, 
-                        default_tp=tp_percent if regime_key == "trend" else 0.3, 
+                        regime_key, entry_volatility,
+                        default_tp=tp_percent if regime_key == "trend" else 0.3,
                         default_sl=tp_percent if regime_key == "trend" else 0.3
                     )
+                    min_trail_dist = 0.0
+                    if geo is not None:
+                        # cost-floored, vol-scaled barrier targets from the pipeline;
+                        # trailing may never come closer than half the target
+                        current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(current_tp_percent, 3.0 * roundtrip_cost_pct())
+                        current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(current_sl_percent, 1.5 * roundtrip_cost_pct())
+                        min_trail_dist = entry_price * current_tp_percent / 100.0 * 0.5
                     max_price_seen = entry_price
                     min_price_seen = entry_price
-                    
+
                     stop_dist = gv[idx-1] * (ping_stop_mult if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else trail_mult)
                     if stop_dist <= 0: stop_dist = entry_price * 0.01
-                    
+
                     risk_amount = balance * (TARGET_RISK_PERCENT / 100.0)
                     target_qty = risk_amount / stop_dist
                     max_qty = (balance * MAX_CAPITAL_ALLOCATION) / entry_price
                     qty = min(target_qty, max_qty)
                     invested_amount = qty * entry_price
-                    
+
                     balance -= invested_amount * self.commission_rate
                     has_taken_partial_tp = False
-                    trail_stop_30 = entry_price - gv[idx-1] * trail_mult
-                    trail_stop_70 = entry_price - gv[idx-1] * trail_mult
+                    trail_dist_init = max(gv[idx-1] * trail_mult, min_trail_dist)
+                    trail_stop_30 = entry_price - trail_dist_init
+                    trail_stop_70 = entry_price - trail_dist_init
                     ping_stop = entry_price - gv[idx-1] * ping_stop_mult
 
         trade_count = len(trades)
@@ -4655,6 +4736,7 @@ HTML_TEMPLATE = """
                 <div class="kv-row"><span class="kv-key">Episode:</span><span class="kv-val" id="geom-episode">NORMAL</span></div>
                 <div class="kv-row"><span class="kv-key">p GBM / Meta:</span><span class="kv-val" id="geom-p">- / -</span></div>
                 <div class="kv-row"><span class="kv-key">Conformal A:</span><span class="kv-val" id="geom-a">-</span></div>
+                <div class="kv-row"><span class="kv-key">E[net] · TP/SL:</span><span class="kv-val" id="geom-expnet" style="font-size:0.7rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">D_anchor:</span><span class="kv-val" id="geom-danchor">-</span></div>
                 <div class="kv-row"><span class="kv-key">δ̂ (5/15/30/60):</span><span class="kv-val" id="geom-dhat" style="font-size:0.68rem;">-</span></div>
                 <div class="kv-row"><span class="kv-key">r·√|κ| (5/15/30/60):</span><span class="kv-val" id="geom-reff" style="font-size:0.68rem;">-</span></div>
@@ -4864,6 +4946,15 @@ HTML_TEMPLATE = """
                         const aEl = document.getElementById('geom-a');
                         aEl.innerText = (g.a_score || 0).toFixed(2) + ' (gate ' + (g.a_gate !== undefined ? g.a_gate.toFixed(2) : '0.50') + ')';
                         aEl.style.color = (g.a_score || 0) >= (g.a_gate || 0.5) ? 'var(--profit-green)' : 'var(--text-muted)';
+                        const enEl = document.getElementById('geom-expnet');
+                        if (g.exp_net !== undefined && g.tp_pct) {
+                            enEl.innerText = (g.exp_net >= 0 ? '+' : '') + g.exp_net.toFixed(2) + '% · ' +
+                                g.tp_pct.toFixed(2) + '/' + g.sl_pct.toFixed(2) + '%';
+                            enEl.style.color = g.exp_net > 0 ? 'var(--profit-green)' : 'var(--loss-red)';
+                        } else {
+                            enEl.innerText = '-';
+                            enEl.style.color = 'var(--text-muted)';
+                        }
                         document.getElementById('geom-danchor').innerText = (gd.d_anchor !== undefined) ? gd.d_anchor.toFixed(4) : '-';
                         const resKeys = ['5', '15', '30', '60'];
                         const dh = g.delta_hat || {};
