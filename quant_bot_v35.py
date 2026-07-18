@@ -66,7 +66,7 @@ log = logging.getLogger("QuantBot")
 # AYARLAR & STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 SYMBOL = "BTC/USDT"
-OHLCV_LIMIT = 500
+OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more visible history
 FAST_LENGTH = 8
 SLOW_LENGTH = 21
 VOL_LENGTH = 14
@@ -5408,7 +5408,7 @@ HTML_TEMPLATE = """
                         }).join('');
                         document.getElementById('ob-spread').innerText = "$" + s.price.toFixed(2);
                     }
-                }).catch(err => {});
+                }).catch(err => { console.error('updateUI failed:', err); });
         }
 
         function runBacktest() {
@@ -5450,7 +5450,22 @@ def get_state():
     with state_lock:
         state_copy = bot_state.copy()
         state_copy.pop("loop", None)
-        return jsonify(state_copy)
+        return jsonify(_json_sanitize(state_copy))
+
+
+def _json_sanitize(obj):
+    """Recursively replace NaN/Infinity with None so the browser can parse the
+    payload. Flask jsonify defaults to allow_nan=True and emits the literal
+    string `NaN`, which is INVALID JSON and makes the browser's JSON.parse
+    reject the whole response — silently killing the UI update loop (chart
+    never renders, timeframe clicks look unresponsive)."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(x) for x in obj]
+    return obj
 
 @app.route('/api/toggle_bot', methods=['POST'])
 def toggle_bot():
