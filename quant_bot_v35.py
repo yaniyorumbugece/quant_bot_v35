@@ -41,11 +41,6 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template_string
 import webview
 
-try:
-    from hmmlearn.hmm import GaussianHMM as HMMLearnGaussianHMM
-    HAS_HMMLEARN = True
-except ImportError:
-    HAS_HMMLEARN = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -66,7 +61,7 @@ log = logging.getLogger("QuantBot")
 # AYARLAR & STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 SYMBOL = "BTC/USDT"
-OHLCV_LIMIT = 500
+OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more visible history
 FAST_LENGTH = 8
 SLOW_LENGTH = 21
 VOL_LENGTH = 14
@@ -148,13 +143,7 @@ bot_state = {
 
     "symbol": SYMBOL,
     "price": 0.0,
-    "fast_gauss": 0.0,
-    "slow_gauss": 0.0,
-    "upper_band": 0.0,
-    "lower_band": 0.0,
-    "gauss_vol": 0.0,
-    "is_ranging": False,
-    "regime": "Bilinmiyor",
+    "gauss_vol": 0.0,          # simple realised-vol for the trailing distance
     "signal": "HOLD",
     "signal_type": "",
     "obi": 0.0,
@@ -197,31 +186,9 @@ bot_state = {
     "chart_data": [],
     "orderbook": {"bids": [], "asks": []},
 
-    "hyp_direction": 0,
-    "ou_theta": 0.0,
-    "ou_mu": 0.0,
-    "ou_half_life": 0.0,
-    "ou_upper": 0.0,
-    "ou_lower": 0.0,
-    "ou_valid": False,
-    "ou_jump_intensity": 0.0,
-    "ou_jump_mean": 0.0,
-    "ou_jump_std": 0.0,
-    "ou_jump_detected": False,
-    "ou_jump_cooldown": 0,
-    
-    # Shadow Mode keys
+    # Shadow flag kept for backward-compat with UI JS (always False now)
     "shadow_active": False,
-    "shadow_parameters": {},
-    "shadow_balance": 1000.0,
-    "shadow_position_side": None,
-    "shadow_position_entry": 0.0,
-    "shadow_position_qty": 0.0,
-    "shadow_position_pnl": 0.0,
-    "shadow_total_pnl": 0.0,
-    "shadow_trade_count": 0,
-    "shadow_trades": [],
-    
+
     # Backtest and WFO keys
     "wfo_report": None,
     "wfo_running": False,
@@ -353,500 +320,10 @@ def calc_true_range(highs, lows, closes):
     tr[0] = highs[0]-lows[0]
     return tr
 
-class NumpyGaussianHMM:
-    def __init__(self, n_components=2, n_iters=20, eps=1e-6):
-        self.n_components, self.n_iters, self.eps = n_components, n_iters, eps
-        self.means_ = self.covars_ = self.transmat_ = None
 
-    def fit(self, X):
-        T, D = X.shape; np.random.seed(42)
-        # Initialize cluster means and covariances
-        self.means_ = X[np.random.choice(T, self.n_components, replace=False)].copy()
-        self.covars_ = np.array([np.eye(D) for _ in range(self.n_components)])
-        self.transmat_ = np.ones((self.n_components, self.n_components)) / self.n_components
-        
-        # Iterative clustering updates (EM-like)
-        Z = np.zeros(T, dtype=int)
-        for _ in range(self.n_iters):
-            ld = np.zeros((T, self.n_components))
-            for j in range(self.n_components):
-                diff = X - self.means_[j]
-                _, logdet = np.linalg.slogdet(self.covars_[j])
-                try: inv_cov = np.linalg.inv(self.covars_[j])
-                except: inv_cov = np.eye(D)
-                ld[:, j] = -0.5 * (D * np.log(2 * np.pi) + logdet + np.sum(diff @ inv_cov * diff, axis=1))
-            Z = np.argmax(ld, axis=1)
-            for i in range(self.n_components):
-                Xi = X[Z == i]
-                if len(Xi) > 1:
-                    self.means_[i] = Xi.mean(0)
-                    self.covars_[i] = np.cov(Xi.T, ddof=0) + self.eps * np.eye(D)
-                    
-        # Learn transition matrix from sequence Z
-        self.transmat_ = np.zeros((self.n_components, self.n_components))
-        for t in range(T - 1):
-            self.transmat_[Z[t], Z[t+1]] += 1.0
-        self.transmat_ += 1e-6  # Laplace smoothing
-        self.transmat_ /= self.transmat_.sum(axis=1, keepdims=True)
-        return self
 
-    def predict(self, X):
-        T_seq, D = X.shape
-        # Log emissions for each observation and component
-        log_emissions = np.zeros((T_seq, self.n_components))
-        for j in range(self.n_components):
-            diff = X - self.means_[j]
-            _, logdet = np.linalg.slogdet(self.covars_[j])
-            try: inv_cov = np.linalg.inv(self.covars_[j])
-            except: inv_cov = np.eye(D)
-            log_emissions[:, j] = -0.5 * (D * np.log(2 * np.pi) + logdet + np.sum(diff @ inv_cov * diff, axis=1))
-            
-        # Viterbi decoding algorithm
-        log_V = np.zeros((T_seq, self.n_components))
-        log_V[0] = log_emissions[0] + np.log(np.ones(self.n_components) / self.n_components)
-        
-        log_trans = np.log(self.transmat_ + 1e-12)
-        for t in range(1, T_seq):
-            for j in range(self.n_components):
-                log_V[t, j] = log_emissions[t, j] + np.max(log_V[t-1] + log_trans[:, j])
-                
-        return int(np.argmax(log_V[-1]))
 
-class HyperbolicClassifier:
-    """
-    Poincaré Ball Model hiperbolik uzay k-NN sınıflandırıcı.
-    Feature'ları hiperbolik uzaya embed eder, hiperbolik mesafe ile k-NN sınıflandırma yapar.
-    Trend sinyallerini doğrulamak için kullanılır.
-    """
-    def __init__(self, k=8, lookback=300):
-        self.k = k
-        self.lookback = lookback
 
-    def _poincare_distance(self, u, v):
-        """Poincaré Ball mesafesi: d(u,v) = arccosh(1 + 2||u-v||² / ((1-||u||²)(1-||v||²)))"""
-        diff_sq = np.sum((u - v)**2)
-        u_sq = np.sum(u**2)
-        v_sq = np.sum(v**2)
-        denom = (1.0 - u_sq) * (1.0 - v_sq)
-        if denom <= 1e-10:
-            return 100.0
-        arg = 1.0 + 2.0 * diff_sq / denom
-        return float(np.arccosh(max(arg, 1.0)))
-
-    def _exp_map_origin(self, v, c=1.0):
-        """Exponential map at origin: exp_0(v) = tanh(√c·||v||/2) · v / (√c·||v||)"""
-        sqrt_c = math.sqrt(c)
-        v_norm = np.linalg.norm(v)
-        if v_norm < 1e-10:
-            return v
-        return np.tanh(sqrt_c * v_norm / 2.0) * v / (sqrt_c * v_norm)
-
-    def _compute_features(self, closes, highs, lows):
-        """Compute 5 features: RSI(14), CCI(20), ROC(9), Williams%R(14), Stochastic%K(14)"""
-        n = len(closes)
-        # RSI(14)
-        rsi = np.full(n, 50.0)
-        deltas = np.diff(closes, prepend=closes[0])
-        for i in range(14, n):
-            window = deltas[i-13:i+1]
-            avg_gain = np.mean(np.maximum(window, 0))
-            avg_loss = np.mean(np.maximum(-window, 0))
-            rsi[i] = 100.0 - 100.0/(1.0 + avg_gain/avg_loss) if avg_loss > 0 else 100.0
-        # CCI(20)
-        cci = np.zeros(n)
-        tp = (highs + lows + closes) / 3.0
-        for i in range(20, n):
-            w = tp[i-19:i+1]; sma = np.mean(w); mad = np.mean(np.abs(w - sma))
-            cci[i] = (tp[i] - sma) / (0.015 * mad) if mad > 0 else 0.0
-        # ROC(9)
-        roc = np.zeros(n)
-        for i in range(9, n):
-            roc[i] = (closes[i] - closes[i-9]) / closes[i-9] * 100 if closes[i-9] > 0 else 0.0
-        # Williams %R(14)
-        wr = np.full(n, -50.0)
-        for i in range(14, n):
-            hh = np.max(highs[i-13:i+1]); ll = np.min(lows[i-13:i+1])
-            wr[i] = -100*(hh - closes[i])/(hh - ll) if (hh - ll) > 0 else -50.0
-        # Stochastic %K(14)
-        stoch = np.full(n, 50.0)
-        for i in range(14, n):
-            hh = np.max(highs[i-13:i+1]); ll = np.min(lows[i-13:i+1])
-            stoch[i] = 100*(closes[i] - ll)/(hh - ll) if (hh - ll) > 0 else 50.0
-        return np.column_stack([rsi, cci, roc, wr, stoch])
-
-    def classify(self, df, idx=-2):
-        """
-        Classify trend direction. Returns: 1 (bullish), -1 (bearish), 0 (neutral)
-        """
-        closes = df['close'].values; highs = df['high'].values; lows = df['low'].values
-        n = len(closes)
-        if n < 50: return 0
-        features = self._compute_features(closes, highs, lows)
-        start = max(0, n - self.lookback)
-        wf = features[start:n]
-        # Normalize to [-1, 1]
-        mins = np.min(wf, axis=0); maxs = np.max(wf, axis=0)
-        ranges = maxs - mins; ranges[ranges == 0] = 1.0
-        normalized = 2 * (wf - mins) / ranges - 1
-        # Embed into Poincaré ball via exp map
-        embedded = np.array([self._exp_map_origin(row * 0.9) for row in normalized])
-        # Labels: future return direction (+4 bars)
-        labels = np.zeros(len(embedded))
-        for i in range(len(embedded) - 4):
-            ai = start + i
-            if ai + 4 < n:
-                labels[i] = 1.0 if closes[ai + 4] > closes[ai] else -1.0
-        # Current point
-        ci = len(embedded) - 1 + idx  # idx is typically -2 (use second-to-last completed bar)
-        if ci < 0 or ci >= len(embedded): return 0
-        current = embedded[ci]
-        # k-NN with hyperbolic distance
-        distances = []
-        for i in range(max(0, ci - self.lookback), ci - 4):
-            if labels[i] != 0:
-                d = self._poincare_distance(current, embedded[i])
-                distances.append((d, labels[i]))
-        if len(distances) < self.k: return 0
-        distances.sort(key=lambda x: x[0])
-        top_k = distances[:self.k]
-        bull_w = sum(1.0/(d+1e-10) for d, lbl in top_k if lbl > 0)
-        bear_w = sum(1.0/(d+1e-10) for d, lbl in top_k if lbl < 0)
-        if bull_w > bear_w * 1.2: return 1
-        elif bear_w > bull_w * 1.2: return -1
-        return 0
-
-    def classify_fast(self, features, closes, current_idx, k=8, lookback=300):
-        n = current_idx + 1
-        if n < 50:
-            return 0
-        start = max(0, n - lookback)
-        wf = features[start:n]
-        mins = np.min(wf, axis=0)
-        maxs = np.max(wf, axis=0)
-        ranges = maxs - mins
-        ranges[ranges == 0] = 1.0
-        normalized = 2 * (wf - mins) / ranges - 1
-        v_norm = np.linalg.norm(normalized, axis=1, keepdims=True)
-        v_norm = np.maximum(v_norm, 1e-10)
-        embedded = np.tanh(v_norm / 2.0) * normalized / v_norm
-        labels = np.zeros(len(embedded))
-        for i in range(len(embedded) - 4):
-            ai = start + i
-            if ai + 4 < n:
-                labels[i] = 1.0 if closes[ai + 4] > closes[ai] else -1.0
-        ci = len(embedded) - 1
-        current = embedded[ci]
-        train_start = max(0, ci - lookback)
-        train_end = ci - 4
-        if train_end <= train_start:
-            return 0
-        train_embedded = embedded[train_start:train_end]
-        train_labels = labels[train_start:train_end]
-        valid_mask = train_labels != 0
-        if not np.any(valid_mask):
-            return 0
-        train_embedded = train_embedded[valid_mask]
-        train_labels = train_labels[valid_mask]
-        diff_sq = np.sum((train_embedded - current)**2, axis=1)
-        u_sq = np.sum(current**2)
-        v_sq = np.sum(train_embedded**2, axis=1)
-        denom = (1.0 - u_sq) * (1.0 - v_sq)
-        denom = np.maximum(denom, 1e-10)
-        arg = 1.0 + 2.0 * diff_sq / denom
-        distances = np.arccosh(np.maximum(arg, 1.0))
-        if len(distances) < k:
-            return 0
-        top_k_indices = np.argsort(distances)[:k]
-        top_k_dists = distances[top_k_indices]
-        top_k_labels = train_labels[top_k_indices]
-        weights = 1.0 / (top_k_dists + 1e-10)
-        bull_w = np.sum(weights[top_k_labels > 0])
-        bear_w = np.sum(weights[top_k_labels < 0])
-        if bull_w > bear_w * 1.2:
-            return 1
-        elif bear_w > bull_w * 1.2:
-            return -1
-        return 0
-
-class OUPingPong:
-    """
-    Jump-Diffusion Ornstein-Uhlenbeck süreci: dX = θ(μ - X)dt + σdW + J dN
-    Yatay piyasada sıçramaları (jumps) filtreler, JD-OU parametrelerini tahmin eder ve sıçrama durumunda cooldown uygular.
-    """
-    def __init__(self, window=100):
-        self.window = window
-        self.theta = 0.0
-        self.mu = 0.0
-        self.sigma_ou = 0.0
-        self.half_life = float('inf')
-        self.ou_upper = 0.0
-        self.ou_lower = 0.0
-        self.ou_stop_upper = 0.0
-        self.ou_stop_lower = 0.0
-        self.is_valid = False
-        self.jump_cooldown = 0
-        self.jump_detected = False
-        # Jump Diffusion Parametreleri
-        self.jump_intensity = 0.0
-        self.jump_mean = 0.0
-        self.jump_std = 0.0
-
-    def fit(self, prices):
-        """OLS ile formal Jump Diffusion OU parametrelerini tahmin et"""
-        if len(prices) < 30:
-            self.is_valid = False; return
-            
-        # 1. Sıçrama Tespiti (Jump Detection)
-        returns = np.diff(prices)
-        median_ret = np.median(returns)
-        mad = np.median(np.abs(returns - median_ret))
-        robust_std = mad * 1.4826 if mad > 1e-8 else np.std(returns)
-        if robust_std < 1e-8:
-            robust_std = 1e-8
-            
-        # Sıçramaları bulalım
-        diff_from_median = np.abs(returns - median_ret)
-        jump_threshold = 3.0 * robust_std
-        jump_mask = diff_from_median > jump_threshold
-        jumps = returns[jump_mask]
-        
-        # Sıçrama yoğunluğu (jump intensity) lambda = sıçrama sayısı / veri uzunluğu
-        self.jump_intensity = float(len(jumps) / len(returns))
-        if len(jumps) > 0:
-            self.jump_mean = float(np.mean(jumps))
-            self.jump_std = float(np.std(jumps))
-        else:
-            self.jump_mean = 0.0
-            self.jump_std = 0.0
-
-        # Son bardaki değişim sıçrama mı?
-        last_ret = returns[-1]
-        self.jump_detected = bool(abs(last_ret - median_ret) > jump_threshold)
-        
-        if self.jump_detected:
-            self.jump_cooldown = 4  # 4 bar boyunca sinyal engelle
-            
-        if self.jump_cooldown > 0:
-            self.jump_cooldown -= 1
-            self.is_valid = False
-            return
-
-        # 2. Sıçramalardan arındırılmış veri ile OU fit etme (De-jumped estimation)
-        p = prices[-self.window:]
-        n_len = len(p)
-        if n_len < 30:
-            self.is_valid = False; return
-            
-        X = p[:-1]; dX = np.diff(p)
-        
-        # Filtreleme: OLS regresyonunu bozmaması için sıçramaları hariç tutalım
-        median_dx = np.median(dX)
-        mad_dx = np.median(np.abs(dX - median_dx))
-        robust_std_dx = mad_dx * 1.4826 if mad_dx > 1e-8 else np.std(dX)
-        if robust_std_dx < 1e-8: robust_std_dx = 1e-8
-        
-        valid_mask = np.abs(dX - median_dx) <= 3.0 * robust_std_dx
-        if np.sum(valid_mask) < 20:
-            self.is_valid = False; return
-            
-        X_clean = X[valid_mask]
-        dX_clean = dX[valid_mask]
-        
-        Xm = np.mean(X_clean); dXm = np.mean(dX_clean)
-        Sxx = np.sum((X_clean - Xm)**2)
-        if Sxx == 0:
-            self.is_valid = False; return
-        Sxy = np.sum((X_clean - Xm) * (dX_clean - dXm))
-        b = Sxy / Sxx; a = dXm - b * Xm
-        self.theta = -b
-        if self.theta <= 0.001:
-            self.is_valid = False; return
-        self.mu = -a / b if abs(b) > 1e-10 else np.mean(p)
-        
-        # Residuals ve sigma hesaplama (sıçramasız)
-        residuals = dX_clean - (a + b * X_clean)
-        self.sigma_ou = float(np.std(residuals))
-        self.half_life = math.log(2) / self.theta
-        ou_std = self.sigma_ou / math.sqrt(2 * self.theta)
-        # Cap corridor range to prevent excessive widening (max 0.5% deviation)
-        max_allowed_std = self.mu * 0.005
-        ou_std = min(ou_std, max_allowed_std)
-        
-        self.ou_upper = self.mu + 2 * ou_std
-        self.ou_lower = self.mu - 2 * ou_std
-        self.ou_stop_upper = self.mu + 3 * ou_std
-        self.ou_stop_lower = self.mu - 3 * ou_std
-        self.is_valid = 2 <= self.half_life <= 50
-
-    def get_signal(self, price):
-        if not self.is_valid or self.jump_cooldown > 0: return "HOLD", ""
-        if price <= self.ou_lower: return "BUY", "OU-Ping"
-        return "HOLD", ""
-
-class DynamicTargetOptimizer:
-    """
-    Geçmiş işlemlerin sonuçlarına göre TP/SL hedeflerini dinamik olarak optimize eden katman.
-    """
-    def __init__(self, lookback_trades=50):
-        self.lookback_trades = lookback_trades
-        self.trade_history = []  # list of dicts: {"regime": str, "volatility": float, "max_excursion_pct": float, "max_drawdown_pct": float, "pnl_pct": float}
-
-    def record_trade(self, regime, volatility, max_excursion_pct, max_drawdown_pct, pnl_pct):
-        self.trade_history.append({
-            "regime": regime,
-            "volatility": float(volatility),
-            "max_excursion_pct": float(max_excursion_pct),
-            "max_drawdown_pct": float(max_drawdown_pct),
-            "pnl_pct": float(pnl_pct)
-        })
-        if len(self.trade_history) > self.lookback_trades:
-            self.trade_history.pop(0)
-
-    def get_optimal_targets(self, regime_type, current_volatility, default_tp=0.3, default_sl=0.3):
-        relevant = [t for t in self.trade_history if t["regime"] == regime_type]
-        if len(relevant) < 3:
-            return default_tp, default_sl
-
-        relevant.sort(key=lambda x: abs(x["volatility"] - current_volatility))
-        neighbors = relevant[:5]
-
-        excursions = [t["max_excursion_pct"] for t in neighbors if t["max_excursion_pct"] > 0]
-        drawdowns = [t["max_drawdown_pct"] for t in neighbors if t["max_drawdown_pct"] > 0]
-
-        opt_tp = np.mean(excursions) * 0.80 if len(excursions) > 0 else default_tp
-        opt_sl = np.mean(drawdowns) * 1.20 if len(drawdowns) > 0 else default_sl
-
-        if regime_type == "trend":
-            opt_tp = np.clip(opt_tp, 0.15, 2.0)
-            opt_sl = np.clip(opt_sl, 0.15, 1.5)
-        else:
-            opt_tp = np.clip(opt_tp, 0.10, 1.0)
-            opt_sl = np.clip(opt_sl, 0.10, 1.0)
-
-        return float(opt_tp), float(opt_sl)
-
-class RoughPathClassifier:
-    """
-    Rough Path Signatures (Kaba Patika İmzaları) + Pure NumPy Ridge Regression Classifier.
-    Fiyat patikasını saf NumPy ile 1., 2. ve 3. seviye imza özelliklerine (signatures) dönüştürür.
-    Herhangi bir dış kütüphane bağımlılığı olmadan (scikit-learn/lightgbm) rejim ve trend tahmin eder.
-    """
-    def __init__(self, window=14):
-        self.window = window
-        self.model = None
-
-    def _compute_signatures(self, prices):
-        """
-        Pure NumPy implementation of Path Signatures up to Level 3.
-        """
-        n = len(prices)
-        if n < self.window:
-            return np.zeros((n, 9))
-            
-        features = []
-        for i in range(n):
-            if i < self.window - 1:
-                features.append(np.zeros(9))
-                continue
-                
-            w = prices[i - self.window + 1 : i + 1]
-            w_mean = np.mean(w)
-            w_std = np.std(w)
-            if w_std < 1e-8:
-                w_std = 1e-8
-            path = (w - w_mean) / w_std
-            
-            dx = np.diff(path)
-            sig_l1 = float(np.sum(dx))
-            sig_l2_1 = 0.5 * (sig_l1 ** 2)
-            
-            dt = 1.0 / (self.window - 1)
-            t_grid = np.arange(self.window) * dt
-            
-            s_1_2 = float(np.sum(t_grid[1:] * dx))
-            s_2_1 = float(np.sum(path[1:] * dt))
-            area = s_1_2 - s_2_1
-            
-            qv = float(np.sum(dx ** 2))
-            cv = float(np.sum(dx ** 3))
-            sig_l3_2 = (sig_l1 ** 3) / 6.0
-            
-            len_path = float(np.sum(np.abs(dx)))
-            sign_changes = float(np.sum(np.diff(np.sign(dx)) != 0))
-            
-            features.append(np.array([
-                sig_l1,
-                sig_l2_1,
-                area,
-                qv,
-                cv,
-                sig_l3_2,
-                len_path,
-                sign_changes,
-                path[-1]
-            ]))
-            
-        return np.array(features)
-
-    def fit(self, df):
-        """
-        Train the classifier on the historical price dataframe using Ridge Regression.
-        """
-        closes = df['close'].values
-        n = len(closes)
-        if n < self.window + 20:
-            return
-            
-        X = self._compute_signatures(closes)
-        
-        y = np.zeros(n)
-        for i in range(n - 4):
-            ret = (closes[i+4] - closes[i]) / closes[i] * 100
-            if ret > 0.05:
-                y[i] = 1.0
-            elif ret < -0.05:
-                y[i] = -1.0
-            else:
-                y[i] = 0.0
-                
-        train_idx = np.arange(self.window, n - 4)
-        X_train = X[train_idx]
-        y_train = y[train_idx]
-        
-        # Add bias column
-        X_bias = np.column_stack([X_train, np.ones(len(X_train))])
-        
-        # Closed-form Ridge Regression: W = (X^T X + alpha * I)^-1 X^T Y
-        d = X_bias.shape[1]
-        alpha = 10.0
-        XTX = np.dot(X_bias.T, X_bias)
-        XTY = np.dot(X_bias.T, y_train)
-        
-        try:
-            self.model = np.linalg.solve(XTX + alpha * np.eye(d), XTY)
-            log.info("RoughPathClassifier successfully trained using pure NumPy Ridge Regression.")
-        except Exception as e:
-            self.model = None
-            log.error(f"RoughPathClassifier training failed: {e}")
-
-    def predict(self, prices):
-        """
-        Predict the regime for the last window.
-        """
-        if self.model is None:
-            return 0
-        if len(prices) < self.window:
-            return 0
-            
-        feats = self._compute_signatures(prices)[-1]
-        feats_bias = np.append(feats, 1.0)
-        pred_val = float(np.dot(feats_bias, self.model))
-        
-        if pred_val > 0.35:
-            return 1
-        elif pred_val < -0.35:
-            return -1
-        return 0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # V3.6 — LEARNED GEOMETRY CORE ("nihai mimari")
@@ -2305,6 +1782,8 @@ class GeometricPipeline:
             self.feature_mask = None
             self.diagnostics = []
             self.delta_hat_series = []     # data-side δ̂(t) drift series
+            self.baseline_heldout = None   # fold-0 held-out recon (health baseline)
+            self.baseline_delta_hat = None # fold-0 data-side δ̂ (health baseline)
             self.last_state = {"status": "collecting", "signal": "HOLD"}
             self._bars_at_fit = 0
             self._prev_standardize = None
@@ -2600,6 +2079,12 @@ class GeometricPipeline:
         }
         self.diagnostics.append(diag_entry)
 
+        # freeze fold-0 baselines for the health monitor
+        if self.baseline_heldout is None and heldout == heldout:   # not NaN
+            self.baseline_heldout = float(heldout)
+        if self.baseline_delta_hat is None:
+            self.baseline_delta_hat = float(dh_data)
+
         # fold-local λ adaptation for the NEXT fold (kept inside the encoder object)
         if p_dnz > 0.45:
             encoder.lambdas["l1"] = min(encoder.lambdas["l1"] * 1.5, 0.5)
@@ -2762,9 +2247,61 @@ class GeometricPipeline:
         }
         return state
 
+    # ── health monitor ────────────────────────────────────────────────────────
+    # Thresholds beyond which a READY pipeline is treated as untrustworthy and
+    # the live signal is forced to HOLD. This is the answer to "a layer breaks
+    # silently and still prints a plausible number" — the number is checked.
+    OVERFIT_GAP_MAX = 0.25       # IS-OOS AUC gap: > this ⇒ the model memorised
+    D_ANCHOR_DRIFT_MAX = 0.60    # representation drift vs fold-0 panel relations
+    RECON_REGRESS_MAX = 2.5      # held-out recon may not exceed 2.5× the fold-0 baseline
+    DELTA_HAT_DRIFT_MAX = 3.0    # data-side δ̂ may not move more than 3× vs baseline
+    STALE_BARS_MULT = 4          # encoder older than 4× the refit cadence ⇒ stale
+
+    def health_status(self, n_bars=None):
+        """Return {'health': 'ok'|'degraded', 'reasons': [...]} from the latest
+        fold diagnostics. Any tripped guard degrades the pipeline; SignalEngine
+        then emits HOLD regardless of what the decision chain produced."""
+        reasons = []
+        if not self.diagnostics or self.status != "ready":
+            return {"health": "ok" if self.status == "ready" else "warmup", "reasons": []}
+        d = self.diagnostics[-1]
+
+        gap = float(d.get("overfit_gap", 0.0))
+        if gap > self.OVERFIT_GAP_MAX:
+            reasons.append(f"overfit gap {gap:.2f}>{self.OVERFIT_GAP_MAX}")
+
+        d_anchor = abs(float(d.get("d_anchor", 0.0)))
+        if d_anchor > self.D_ANCHOR_DRIFT_MAX:
+            reasons.append(f"D_anchor drift {d_anchor:.2f}>{self.D_ANCHOR_DRIFT_MAX}")
+
+        recon = float(d.get("heldout_recon", 0.0))
+        if (self.baseline_heldout and recon == recon
+                and recon > self.RECON_REGRESS_MAX * self.baseline_heldout):
+            reasons.append(f"recon {recon:.3f}>{self.RECON_REGRESS_MAX}×baseline")
+
+        dh = float(d.get("delta_hat_data", 0.0))
+        if self.baseline_delta_hat and self.baseline_delta_hat > 1e-9:
+            ratio = dh / self.baseline_delta_hat
+            if ratio > self.DELTA_HAT_DRIFT_MAX or ratio < 1.0 / self.DELTA_HAT_DRIFT_MAX:
+                reasons.append(f"δ̂ drift ×{ratio:.2f}")
+
+        p_dnz = float(d.get("p_delta_nonzero", 0.5))
+        if p_dnz >= 0.999 or p_dnz <= 1e-6:
+            reasons.append(f"P(δ≠0) collapsed to {p_dnz:.3f}")
+
+        if n_bars is not None and self._bars_at_fit:
+            stale = n_bars - self._bars_at_fit
+            if stale > self.STALE_BARS_MULT * self.LIVE_REFIT_BARS:
+                reasons.append(f"encoder stale ({stale} bars since fit)")
+
+        return {"health": "degraded" if reasons else "ok", "reasons": reasons}
+
     def live_state(self, extra=None):
+        hs = self.health_status()
         s = {
             "status": self.status,
+            "health": hs["health"],
+            "health_reasons": hs["reasons"],
             "schema": self.schema.label() if self.schema else "-",
             "version": self.schema.version if self.schema else 0,
             "kappa": float(self.encoder.kappa) if self.encoder else 0.0,
@@ -2783,6 +2320,10 @@ class GeometricPipeline:
         }
         if extra:
             s.update(extra)
+        # health is authoritative: a degraded pipeline can never emit a live trade
+        if s.get("health") == "degraded":
+            s["signal"] = "HOLD"
+            s["exit_flag"] = True   # also flatten any open geo position
         self.last_state = s
         return s
 
@@ -2957,65 +2498,22 @@ def run_geometric_backtest(df, params, timeframe="1m", seed=42):
 
 
 class SignalEngine:
+    """Thin adapter over the learned-geometry pipeline. Signal is HOLD until
+    (a) the pipeline is READY and (b) its health monitor is green — no
+    legacy fallback, no cost-blind heuristics. `enable_geometry=False` is
+    the "test / shadow-off" mode used by the safety suite."""
+
     def __init__(self, enable_geometry=True):
-        self.regime = RoughPathClassifier()
-        self.ou = OUPingPong()
-        # V3.6 learned-geometry pipeline; the legacy classifiers remain as the
-        # fallback while the first window is still being collected/trained.
         self.geometry = GeometricPipeline(bot_state.get("timeframe", "1m")) if enable_geometry else None
 
     def process(self, df, params=None, force_retrain=False):
-        if params is None:
-            params = get_active_parameters()
-        
-        fast_len = int(params.get("FAST_LENGTH", 8))
-        slow_len = int(params.get("SLOW_LENGTH", 21))
-        vol_len = int(params.get("VOL_LENGTH", 14))
-        cvd_len = int(params.get("CVD_LENGTH", 14))
-        band_mult = float(params.get("BAND_MULT", 2.5))
-        margin = float(params.get("MIN_PROFIT_MARGIN", 0.3))
-        
-        c, h, l, o, v = df['close'].values, df['high'].values, df['low'].values, df['open'].values, df['volume'].values
-        fg = gaussian_filter(c, fast_len); sg = gaussian_filter(c, slow_len)
-        gv = gaussian_filter(calc_true_range(h,l,c), vol_len)
-        delta = np.where(c>o, v, np.where(c<o, -v, 0.0)); cvd_g = gaussian_filter(np.cumsum(delta), cvd_len)
-        
-        # Train classifier if not trained yet or forced
-        if self.regime.model is None or force_retrain:
-            self.regime.fit(df)
-            
-        i = len(df)-1
-        ub, lb = sg[i]+gv[i]*band_mult, sg[i]-gv[i]*band_mult
-        
-        # Predict regime from Rough Path Signatures
-        pred_direction = self.regime.predict(c)
-        is_r = (pred_direction == 0)
-        
-        sig, st = "HOLD", ""
-        # Trend: model predicts 1 (bullish) or -1 (bearish)
-        if not is_r and pred_direction == 1:
-            sig, st = "BUY", "Trend"
-        elif not is_r and pred_direction == -1:
-            sig, st = "SELL", "Trend"
-        # Ranging: OU model primary, fallback to bands
-        elif is_r and self.ou.is_valid:
-            ou_sig, ou_type = self.ou.get_signal(c[i])
-            if ou_sig != "HOLD":
-                sig, st = ou_sig, ou_type
-        elif is_r and l[i]<lb and c[i]>lb:
-            ml = ((sg[i]-lb)/lb*100)>=margin if lb>0 else False
-            if ml:
-                sig, st = "BUY", "Ping"
-        elif is_r and h[i]>ub and c[i]<ub:
-            ms = ((ub-sg[i])/sg[i]*100)>=margin if sg[i]>0 else False
-            if ms:
-                sig, st = "SELL", "Pong"
+        c = df['close'].values
+        h = df['high'].values
+        l = df['low'].values
+        i = len(df) - 1
+        # simple, cost-agnostic realised volatility for trailing distance only
+        gv = float(np.mean(calc_true_range(h[-32:], l[-32:], c[-32:]))) if len(df) >= 32 else float(h[i] - l[i])
 
-        # Fit OU model for future/ranging calculations
-        self.ou.fit(c[max(0, len(c)-100):])
-
-        # ── V3.6 learned geometry: once trained, the geometric decision chain
-        # (GBM → meta labeling → conformal gate) is the authoritative signal.
         geom_state = {}
         if self.geometry is not None:
             try:
@@ -3025,47 +2523,21 @@ class SignalEngine:
             except Exception as e_geom:
                 log.error(f"Geometry pipeline error: {e_geom}")
                 geom_state = self.geometry.live_state() if self.geometry else {}
-            if geom_state.get("status") == "ready":
-                gsig = geom_state.get("signal", "HOLD")
-                if gsig in ("BUY", "SELL"):
-                    sig, st = gsig, "Geo"
-                else:
-                    sig, st = "HOLD", ""
 
-        def sanitize(v, default=0.0):
-            if v is None or math.isnan(v) or math.isinf(v):
-                return default
-            return float(v)
+        # Signal is authoritative only when the pipeline is READY AND HEALTHY.
+        # A degraded pipeline is treated exactly like an untrained one: HOLD.
+        sig, st = "HOLD", ""
+        if geom_state.get("status") == "ready" and geom_state.get("health", "ok") == "ok":
+            gsig = geom_state.get("signal", "HOLD")
+            if gsig in ("BUY", "SELL"):
+                sig, st = gsig, "Geo"
 
         return {
             "signal": sig,
             "type": st,
             "geom": geom_state,
             "price": float(c[i]),
-            "gauss_vol": float(gv[i]),
-            "slow_gauss": float(sg[i]),
-            "upper_band": float(ub),
-            "lower_band": float(lb),
-            "is_ranging": bool(is_r),
-            "fast_gauss": float(fg[i]),
-            "fg_list": fg,
-            "sg_list": sg,
-            "ub_list": sg+gv*band_mult,
-            "lb_list": sg-gv*band_mult,
-            "hyp_direction": int(pred_direction),
-            "ou_theta": sanitize(self.ou.theta),
-            "ou_mu": sanitize(self.ou.mu),
-            "ou_half_life": sanitize(self.ou.half_life, 999.0),
-            "ou_upper": sanitize(self.ou.ou_upper),
-            "ou_lower": sanitize(self.ou.ou_lower),
-            "ou_stop_upper": sanitize(self.ou.ou_stop_upper),
-            "ou_stop_lower": sanitize(self.ou.ou_stop_lower),
-            "ou_valid": bool(self.ou.is_valid),
-            "ou_jump_intensity": float(self.ou.jump_intensity),
-            "ou_jump_mean": float(self.ou.jump_mean),
-            "ou_jump_std": float(self.ou.jump_std),
-            "ou_jump_detected": bool(self.ou.jump_detected),
-            "ou_jump_cooldown": int(self.ou.jump_cooldown)
+            "gauss_vol": gv,     # kept as a plain realised-vol scalar for trailing distance
         }
 
 
@@ -3157,39 +2629,30 @@ class PositionManager:
             self.ping_stop = min(self.ping_stop, price+gv_normal*self.ping_stop_mult)
 
     def check_exits(self, price, info, force_close=False):
+        """Geo-only exits: fixed SL/TP + first-touch trailing partial (70%) then
+        30%-tail trailing stop. All entries are 'Geo' now — the only regime
+        marker left is the health flag from the pipeline (handled by caller)."""
         if not self.is_open: return None
         if force_close: return "Zaman Dilimi Degisimi (Force Close)"
-        if self.entry_type in ("Ping","Pong","OU-Ping","OU-Pong") and not info['is_ranging']: return "Acil Cikis (Rejim Degisti)"
-        
+
         if self.side == "long":
             if self.has_taken_partial_tp:
                 if price <= self.trail_stop_30: return "Trail Stop (30%)"
                 return None
-            
-            if self.entry_type in ("Ping", "OU-Ping"):
-                if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss (Ping)"
-                if price >= self.entry_price * (1 + self.tp_percent/100): return "Ping TP"
-            elif self.entry_type in ("Trend", "Geo"):
-                if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss (Trend)"
-                if price <= self.trail_stop_70:
-                    if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss (Trend)"
-                    return "PARTIAL_TP"
-                if price >= self.entry_price * (1 + self.tp_percent/100): return f"Trend TP ({self.tp_percent:.2f}%)"
-                
+            if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss"
+            if price <= self.trail_stop_70:
+                if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss"
+                return "PARTIAL_TP"
+            if price >= self.entry_price * (1 + self.tp_percent/100): return f"Take Profit ({self.tp_percent:.2f}%)"
         elif self.side == "short":
             if self.has_taken_partial_tp:
                 if price >= self.trail_stop_30: return "Trail Stop (30%)"
                 return None
-            
-            if self.entry_type in ("Pong", "OU-Pong"):
-                if price >= self.entry_price * (1 + self.sl_percent/100): return "Stop Loss (Pong)"
-                if price <= self.entry_price * (1 - self.tp_percent/100): return "Pong TP"
-            elif self.entry_type in ("Trend", "Geo"):
-                if price >= self.entry_price * (1 + self.sl_percent/100): return "Stop Loss (Trend)"
-                if price >= self.trail_stop_70:
-                    if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss (Trend)"
-                    return "PARTIAL_TP"
-                if price <= self.entry_price * (1 - self.tp_percent/100): return f"Trend TP ({self.tp_percent:.2f}%)"
+            if price >= self.entry_price * (1 + self.sl_percent/100): return "Stop Loss"
+            if price >= self.trail_stop_70:
+                if self.trail_stop_70 == self.trail_stop_30: return "Stop Loss"
+                return "PARTIAL_TP"
+            if price <= self.entry_price * (1 - self.tp_percent/100): return f"Take Profit ({self.tp_percent:.2f}%)"
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3294,20 +2757,19 @@ class TelegramController:
             pos_desc = f"{bot_state['position_side'].upper()} (Giriş: {bot_state['position_entry']:.2f}, PnL: {bot_state['position_pnl']:.2f}%)" if bot_state["position_side"] else "Açık Pozisyon Yok"
             mode = bot_state["trading_mode"]
             active = "AKTİF" if bot_state["is_trading_active"] else "DURAKLATILDI"
-            ou_status = f"Valid (Half-life: {bot_state['ou_half_life']:.1f})" if bot_state["ou_valid"] else "Invalid"
+            g = bot_state.get("geom", {}) or {}
+            geo_line = f"{g.get('status','-').upper()}/{g.get('health','-').upper()} · {g.get('schema','-')}"
             msg = (
                 f"📊 *ANLIK DURUM RAPORU*\n\n"
                 f"📈 *Fiyat:* {bot_state['price']:.2f} USDT\n"
                 f"🤖 *Durum:* {active}\n"
                 f"🔄 *Mod:* {mode} Mod\n"
-                f"📊 *Rejim:* {bot_state['regime']}\n"
+                f"🧠 *Geo:* {geo_line}\n"
                 f"🎯 *Sinyal:* {bot_state['signal']} ({bot_state['signal_type'] or 'Yok'})\n"
                 f"⚖️ *OBI:* {bot_state['obi']:.2f}\n"
                 f"💼 *Pozisyon:* {pos_desc}\n"
                 f"💵 *Bakiye (Paper):* {bot_state['virtual_balance']:.2f} USDT\n"
-                f"📈 *OU Model:* {ou_status}\n"
-                f"📐 *OU μ (Denge):* {bot_state['ou_mu']:.2f}\n"
-                f"📐 *OU θ (Hız):* {bot_state['ou_theta']:.4f}"
+                f"🎯 *E[net]:* {g.get('exp_net', 0.0):+.2f}% (TP {g.get('tp_pct', 0.0):.2f}/SL {g.get('sl_pct', 0.0):.2f}%)"
             )
             await self.send_message(msg)
         elif text.startswith("/start_trade"):
@@ -3343,8 +2805,6 @@ class QuantBot:
         self.signal_engine = SignalEngine()
         self.position = PositionManager()
         self.telegram = TelegramController(self)
-        self.dynamic_target_optimizer = DynamicTargetOptimizer()
-        self.shadow_dynamic_target_optimizer = DynamicTargetOptimizer()
 
     def simulate_slippage(self, side, qty, orderbook):
         """
@@ -3600,17 +3060,6 @@ class QuantBot:
             # Update metrics using portfolio return
             update_portfolio_metrics(total_trade_pnl_usdt, pos_mode)
 
-            # Record completed trade metrics
-            max_excursion = (max_price_seen - saved_entry_price) / saved_entry_price * 100 if pos_side == "long" else (saved_entry_price - min_price_seen) / saved_entry_price * 100
-            max_drawdown = (saved_entry_price - min_price_seen) / saved_entry_price * 100 if pos_side == "long" else (max_price_seen - saved_entry_price) / saved_entry_price * 100
-            self.dynamic_target_optimizer.record_trade(
-                "ranging" if saved_entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
-                entry_volatility,
-                max_excursion,
-                max_drawdown,
-                pnl_pct
-            )
-
             bot_state["trades"].insert(0, {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "type": saved_entry_type, "side": "CLOSED",
@@ -3646,40 +3095,19 @@ class QuantBot:
         active_params = get_active_parameters()
         bot_state["active_parameters"] = active_params
         
-        margin = float(active_params.get("MIN_PROFIT_MARGIN", 0.3))
-        band_mult = float(active_params.get("BAND_MULT", 2.5))
-        ping_stop_mult = float(active_params.get("PING_STOP_MULT", 0.5))
         trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
-        
+
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
         info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
-        is_r = info['is_ranging']
-        log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), Ranging={is_r}, Active={bot_state['is_trading_active']}, OBI={bot_state.get('obi', 0.0):.2f}")
-        bot_state["fast_gauss"] = float(info['fast_gauss'])
-        bot_state["slow_gauss"] = float(info['slow_gauss'])
-        bot_state["upper_band"] = float(info['upper_band'])
-        bot_state["lower_band"] = float(info['lower_band'])
+        geom = info.get("geom", {}) or {}
+        log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), "
+                 f"Geo={geom.get('status','-')}/{geom.get('health','-')}, Active={bot_state['is_trading_active']}, OBI={bot_state.get('obi', 0.0):.2f}")
         bot_state["gauss_vol"] = float(info['gauss_vol'])
-        bot_state["is_ranging"] = is_r
-        bot_state["regime"] = "Yatay (Ranging)" if is_r else "Trend"
         bot_state["signal"] = info['signal']
         bot_state["signal_type"] = info['type']
-        
-        bot_state["geom"] = info.get("geom", bot_state.get("geom", {"status": "collecting", "signal": "HOLD"}))
-        bot_state["hyp_direction"] = info["hyp_direction"]
-        bot_state["ou_theta"] = info["ou_theta"]
-        bot_state["ou_mu"] = info["ou_mu"]
-        bot_state["ou_half_life"] = info["ou_half_life"]
-        bot_state["ou_upper"] = info["ou_upper"]
-        bot_state["ou_lower"] = info["ou_lower"]
-        bot_state["ou_valid"] = info["ou_valid"]
-        bot_state["ou_jump_intensity"] = info["ou_jump_intensity"]
-        bot_state["ou_jump_mean"] = info["ou_jump_mean"]
-        bot_state["ou_jump_std"] = info["ou_jump_std"]
-        bot_state["ou_jump_detected"] = info["ou_jump_detected"]
-        bot_state["ou_jump_cooldown"] = info["ou_jump_cooldown"]
+        bot_state["geom"] = geom or bot_state.get("geom", {"status": "collecting", "signal": "HOLD"})
 
         # OHLC chart data for Lightweight Charts (unix timestamps) with the
         # learned-geometry overlay: Conformal A, episodes, GEO entries/exits.
@@ -3711,63 +3139,11 @@ class QuantBot:
         bot_state["chart_data"] = chart_data
 
         if self.position.is_open:
-            # 1. Update stops using both normal and 1/6th lower timeframe volatility
-            gv_normal = info['gauss_vol']
-            gv_lower = gv_normal
-            try:
-                if bot_state["timeframe"] == "1m":
-                    # For 1m timeframe, MEXC doesn't support sub-minute.
-                    # We fetch 1s data from Binance, resample to 10s, and calculate volatility!
-                    ohlcv_1s = await asyncio.to_thread(self.public_binance.fetch_ohlcv, SYMBOL, "1s", None, 600)
-                    df_1s = pd.DataFrame(ohlcv_1s, columns=['timestamp','open','high','low','close','volume'])
-                    df_1s['timestamp'] = pd.to_datetime(df_1s['timestamp'], unit='ms')
-                    df_1s.set_index('timestamp', inplace=True)
-                    df_10s = df_1s.resample('10s').agg({
-                        'open': 'first',
-                        'high': 'max',
-                        'low': 'min',
-                        'close': 'last',
-                        'volume': 'sum'
-                    }).dropna()
-                    c_l, h_l, l_l = df_10s['close'].values, df_10s['high'].values, df_10s['low'].values
-                    gv_lower_list = gaussian_filter(calc_true_range(h_l, l_l, c_l), VOL_LENGTH)
-                    gv_lower = float(gv_lower_list[-1])
-                else:
-                    lower_tf = get_lower_tf(bot_state["timeframe"])
-                    if lower_tf != bot_state["timeframe"]:
-                        if lower_tf in ("2m", "10m"):
-                            # Local resampling using 1m data since 2m/10m are not natively supported by MEXC Spot
-                            ohlcv_1m = await asyncio.to_thread(self.exchange.fetch_ohlcv, SYMBOL, "1m", None, 200)
-                            df_1m = pd.DataFrame(ohlcv_1m, columns=['timestamp','open','high','low','close','volume'])
-                            df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
-                            df_1m.set_index('timestamp', inplace=True)
-                            
-                            resample_rule = "2Min" if lower_tf == "2m" else "10Min"
-                            df_resampled = df_1m.resample(resample_rule).agg({
-                                'open': 'first',
-                                'high': 'max',
-                                'low': 'min',
-                                'close': 'last',
-                                'volume': 'sum'
-                            }).dropna()
-                            c_l, h_l, l_l = df_resampled['close'].values, df_resampled['high'].values, df_resampled['low'].values
-                            gv_lower_list = gaussian_filter(calc_true_range(h_l, l_l, c_l), VOL_LENGTH)
-                            gv_lower = float(gv_lower_list[-1])
-                            log.info(f"MTF: Resampled 1m to {lower_tf} locally. Volatility = {gv_lower:.4f}")
-                        else:
-                            ohlcv_lower = await asyncio.to_thread(self.exchange.fetch_ohlcv, SYMBOL, lower_tf, None, 100)
-                            df_lower = pd.DataFrame(ohlcv_lower, columns=['timestamp','open','high','low','close','volume'])
-                            c_l, h_l, l_l = df_lower['close'].values, df_lower['high'].values, df_lower['low'].values
-                            gv_lower_list = gaussian_filter(calc_true_range(h_l, l_l, c_l), VOL_LENGTH)
-                            gv_lower = float(gv_lower_list[-1])
-            except Exception as ex_mtf:
-                log.error(f"MTF gv fetch error: {ex_mtf}")
-
-            self.position.update_stops(price, gv_normal, gv_lower)
+            gv = info['gauss_vol']
+            self.position.update_stops(price, gv, gv)
             reason = self.position.check_exits(price, info)
-            # Geometric positions also exit when the conformal score collapses while an
-            # anomalous episode with negative expected return is active
-            if reason is None and self.position.entry_type == "Geo" and info.get("geom", {}).get("exit_flag"):
+            # Geo exits when conformal collapses inside an anomalous episode
+            if reason is None and geom.get("exit_flag"):
                 reason = "Geo Exit (Conformal/Transition)"
 
             bot_state["position_side"] = self.position.side
@@ -3883,40 +3259,19 @@ class QuantBot:
             obi_filter_pass = False
             log.info(f"SELL blocked by OBI ({obi_now:.2f} Buy Wall)")
 
-        # CRITICAL Spot Restructure: Only open on BUY (no shorting on Spot)
+        # Spot BUY entry (long) — SELL branch below handles opt-in shorts
         if not self.position.is_open and info['signal'] == "BUY" and obi_filter_pass:
             if bot_state["is_trading_active"]:
                 try:
-                    if info['type'] in ("OU-Ping", "OU-Pong"):
-                        stop_dist = abs(price - info['ou_stop_lower'])
-                    else:
-                        stop_dist = info['gauss_vol'] * (ping_stop_mult if info['type'] in ("Ping","Pong") else trail_mult)
-                    if stop_dist <= 0: stop_dist = price * 0.01
-
-                    ou_target = info.get('ou_mu', 0.0)
-                    ou_stop = info.get('ou_stop_lower', 0.0)
-
+                    # cost-floored, vol-scaled targets from the geometry pipeline
                     entry_vol = float(info['gauss_vol'])
-                    reg_key = "ranging" if info['type'] in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
-                    active_p = get_active_parameters()
-                    def_tp = float(active_p.get("TP_PERCENT", 0.3))
-                    opt_tp, opt_sl = self.dynamic_target_optimizer.get_optimal_targets(
-                        reg_key, entry_vol,
-                        default_tp=def_tp if reg_key == "trend" else 0.3,
-                        default_sl=def_tp if reg_key == "trend" else 0.3
-                    )
-                    min_trail_dist = 0.0
-                    if info['type'] == "Geo":
-                        # cost wall: learned-geometry targets are floored above the
-                        # roundtrip cost and scaled to barrier-horizon volatility;
-                        # the DTO can widen but never shrink them below the floor
-                        g_state = info.get("geom", {}) or {}
-                        cost = roundtrip_cost_pct()
-                        bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
-                        opt_tp = max(opt_tp, float(g_state.get("tp_pct") or 0.0), 3.0 * cost,
-                                     2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
-                        opt_sl = max(float(g_state.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
-                        min_trail_dist = price * opt_tp / 100.0 * 0.5
+                    cost = roundtrip_cost_pct()
+                    bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
+                    opt_tp = max(float(geom.get("tp_pct") or 0.0), 3.0 * cost,
+                                 2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
+                    opt_sl = max(float(geom.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
+                    min_trail_dist = price * opt_tp / 100.0 * 0.5
+                    stop_dist = max(entry_vol * trail_mult, min_trail_dist, price * 0.01)
                     active_mode = bot_state["trading_mode"]
 
                     if active_mode == "REAL":
@@ -3960,16 +3315,16 @@ class QuantBot:
                             price = float(order.get('average', price))
                             invested = filled_qty * price
 
-                            # Place Native Stop-loss Order on Exchange
+                            # Native stop-loss at TP/2 below entry (cost-floored)
                             stop_order_id = None
                             try:
-                                stop_price_val = ou_stop if info['type'] == "OU-Ping" else (price - info['gauss_vol'] * (ping_stop_mult if info['type'] == "Ping" else trail_mult))
+                                stop_price_val = price - stop_dist
                                 stop_order_id = await self.place_native_stop_loss(filled_qty, stop_price_val)
                             except Exception as ex_stop:
                                 log.error(f"Failed to place native exchange stop order: {ex_stop}")
 
                             pos_side = "long"
-                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="REAL", stop_order_id=stop_order_id, tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
+                            self.position.open(pos_side, price, filled_qty, info['type'], info['gauss_vol'], invested, mode="REAL", stop_order_id=stop_order_id, tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
                             
                             # Send Telegram alert
                             msg = (
@@ -4001,7 +3356,7 @@ class QuantBot:
 
                             log.info(f"PAPER ORDER: buy {info['type']} (Qty: {qty:.6f}, Entry Price: {slippage_price:.2f}, Invest: ${invested:.2f})")
                             pos_side = "long"
-                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, ou_target, ou_stop, mode="PAPER", tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
+                            self.position.open(pos_side, slippage_price, qty, info['type'], info['gauss_vol'], invested, mode="PAPER", tp_percent=opt_tp, sl_percent=opt_sl, entry_volatility=entry_vol, min_trail_dist=min_trail_dist)
 
                             bot_state["trades"].insert(0, {
                                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4084,143 +3439,9 @@ class QuantBot:
             except Exception as e_short:
                 log.error(f"Short entry error: {e_short}")
 
-        # Shadow Mode Processing
-        shadow_challenger = bot_state["parameters_store"].get("shadow_challenger")
-        if shadow_challenger:
-            bot_state["shadow_active"] = True
-            bot_state["shadow_parameters"] = shadow_challenger
-            if not hasattr(self, "shadow_signal_engine"):
-                # Shadow engine stays on the legacy core (no second geometry training)
-                self.shadow_signal_engine = SignalEngine(enable_geometry=False)
-                self.shadow_position = PositionManager()
-        else:
-            bot_state["shadow_active"] = False
-            bot_state["shadow_parameters"] = {}
-
-        if bot_state["shadow_active"]:
-            try:
-                shadow_info = self.shadow_signal_engine.process(df_completed, params=shadow_challenger, force_retrain=force_retrain)
-                
-                if self.shadow_position.is_open:
-                    gv_normal = shadow_info['gauss_vol']
-                    gv_lower = gv_normal
-                    self.shadow_position.update_stops(price, gv_normal, gv_lower)
-                    
-                    shadow_reason = self.shadow_position.check_exits(price, shadow_info)
-                    
-                    bot_state["shadow_position_side"] = self.shadow_position.side
-                    bot_state["shadow_position_entry"] = float(self.shadow_position.entry_price)
-                    bot_state["shadow_position_qty"] = float(self.shadow_position.qty)
-                    bot_state["shadow_position_pnl"] = float((price - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price-price)/self.shadow_position.entry_price*100)
-                    
-                    if shadow_reason == "PARTIAL_TP":
-                        close_qty = self.shadow_position.qty * 0.70
-                        exit_price_slippage = price * 0.9995 if self.shadow_position.side == "long" else price * 1.0005
-                        comm_exit = (close_qty * exit_price_slippage) * 0.001
-                        
-                        pnl_pct = (exit_price_slippage - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price - exit_price_slippage)/self.shadow_position.entry_price*100
-                        realized_pnl_usdt = (self.shadow_position.invested_amount * 0.70) * (pnl_pct / 100) - comm_exit
-                        
-                        bot_state["shadow_balance"] += realized_pnl_usdt
-                        self.shadow_position.realized_pnl_usdt += realized_pnl_usdt
-                        
-                        bot_state["shadow_trades"].insert(0, {
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "type": self.shadow_position.entry_type,
-                            "side": f"PART_TP_{self.shadow_position.side.upper()}",
-                            "entry": float(self.shadow_position.entry_price),
-                            "exit": float(exit_price_slippage),
-                            "pnl": f"{pnl_pct:+.2f}%",
-                            "reason": "First Trailing Stop Hit (70% TP)"
-                        })
-                        
-                        self.shadow_position.qty *= 0.30
-                        self.shadow_position.invested_amount *= 0.30
-                        self.shadow_position.has_taken_partial_tp = True
-                        bot_state["shadow_position_qty"] = float(self.shadow_position.qty)
-                        
-                    elif shadow_reason:
-                        exit_price_slippage = price * 0.9995 if self.shadow_position.side == "long" else price * 1.0005
-                        comm_exit = (self.shadow_position.qty * exit_price_slippage) * 0.001
-                        
-                        pnl_pct = (exit_price_slippage - self.shadow_position.entry_price)/self.shadow_position.entry_price*100 if self.shadow_position.side=="long" else (self.shadow_position.entry_price - exit_price_slippage)/self.shadow_position.entry_price*100
-                        pnl_usdt = self.shadow_position.invested_amount * (pnl_pct / 100) - comm_exit
-                        
-                        total_trade_pnl_usdt = self.shadow_position.realized_pnl_usdt + pnl_usdt
-                        bot_state["shadow_balance"] += pnl_usdt
-                        
-                        bot_state["shadow_trade_count"] += 1
-                        bot_state["shadow_total_pnl"] += total_trade_pnl_usdt
-                        
-                        bot_state["shadow_trades"].insert(0, {
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "type": self.shadow_position.entry_type,
-                            "side": "CLOSED",
-                            "entry": float(self.shadow_position.entry_price),
-                            "exit": float(exit_price_slippage),
-                            "pnl": f"{(total_trade_pnl_usdt / (self.shadow_position.invested_amount / 0.30 if self.shadow_position.has_taken_partial_tp else self.shadow_position.invested_amount) * 100):+.2f}%",
-                            "reason": shadow_reason
-                        })
-                        
-                        # Record shadow completed trade metrics
-                        max_excursion = (self.shadow_position.max_price_seen - self.shadow_position.entry_price) / self.shadow_position.entry_price * 100 if self.shadow_position.side == "long" else (self.shadow_position.entry_price - self.shadow_position.min_price_seen) / self.shadow_position.entry_price * 100
-                        max_drawdown = (self.shadow_position.entry_price - self.shadow_position.min_price_seen) / self.shadow_position.entry_price * 100 if self.shadow_position.side == "long" else (self.shadow_position.max_price_seen - self.shadow_position.entry_price) / self.shadow_position.entry_price * 100
-                        self.shadow_dynamic_target_optimizer.record_trade(
-                            "ranging" if self.shadow_position.entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
-                            self.shadow_position.entry_volatility,
-                            max_excursion,
-                            max_drawdown,
-                            pnl_pct
-                        )
-                        
-                        self.shadow_position.close(shadow_reason, exit_price_slippage)
-                        bot_state["shadow_position_side"] = None
-                        bot_state["shadow_position_qty"] = 0.0
-                
-                if not self.shadow_position.is_open and shadow_info['signal'] == "BUY":
-                    shadow_obi_pass = True
-                    if bot_state.get("obi", 0) < -0.3:
-                        shadow_obi_pass = False
-                        
-                    if shadow_obi_pass:
-                        shadow_stop_dist = shadow_info['gauss_vol'] * (float(shadow_challenger.get('PING_STOP_MULT', 0.5)) if shadow_info['type'] in ("Ping","Pong") else float(shadow_challenger.get('TRAIL_MULT', 3.0)))
-                        if shadow_stop_dist <= 0:
-                            shadow_stop_dist = price * 0.01
-                            
-                        risk_amount = bot_state["shadow_balance"] * (TARGET_RISK_PERCENT / 100.0)
-                        target_qty = risk_amount / shadow_stop_dist
-                        max_qty = (bot_state["shadow_balance"] * MAX_CAPITAL_ALLOCATION) / price
-                        qty = min(target_qty, max_qty)
-                        invested = qty * price
-                        
-                        entry_fee = invested * 0.001
-                        bot_state["shadow_balance"] -= entry_fee
-                        
-                        shadow_entry_vol = float(shadow_info['gauss_vol'])
-                        shadow_reg_key = "ranging" if shadow_info['type'] in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
-                        shadow_def_tp = float(shadow_challenger.get("TP_PERCENT", 0.3))
-                        shadow_opt_tp, shadow_opt_sl = self.shadow_dynamic_target_optimizer.get_optimal_targets(
-                            shadow_reg_key, shadow_entry_vol, 
-                            default_tp=shadow_def_tp if shadow_reg_key == "trend" else 0.3, 
-                            default_sl=shadow_def_tp if shadow_reg_key == "trend" else 0.3
-                        )
-                        self.shadow_position.open("long", price, qty, shadow_info['type'], shadow_info['gauss_vol'], invested, params=shadow_challenger, tp_percent=shadow_opt_tp, sl_percent=shadow_opt_sl, entry_volatility=shadow_entry_vol)
-                        bot_state["shadow_position_side"] = "long"
-                        bot_state["shadow_position_entry"] = float(price)
-                        bot_state["shadow_position_qty"] = float(qty)
-                        bot_state["shadow_position_pnl"] = 0.0
-                        
-                        bot_state["shadow_trades"].insert(0, {
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "type": shadow_info['type'],
-                            "side": "LONG",
-                            "entry": float(price),
-                            "exit": 0.0,
-                            "pnl": "OPEN",
-                            "reason": f"Signal: {shadow_info['signal']}"
-                        })
-            except Exception as e_shadow:
-                log.error(f"Shadow Mode tick error: {e_shadow}")
+        # Shadow Mode removed with the legacy engine — the WFO challenger now goes
+        # straight into the parameters store (promote/rollback via /api/promote_challenger).
+        bot_state["shadow_active"] = False
 
     async def fast_orderbook_tick(self):
         while True:
@@ -4264,7 +3485,7 @@ class QuantBot:
                 
                 # Fetch recent trades to find actual entry price
                 entry_price = current_price
-                entry_type = "Trend"
+                entry_type = "Geo"
                 try:
                     trades = await asyncio.to_thread(self.exchange.fetch_my_trades, SYMBOL, limit=5)
                     if trades:
@@ -4364,41 +3585,42 @@ class Backtester:
         ping_stop = 0.0
         min_trail_dist = 0.0
 
-        dynamic_target_optimizer = DynamicTargetOptimizer()
         entry_volatility = 0.0
         current_tp_percent = 0.3
         current_sl_percent = 0.3
         max_price_seen = 0.0
         min_price_seen = 0.0
-        
+
         trades = []
         pnl_list = []
         gross_profit = 0.0
         gross_loss = 0.0
         win_trades = 0
         loss_trades = 0
-        
-        fast_len = int(params.get("FAST_LENGTH", 8))
-        slow_len = int(params.get("SLOW_LENGTH", 21))
-        vol_len = int(params.get("VOL_LENGTH", 14))
-        cvd_len = int(params.get("CVD_LENGTH", 14))
-        band_mult = float(params.get("BAND_MULT", 2.5))
-        margin = float(params.get("MIN_PROFIT_MARGIN", 0.3))
-        trail_mult = float(params.get("TRAIL_MULT", 3.0))
-        ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
-        tp_percent = float(params.get("TP_PERCENT", 3.0))
-        
-        fg = gaussian_filter(c, fast_len)
-        sg = gaussian_filter(c, slow_len)
-        gv = gaussian_filter(calc_true_range(h, l, c), vol_len)
-        delta = np.where(c > o, v, np.where(c < o, -v, 0.0))
-        cvd_g = gaussian_filter(np.cumsum(delta), cvd_len)
-        
-        rough_path_classifier = RoughPathClassifier()
-        features = rough_path_classifier._compute_signatures(c) if geo is None else None
-        ou = OUPingPong()
 
-        start_idx = max(slow_len + 100, 300) if geo is None else max(slow_len + 5, 65)
+        vol_len = int(params.get("VOL_LENGTH", 14))
+        trail_mult = float(params.get("TRAIL_MULT", 3.0))
+        tp_percent = float(params.get("TP_PERCENT", 0.6))
+
+        # Simple realised volatility (True Range, rolling mean) for trailing stops.
+        # No more Gaussian-filter/CVD/HMM machinery — signals come from `geo` only.
+        tr = calc_true_range(h, l, c)
+        gv = np.zeros(len(c))
+        for i in range(len(c)):
+            j = max(0, i - vol_len + 1)
+            gv[i] = float(np.mean(tr[j:i + 1])) if i >= j else float(tr[i])
+
+        if geo is None:
+            # Geo-mandatory: without a geometry payload the backtester emits nothing.
+            return {
+                "trade_count": 0, "total_pnl_pct": 0.0, "total_pnl_usdt": 0.0,
+                "profit_factor": 1.0, "max_drawdown_pct": 0.0, "calmar_ratio": 0.0,
+                "sharpe_ratio": 0.0, "sortino_ratio": 0.0, "recovery_factor": 0.0,
+                "win_rate": 0.0, "expectancy": 0.0, "trades": [],
+                "engine": "geometric-empty", "reason": "no geo signal payload provided"
+            }
+
+        start_idx = max(vol_len + 5, 65)
         if start_idx >= len(self.df):
             return {
                 "trade_count": 0, "total_pnl_pct": 0.0, "total_pnl_usdt": 0.0,
@@ -4406,78 +3628,44 @@ class Backtester:
                 "sharpe_ratio": 0.0, "sortino_ratio": 0.0, "recovery_factor": 0.0,
                 "win_rate": 0.0, "expectancy": 0.0, "trades": []
             }
-            
-        if geo is None:
-            rough_path_classifier.fit(self.df.iloc[:start_idx])
 
         for idx in range(start_idx, len(self.df)):
             price = float(c[idx])
-            prev_price = float(c[idx-1])
 
-            if geo is None:
-                if rough_path_classifier.model is not None:
-                    feats_bias = np.append(features[idx-1], 1.0)
-                    pred_val = float(np.dot(feats_bias, rough_path_classifier.model))
-                    if pred_val > 0.35: pred_direction = 1
-                    elif pred_val < -0.35: pred_direction = -1
-                    else: pred_direction = 0
-                else:
-                    pred_direction = 0
-                is_r = (pred_direction == 0)
-                hyp_direction = pred_direction
-                ou.fit(c[max(0, idx - 100):idx])
-            else:
-                pred_direction = 0
-                hyp_direction = 0
-                is_r = False
-            
             if position_side is not None:
                 max_price_seen = max(max_price_seen, price)
                 min_price_seen = min(min_price_seen, price)
                 gv_normal = float(gv[idx-1])
-                gv_lower = 0.7 * gv_normal
                 d30 = max(gv_normal * trail_mult, min_trail_dist)
-                d70 = max(gv_lower * trail_mult, min_trail_dist)
 
                 if position_side == "long":
                     trail_stop_30 = max(trail_stop_30, price - d30)
                     if not has_taken_partial_tp:
-                        trail_stop_70 = max(trail_stop_70, price - d70)
-                    ping_stop = max(ping_stop, price - gv_normal * ping_stop_mult)
+                        trail_stop_70 = max(trail_stop_70, price - d30)
                 else:
                     trail_stop_30 = min(trail_stop_30, price + d30)
                     if not has_taken_partial_tp:
-                        trail_stop_70 = min(trail_stop_70, price + d70)
-                    ping_stop = min(ping_stop, price + gv_normal * ping_stop_mult)
-                    
+                        trail_stop_70 = min(trail_stop_70, price + d30)
+
                 exit_reason = None
                 if position_side == "long":
                     if has_taken_partial_tp:
                         if price <= trail_stop_30: exit_reason = "Trail Stop (30%)"
-                    elif entry_type in ("Ping", "OU-Ping"):
-                        if price <= entry_price * (1 - current_sl_percent/100): exit_reason = "Stop Loss (Ping)"
-                        elif price >= entry_price * (1 + current_tp_percent/100): exit_reason = "Ping TP"
-                    elif entry_type in ("Trend", "Geo"):
-                        if price <= entry_price * (1 - current_sl_percent/100): exit_reason = "Stop Loss (Trend)"
+                    else:
+                        if price <= entry_price * (1 - current_sl_percent/100): exit_reason = "Stop Loss"
                         elif price <= trail_stop_70: exit_reason = "PARTIAL_TP"
-                        elif price >= entry_price * (1 + current_tp_percent/100): exit_reason = f"Trend TP ({current_tp_percent:.2f}%)"
+                        elif price >= entry_price * (1 + current_tp_percent/100): exit_reason = f"Take Profit ({current_tp_percent:.2f}%)"
                 else:
                     if has_taken_partial_tp:
                         if price >= trail_stop_30: exit_reason = "Trail Stop (30%)"
-                    elif entry_type in ("Pong", "OU-Pong"):
-                        if price >= entry_price * (1 + current_sl_percent/100): exit_reason = "Stop Loss (Pong)"
-                        elif price <= entry_price * (1 - current_tp_percent/100): exit_reason = "Pong TP"
-                    elif entry_type in ("Trend", "Geo"):
-                        if price >= entry_price * (1 + current_sl_percent/100): exit_reason = "Stop Loss (Trend)"
+                    else:
+                        if price >= entry_price * (1 + current_sl_percent/100): exit_reason = "Stop Loss"
                         elif price >= trail_stop_70: exit_reason = "PARTIAL_TP"
-                        elif price <= entry_price * (1 - current_tp_percent/100): exit_reason = f"Trend TP ({current_tp_percent:.2f}%)"
+                        elif price <= entry_price * (1 - current_tp_percent/100): exit_reason = f"Take Profit ({current_tp_percent:.2f}%)"
 
-                if exit_reason is None:
-                    if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") and not is_r:
-                        exit_reason = "Acil Cikis (Rejim Degisti)"
-                    elif geo is not None and entry_type == "Geo" and bool(geo["exit_flag"][idx-1]):
-                        exit_reason = "Geo Exit (Conformal/Transition)"
-                        
+                if exit_reason is None and bool(geo["exit_flag"][idx-1]):
+                    exit_reason = "Geo Exit (Conformal/Transition)"
+
                 if exit_reason == "PARTIAL_TP":
                     close_qty = qty * 0.70
                     slippage_factor = self.slippage_rate + self.spread_rate / 2
@@ -4520,57 +3708,21 @@ class Backtester:
                         "reason": exit_reason
                     })
                     
-                    # Record completed trade
-                    max_excursion = (max_price_seen - entry_price) / entry_price * 100 if position_side == "long" else (entry_price - min_price_seen) / entry_price * 100
-                    max_drawdown = (entry_price - min_price_seen) / entry_price * 100 if position_side == "long" else (max_price_seen - entry_price) / entry_price * 100
-                    dynamic_target_optimizer.record_trade(
-                        "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend",
-                        entry_volatility,
-                        max_excursion,
-                        max_drawdown,
-                        pnl_pct
-                    )
-                    
                     position_side = None
                     qty = 0.0
                     invested_amount = 0.0
                     has_taken_partial_tp = False
                     min_trail_dist = 0.0
-            
+
             if position_side is None:
+                # learned-geometry decision chain on the last completed bar
                 sig, st = "HOLD", ""
-                if geo is not None:
-                    # learned-geometry decision chain on the last completed bar
-                    gsig_bt = str(geo["signal"][idx-1])
-                    if gsig_bt in ("BUY", "SELL"):
-                        sig, st = gsig_bt, "Geo"
-                else:
-                    ub, lb = sg[idx-1] + gv[idx-1] * band_mult, sg[idx-1] - gv[idx-1] * band_mult
-                    cu = fg[idx-1] > sg[idx-1] and fg[idx-2] <= sg[idx-2]
-                    cd = fg[idx-1] < sg[idx-1] and fg[idx-2] >= sg[idx-2]
-                    cb = cvd_g[idx-1] > cvd_g[idx-2]
-                    cbe = cvd_g[idx-1] < cvd_g[idx-2]
+                gsig_bt = str(geo["signal"][idx-1])
+                if gsig_bt in ("BUY", "SELL"):
+                    sig, st = gsig_bt, "Geo"
 
-                    ml = ((sg[idx-1] - lb) / lb * 100) >= margin if lb > 0 else False
-                    ms = ((ub - sg[idx-1]) / sg[idx-1] * 100) >= margin if sg[idx-1] > 0 else False
-
-                    if not is_r and cu and cb and hyp_direction == 1:
-                        sig, st = "BUY", "Trend"
-                    elif not is_r and cd and cbe and hyp_direction == -1:
-                        sig, st = "SELL", "Trend"
-                    elif is_r and ou.is_valid:
-                        ou_sig, ou_type = ou.get_signal(price)
-                        if ou_sig != "HOLD":
-                            sig, st = ou_sig, ou_type
-                    elif is_r and ml and l[idx-1] < lb and c[idx-1] > lb:
-                        sig, st = "BUY", "Ping"
-                    elif is_r and ms and h[idx-1] > ub and c[idx-1] < ub:
-                        sig, st = "SELL", "Pong"
-                    
-                # SELL opens a short only in geo mode (futures/two-sided); legacy
-                # spot SELL stays flat as before.
                 open_long = sig == "BUY" and balance >= 5.0
-                open_short = sig == "SELL" and geo is not None and balance >= 5.0
+                open_short = sig == "SELL" and balance >= 5.0
                 if open_long or open_short:
                     position_side = "long" if open_long else "short"
                     entry_type = st
@@ -4579,23 +3731,15 @@ class Backtester:
                     entry_price = price * (1 + slippage_factor) if open_long else price * (1 - slippage_factor)
 
                     entry_volatility = float(gv[idx-1])
-                    regime_key = "ranging" if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else "trend"
-                    current_tp_percent, current_sl_percent = dynamic_target_optimizer.get_optimal_targets(
-                        regime_key, entry_volatility,
-                        default_tp=tp_percent if regime_key == "trend" else 0.3,
-                        default_sl=tp_percent if regime_key == "trend" else 0.3
-                    )
-                    min_trail_dist = 0.0
-                    if geo is not None:
-                        # cost-floored, vol-scaled barrier targets from the pipeline;
-                        # trailing may never come closer than half the target
-                        current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(current_tp_percent, 3.0 * roundtrip_cost_pct())
-                        current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(current_sl_percent, 1.5 * roundtrip_cost_pct())
-                        min_trail_dist = entry_price * current_tp_percent / 100.0 * 0.5
+                    # cost-floored, vol-scaled barrier targets from the pipeline;
+                    # trailing may never come closer than half the target
+                    current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(tp_percent, 3.0 * roundtrip_cost_pct())
+                    current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(0.3, 1.5 * roundtrip_cost_pct())
+                    min_trail_dist = entry_price * current_tp_percent / 100.0 * 0.5
                     max_price_seen = entry_price
                     min_price_seen = entry_price
 
-                    stop_dist = gv[idx-1] * (ping_stop_mult if entry_type in ("Ping", "Pong", "OU-Ping", "OU-Pong") else trail_mult)
+                    stop_dist = max(gv[idx-1] * trail_mult, min_trail_dist)
                     if stop_dist <= 0: stop_dist = entry_price * 0.01
 
                     risk_amount = balance * (TARGET_RISK_PERCENT / 100.0)
@@ -4610,11 +3754,9 @@ class Backtester:
                     if position_side == "long":
                         trail_stop_30 = entry_price - trail_dist_init
                         trail_stop_70 = entry_price - trail_dist_init
-                        ping_stop = entry_price - gv[idx-1] * ping_stop_mult
                     else:
                         trail_stop_30 = entry_price + trail_dist_init
                         trail_stop_70 = entry_price + trail_dist_init
-                        ping_stop = entry_price + gv[idx-1] * ping_stop_mult
 
         trade_count = len(trades)
         total_pnl_pct = sum(pnl_list)
@@ -4661,100 +3803,6 @@ class Backtester:
             "trades": trades
         }
 
-class BacktestOptimizer:
-    def __init__(self, df):
-        self.df = df
-        
-    def run_wfo(self):
-        L = len(self.df)
-        window_size = int(L * 0.40)
-        n_slices = 10
-        step = int((L - window_size) / (n_slices - 1)) if n_slices > 1 else 0
-        
-        grid_fast = [5, 8, 12]
-        grid_slow = [18, 21, 28]
-        grid_band = [2.0, 2.5, 3.0]
-        grid_margin = [0.2, 0.3, 0.4]
-        
-        combos = []
-        for f in grid_fast:
-            for s in grid_slow:
-                for b in grid_band:
-                    for m in grid_margin:
-                        combos.append({
-                            "FAST_LENGTH": f,
-                            "SLOW_LENGTH": s,
-                            "BAND_MULT": b,
-                            "MIN_PROFIT_MARGIN": m,
-                            "VOL_LENGTH": 14,
-                            "CVD_LENGTH": 14,
-                            "TRAIL_MULT": 3.0,
-                            "PING_STOP_MULT": 0.5,
-                            "TP_PERCENT": 3.0
-                        })
-                        
-        best_candidate = None
-        best_stability_count = -1
-        lowest_variance = float('inf')
-        candidate_reports = []
-        
-        slices = []
-        for i in range(n_slices):
-            start = i * step
-            end = start + window_size
-            is_end = start + int(0.70 * window_size)
-            slices.append({
-                "is_df": self.df.iloc[start:is_end].copy(),
-                "oos_df": self.df.iloc[is_end:end].copy()
-            })
-            
-        for combo in combos:
-            slice_pfs = []
-            slice_calmars = []
-            stable_slices = 0
-            
-            for s_idx, sl in enumerate(slices):
-                bt = Backtester(sl["oos_df"])
-                res = bt.run(combo)
-                
-                pf = res["profit_factor"]
-                calmar = res["calmar_ratio"]
-                
-                slice_pfs.append(pf)
-                slice_calmars.append(calmar)
-                
-                if pf > 1.20 and calmar > 1.0:
-                    stable_slices += 1
-                    
-            if stable_slices >= 8:
-                pf_std = float(np.std(slice_pfs))
-                if stable_slices > best_stability_count or (stable_slices == best_stability_count and pf_std < lowest_variance):
-                    best_stability_count = stable_slices
-                    lowest_variance = pf_std
-                    best_candidate = combo
-                    best_candidate["slice_pfs"] = slice_pfs
-                    best_candidate["slice_calmars"] = slice_calmars
-                    
-            candidate_reports.append({
-                "parameters": combo,
-                "stable_slices": stable_slices,
-                "avg_pf": float(np.mean(slice_pfs))
-            })
-            
-        if best_candidate is None:
-            candidate_reports.sort(key=lambda x: (x["stable_slices"], x["avg_pf"]), reverse=True)
-            if candidate_reports:
-                best_candidate = candidate_reports[0]["parameters"]
-                best_candidate["slice_pfs"] = []
-                best_candidate["slice_calmars"] = []
-                best_stability_count = candidate_reports[0]["stable_slices"]
-                
-        return {
-            "challenger": best_candidate,
-            "stability_count": best_stability_count,
-            "variance": lowest_variance if lowest_variance != float('inf') else 0.0,
-            "slices_evaluated": n_slices
-        }
 app = Flask("QuantDesktopApp")
 
 HTML_TEMPLATE = """
@@ -4959,18 +4007,15 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="panel-box">
-                <div class="box-title">Shadow Mode & WFO</div>
+                <div class="box-title">Backtest & Purged WFO</div>
                 <div class="kv-row"><span class="kv-key">Challenger:</span><span class="kv-val color-blue" id="shadow-challenger-title">None</span></div>
                 <div id="challenger-params" style="font-size:0.7rem; color:var(--text-muted); display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; margin-bottom:6px; display:none;">
                     <!-- JS populated -->
                 </div>
-                <div class="kv-row"><span class="kv-key">Shadow Bal:</span><span class="kv-val color-green" id="shadow-balance">$1000.00</span></div>
-                <div class="kv-row"><span class="kv-key">Shadow PnL:</span><span class="kv-val" id="shadow-pnl">$0.00</span></div>
-                <div class="kv-row"><span class="kv-key">Shadow Pos:</span><span class="kv-val" id="shadow-position">None</span></div>
-                
+
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
                     <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runBacktest()" id="btn-backtest">Run Backtest (3000b)</button>
-                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runWFO()" id="btn-wfo">Run WFO (10 slices)</button>
+                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runWFO()" id="btn-wfo">Run Purged WFO</button>
                     <button class="btn" style="background:var(--tv-green); color:white; font-size:0.7rem; padding:4px; display:none;" onclick="promoteChallenger()" id="btn-promote">Promote Challenger</button>
                 </div>
             </div>
@@ -5125,38 +4170,41 @@ HTML_TEMPLATE = """
                     cpDiv.innerText = "$" + s.price.toFixed(2);
                     lastPrice = s.price;
 
-                    // Signal & Regime with Hyperbolic trend confirmation indicators
-                    let hypText = "";
-                    if (s.hyp_direction === 1) {
-                        hypText = " <span style='color:var(--profit-green); font-weight:bold;'>▲ Hyp</span>";
-                    } else if (s.hyp_direction === -1) {
-                        hypText = " <span style='color:var(--loss-red); font-weight:bold;'>▼ Hyp</span>";
-                    }
-                    
+                    // Signal
                     let sigText = s.signal;
                     if (s.signal_type) sigText += " (" + s.signal_type + ")";
-                    document.getElementById('signal-val').innerHTML = sigText + hypText;
+                    document.getElementById('signal-val').innerHTML = sigText;
                     document.getElementById('signal-val').style.color = s.signal === 'BUY' ? 'var(--profit-green)' : (s.signal === 'SELL' ? 'var(--loss-red)' : 'var(--text-main)');
-                    
-                    // Regime box: geometric episode state once the pipeline is ready,
-                    // legacy trend/ranging only during warm-up
-                    if (s.geom && s.geom.status === 'ready') {
-                        const inEp = s.geom.episode === 'EPISODE';
-                        document.getElementById('regime-box').innerText = inEp
-                            ? ('EPİZOT' + (s.geom.cluster >= 0 ? ' (A' + s.geom.cluster + ')' : ''))
-                            : 'NORMAL (GEO)';
-                        document.getElementById('regime-box').className = "regime-box " + (inEp ? "regime-range" : "regime-trend");
-                    } else {
-                        document.getElementById('regime-box').innerText = s.regime.toUpperCase();
-                        document.getElementById('regime-box').className = "regime-box " + (s.is_ranging ? "regime-range" : "regime-trend");
+
+                    // Regime box: geometric episode/health state
+                    {
+                        const g = s.geom || {};
+                        const box = document.getElementById('regime-box');
+                        if (g.status === 'ready' && g.health === 'degraded') {
+                            box.innerText = 'GEOMETRY DEGRADED';
+                            box.className = "regime-box regime-range";
+                            box.style.color = 'var(--loss-red)';
+                        } else if (g.status === 'ready') {
+                            const inEp = g.episode === 'EPISODE';
+                            box.innerText = inEp ? ('EPİZOT' + (g.cluster >= 0 ? ' (A' + g.cluster + ')' : '')) : 'NORMAL (GEO)';
+                            box.className = "regime-box " + (inEp ? "regime-range" : "regime-trend");
+                            box.style.color = '';
+                        } else {
+                            box.innerText = (g.status || 'collecting').toUpperCase();
+                            box.className = "regime-box regime-trend";
+                            box.style.color = 'var(--warning-yellow)';
+                        }
                     }
 
                     // Learned Geometry panel (V3.6)
                     if (s.geom) {
                         const g = s.geom;
                         const gst = document.getElementById('geom-status');
-                        gst.innerText = (g.status || 'collecting').toUpperCase();
-                        gst.style.color = g.status === 'ready' ? 'var(--profit-green)' : 'var(--warning-yellow)';
+                        const degraded = (g.status === 'ready' && g.health === 'degraded');
+                        gst.innerText = degraded ? 'DEGRADED' : (g.status || 'collecting').toUpperCase();
+                        gst.style.color = degraded ? 'var(--loss-red)'
+                            : (g.status === 'ready' ? 'var(--profit-green)' : 'var(--warning-yellow)');
+                        gst.title = degraded && g.health_reasons ? g.health_reasons.join('; ') : '';
                         document.getElementById('geom-schema').innerText = g.schema || '-';
                         document.getElementById('geom-kappa').innerText = (g.kappa || 0).toFixed(3) + ' / ' + (g.kappa_init || 0).toFixed(3);
                         document.getElementById('geom-eta').innerText = (g.eta || 0).toFixed(3);
@@ -5261,17 +4309,6 @@ HTML_TEMPLATE = """
                         cTitle.className = "kv-val color-red";
                         cParams.style.display = "none";
                         promoteBtn.style.display = "none";
-                    }
-
-                    // Shadow metrics
-                    document.getElementById('shadow-balance').innerText = "$" + s.shadow_balance.toFixed(2);
-                    document.getElementById('shadow-pnl').innerText = (s.shadow_total_pnl >= 0 ? "+" : "") + s.shadow_total_pnl.toFixed(2) + " USDT (" + s.shadow_trade_count + " trades)";
-                    document.getElementById('shadow-pnl').className = "kv-val " + (s.shadow_total_pnl >= 0 ? "color-green" : "color-red");
-                    
-                    if (s.shadow_position_side) {
-                        document.getElementById('shadow-position').innerHTML = '<span class="' + (s.shadow_position_side === 'long' ? 'badge-long' : 'badge-short') + '">' + s.shadow_position_side.toUpperCase() + '</span> @ $' + s.shadow_position_entry.toFixed(2) + ' (' + (s.shadow_position_pnl >= 0 ? '+' : '') + s.shadow_position_pnl.toFixed(2) + '%)';
-                    } else {
-                        document.getElementById('shadow-position').innerText = "None";
                     }
 
                     // Task spinners
@@ -5408,7 +4445,7 @@ HTML_TEMPLATE = """
                         }).join('');
                         document.getElementById('ob-spread').innerText = "$" + s.price.toFixed(2);
                     }
-                }).catch(err => {});
+                }).catch(err => { console.error('updateUI failed:', err); });
         }
 
         function runBacktest() {
@@ -5450,7 +4487,22 @@ def get_state():
     with state_lock:
         state_copy = bot_state.copy()
         state_copy.pop("loop", None)
-        return jsonify(state_copy)
+        return jsonify(_json_sanitize(state_copy))
+
+
+def _json_sanitize(obj):
+    """Recursively replace NaN/Infinity with None so the browser can parse the
+    payload. Flask jsonify defaults to allow_nan=True and emits the literal
+    string `NaN`, which is INVALID JSON and makes the browser's JSON.parse
+    reject the whole response — silently killing the UI update loop (chart
+    never renders, timeframe clicks look unresponsive)."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(x) for x in obj]
+    return obj
 
 @app.route('/api/toggle_bot', methods=['POST'])
 def toggle_bot():
@@ -5521,15 +4573,9 @@ def run_backtest_endpoint():
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
             active_params = get_active_parameters()
-            # V3.6: geometric backtest (train on first window, trade the purged
-            # remainder); legacy engine only as fallback for short histories.
-            try:
-                report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
-            except Exception as e_geo_bt:
-                log.error(f"Geometric backtest unavailable ({e_geo_bt}); falling back to legacy engine.")
-                report = Backtester(df).run(active_params)
-                report["engine"] = "legacy"
-            log.info(f"Backtest simulation completed ({report.get('engine','legacy')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
+            # Geometric backtest: train on the first window, trade the purged remainder.
+            report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
+            log.info(f"Backtest simulation completed ({report.get('engine','geometric')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
 
             bot_state["backtest_report"] = {
                 "trade_count": report["trade_count"],
@@ -5578,16 +4624,11 @@ def run_wfo_endpoint():
                 df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000))
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
-            # V3.6: purged walk-forward over the geometric pipeline (warm start +
-            # neighbour-fold RKD, geometry schema fixed). Legacy grid as fallback.
-            try:
-                engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
-                result = engine.run()
-            except Exception as e_geo_wfo:
-                log.error(f"Purged WFO unavailable ({e_geo_wfo}); falling back to legacy grid WFO.")
-                result = BacktestOptimizer(df).run_wfo()
-                result["engine"] = "legacy-grid"
-            log.info(f"WFO completed ({result.get('engine','legacy-grid')}). Challenger: {result['challenger']}, "
+            # Purged walk-forward over the geometric pipeline (warm start +
+            # neighbour-fold RKD, geometry schema fixed).
+            engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
+            result = engine.run()
+            log.info(f"WFO completed ({result.get('engine','geometric-purged-wfo')}). Challenger: {result['challenger']}, "
                      f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
 
             challenger = result["challenger"]
@@ -5678,8 +4719,7 @@ def promote_challenger_endpoint():
 #   python quant_bot_v35.py                # launch the bot (default)
 #   python quant_bot_v35.py --test         # run every suite
 #   python quant_bot_v35.py --test-geom    # V3.6 learned-geometry tests only
-#   python quant_bot_v35.py --test-comp    # V3.5 component tests only
-#   python quant_bot_v35.py --test-safe    # V3.5 safety/execution tests only
+#   python quant_bot_v35.py --test-safe    # safety/execution tests only
 #
 # The suites don't need extra installs — same NumPy/pandas the bot already uses.
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6135,123 +5175,39 @@ def test_geometric_backtest_and_purged_wfo():
 
 
 def test_signal_engine_contract():
-    print("Testing SignalEngine info contract (legacy keys preserved + geom block)...")
+    print("Testing SignalEngine geo-only contract (HOLD until ready+healthy)...")
     df = _make_synth_df(300)
-    eng = SignalEngine(enable_geometry=True)
+    eng = SignalEngine(enable_geometry=True)   # 300 bars < MIN_TRAIN_BARS -> collecting
     info = eng.process(df)
-    for key in ("signal", "type", "price", "gauss_vol", "slow_gauss", "upper_band",
-                "lower_band", "is_ranging", "fast_gauss", "hyp_direction",
-                "ou_theta", "ou_mu", "ou_valid", "geom"):
+    for key in ("signal", "type", "price", "gauss_vol", "geom"):
         assert key in info, f"missing info key: {key}"
     assert info["geom"]["status"] in ("collecting", "training")
-    assert info["signal"] in ("BUY", "SELL", "HOLD")
+    # never a legacy signal during warm-up: geometry not ready -> HOLD
+    assert info["signal"] == "HOLD", "warm-up must be HOLD (no legacy fallback)"
     eng2 = SignalEngine(enable_geometry=False)
     info2 = eng2.process(df)
-    assert info2["geom"] == {}
-    print("  legacy contract intact, geometry block attached ✓")
+    assert info2["geom"] == {} and info2["signal"] == "HOLD"
+    print("  warm-up HOLD, geometry-only signal path ✓")
 
 
-# ── V3.5 component tests ─────────────────────────────────────────────────────
-def test_ou_component():
-    print("Testing OUPingPong...")
-    ou = OUPingPong()
-    np.random.seed(42)
-    prices = [100.0]
-    mu = 100.0; theta = 0.1; sigma = 0.2
-    for _ in range(150):
-        dp = theta * (mu - prices[-1]) + np.random.normal(0, sigma)
-        prices.append(prices[-1] + dp)
-    prices = np.array(prices)
-    ou.fit(prices)
-    print(f"Fit results: theta={ou.theta:.4f}, mu={ou.mu:.2f}, half_life={ou.half_life:.2f}, valid={ou.is_valid}")
-    print(f"Corridor: lower={ou.ou_lower:.2f}, upper={ou.ou_upper:.2f}")
-    sig, sig_type = ou.get_signal(ou.ou_lower - 1.0)
-    print(f"Price below lower band signal: {sig} ({sig_type})")
-    assert sig == "BUY"
+def test_health_monitor_auto_hold():
+    print("Testing geometry health monitor + auto-HOLD on degraded diagnostics...")
+    df = _make_synth_df(900, seed=17)
+    pipe = GeometricPipeline("1m", encoder_epochs=25)
+    pipe.fit(df.iloc[:600])
+    assert pipe.status == "ready"
+    hs = pipe.health_status()
+    assert hs["health"] in ("ok", "degraded") and "reasons" in hs
+    # force a degraded diagnostic: absurd D_anchor drift -> must flip to degraded
+    pipe.diagnostics[-1]["d_anchor"] = 99.0
+    hs2 = pipe.health_status()
+    assert hs2["health"] == "degraded" and any("drift" in r for r in hs2["reasons"])
+    # a degraded pipeline reports READY status but SignalEngine must emit HOLD
+    live = pipe.live_state({"status": "ready", "signal": "BUY",
+                            "health": "degraded", "health_reasons": hs2["reasons"]})
+    assert live["health"] == "degraded"
+    print(f"  health flips to degraded on drift; signal gated ✓ ({hs2['reasons'][:1]})")
 
-
-def test_jump_diffusion_component():
-    print("Testing Jump Diffusion detection...")
-    ou = OUPingPong()
-    np.random.seed(42)
-    prices = [100.0]
-    mu = 100.0; theta = 0.1; sigma = 0.2
-    for _ in range(150):
-        dp = theta * (mu - prices[-1]) + np.random.normal(0, sigma)
-        prices.append(prices[-1] + dp)
-    ou.fit(np.array(prices))
-    print(f"Clean fit valid: {ou.is_valid}, upper_band: {ou.ou_upper:.2f}")
-    prices.append(prices[-1] + 5.0)
-    ou.fit(np.array(prices))
-    print(f"Post-jump valid (should be False due to cooldown): {ou.is_valid}")
-    print(f"Jump detected: {ou.jump_detected}, cooldown: {ou.jump_cooldown}")
-    print(f"Jump intensity (lambda): {ou.jump_intensity:.4f}, Jump Mean: {ou.jump_mean:.4f}, Jump Std: {ou.jump_std:.4f}")
-    assert ou.jump_intensity > 0.0
-    assert ou.jump_mean > 0.0
-    sig, sig_type = ou.get_signal(90.0)
-    print(f"Signal during cooldown (should be HOLD): {sig}")
-    assert sig == "HOLD"
-
-
-def test_rough_path_classifier():
-    print("Testing RoughPathClassifier...")
-    clf = RoughPathClassifier(window=14)
-    np.random.seed(42)
-    n = 100
-    closes = 100 + np.cumsum(np.random.normal(0, 0.5, n))
-    sigs = clf._compute_signatures(closes)
-    print(f"Computed signatures shape: {sigs.shape}")
-    assert sigs.shape == (n, 9)
-    df = pd.DataFrame({'close': closes})
-    clf.fit(df)
-    pred = clf.predict(closes)
-    print(f"Predicted direction: {pred}")
-    assert pred in (-1, 0, 1)
-
-
-def test_dynamic_target_optimizer():
-    print("Testing DynamicTargetOptimizer...")
-    dto = DynamicTargetOptimizer()
-    tp, sl = dto.get_optimal_targets("trend", 1.5, default_tp=0.5, default_sl=0.5)
-    print(f"Default targets: tp={tp:.2f}, sl={sl:.2f}")
-    assert tp == 0.5
-    assert sl == 0.5
-    dto.record_trade("trend", 1.0, 1.2, 0.5, 1.0)
-    dto.record_trade("trend", 1.1, 1.0, 0.4, 0.8)
-    dto.record_trade("trend", 0.9, 1.4, 0.6, 1.2)
-    dto.record_trade("trend", 1.0, 1.1, 0.5, 0.9)
-    tp, sl = dto.get_optimal_targets("trend", 1.0)
-    print(f"Optimal targets for vol 1.0: tp={tp:.4f}, sl={sl:.4f}")
-    assert abs(tp - 0.94) < 1e-5
-    assert abs(sl - 0.60) < 1e-5
-
-
-def test_backtester_and_wfo():
-    print("Testing Backtester and BacktestOptimizer...")
-    np.random.seed(42)
-    n = 500
-    closes = 100 + np.cumsum(np.random.normal(0, 0.5, n))
-    highs = closes + np.random.uniform(0.05, 0.2, n)
-    lows = closes - np.random.uniform(0.05, 0.2, n)
-    opens = closes + np.random.uniform(-0.1, 0.1, n)
-    volumes = np.random.uniform(10, 100, n)
-    df = pd.DataFrame({'open': opens, 'high': highs, 'low': lows,
-                       'close': closes, 'volume': volumes})
-    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
-              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
-              "PING_STOP_MULT": 0.5, "TP_PERCENT": 3.0}
-    bt = Backtester(df)
-    report = bt.run(params)
-    print(f"Backtest run complete: Trade Count={report['trade_count']}, Net PnL={report['total_pnl_usdt']:.2f}")
-    assert "trade_count" in report
-    assert "total_pnl_pct" in report
-    assert "total_pnl_usdt" in report
-    assert "profit_factor" in report
-    optimizer = BacktestOptimizer(df)
-    wfo_res = optimizer.run_wfo()
-    print(f"WFO run complete: Challenger={wfo_res['challenger']}, Stability={wfo_res['stability_count']}/10")
-    assert "challenger" in wfo_res
-    assert "stability_count" in wfo_res
 
 
 # ── V3.5 safety/execution tests with a mock CCXT exchange ───────────────────
@@ -6308,14 +5264,13 @@ async def _run_safety_tests_async():
     bot_state["losing_trades"] = 0
 
     print("Testing Spot Long-only restriction:")
+    # Minimal geo-only info contract: a healthy READY pipeline emitting a signal,
+    # with the cost-floored TP/SL the executor reads.
     info = {
-        'signal': 'SELL', 'type': 'Trend', 'gauss_vol': 200.0, 'slow_gauss': 60000.0,
-        'upper_band': 60500.0, 'lower_band': 59500.0, 'is_ranging': False, 'fast_gauss': 60000.0,
-        'sg_list': [60000.0] * 100, 'ub_list': [60500.0] * 100, 'lb_list': [59500.0] * 100,
-        'hyp_direction': 0, 'ou_theta': 0.0, 'ou_mu': 0.0, 'ou_half_life': 999.0,
-        'ou_upper': 0.0, 'ou_lower': 0.0, 'ou_stop_lower': 0.0, 'ou_stop_upper': 0.0,
-        'ou_valid': False, 'ou_jump_intensity': 0.0, 'ou_jump_mean': 0.0,
-        'ou_jump_std': 0.0, 'ou_jump_detected': False, 'ou_jump_cooldown': 0
+        'signal': 'SELL', 'type': 'Geo', 'gauss_vol': 200.0,
+        'geom': {'status': 'ready', 'health': 'ok', 'signal': 'SELL', 'exit_flag': False,
+                 'tp_pct': 1.0, 'sl_pct': 0.5, 'exp_net': 0.5, 'schema': 'test',
+                 'chart': {}},
     }
     df = pd.DataFrame({
         'timestamp': [pd.Timestamp.now()] * 100,
@@ -6334,7 +5289,7 @@ async def _run_safety_tests_async():
     assert not bot.position.is_open, "Error: Opened position on SELL signal!"
 
     print("Testing Paper entry slippage and fee calculation:")
-    info['signal'] = 'BUY'
+    info['signal'] = 'BUY'; info['geom']['signal'] = 'BUY'
     await bot.main_tick()
     print(f"  Position open? {bot.position.is_open} (Expected: True)")
     print(f"  Position mode: {bot.position.mode} (Expected: PAPER)")
@@ -6359,8 +5314,7 @@ async def _run_safety_tests_async():
     mock_ex.balance = {"USDT": {"free": 100.0}}
     bot_state["real_balance"] = 100.0
     bot_state["start_real_balance"] = 100.0
-    info['signal'] = 'BUY'
-    info['type'] = 'Ping'
+    info['signal'] = 'BUY'; info['geom']['signal'] = 'BUY'
     await bot.main_tick()
     print(f"  Position mode: {bot.position.mode} (Expected: REAL)")
     print(f"  Borsa orders count: {len(mock_ex.orders)} (Expected: 2 - 1 entry and 1 stop-loss)")
@@ -6379,7 +5333,7 @@ async def _run_safety_tests_async():
     mock_ex.orders = []
     mock_ex.balance = {"USDT": {"free": 3.0}}
     bot_state["real_balance"] = 3.0
-    info['signal'] = 'BUY'
+    info['signal'] = 'BUY'; info['geom']['signal'] = 'BUY'
     await bot.main_tick()
     print(f"  Position open with low balance? {bot.position.is_open} (Expected: False)")
     assert not bot.position.is_open
@@ -6420,16 +5374,8 @@ def _run_geom_suite():
     test_pipeline_end_to_end()
     test_geometric_backtest_and_purged_wfo()
     test_signal_engine_contract()
+    test_health_monitor_auto_hold()
     print("\nAll V3.6 learned-geometry tests passed!")
-
-
-def _run_components_suite():
-    test_ou_component()
-    test_jump_diffusion_component()
-    test_rough_path_classifier()
-    test_dynamic_target_optimizer()
-    test_backtester_and_wfo()
-    print("All component tests passed!")
 
 
 def _run_safety_suite():
@@ -6439,8 +5385,6 @@ def _run_safety_suite():
 def _run_all_tests():
     _run_geom_suite()
     print()
-    _run_components_suite()
-    print()
     _run_safety_suite()
 
 
@@ -6449,15 +5393,19 @@ bot_instance = None
 def run_bot():
     global bot_instance
     bot_instance = QuantBot()
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     loop = asyncio.new_event_loop()
+    loop.set_default_executor(executor)
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(bot_instance.main_loop())
+    except (RuntimeError, asyncio.CancelledError) as e:
+        log.warning(f"Bot loop ended: {e}")
     except Exception as e:
         log.error(f"Bot main loop error: {e}")
     finally:
         try:
-            # Cancel all pending tasks gracefully
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
@@ -6465,18 +5413,20 @@ def run_bot():
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         except Exception:
             pass
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
         loop.close()
 
 if __name__ == "__main__":
-    # ── CLI: --test / --test-geom / --test-comp / --test-safe run the embedded
-    # test suites and exit. No flag = launch the desktop bot as before.
+    # ── CLI: --test / --test-geom / --test-safe run the embedded test suites
+    # and exit. No flag = launch the desktop bot as before.
     _flags = {a for a in sys.argv[1:] if a.startswith("--")}
     if _flags & {"--test", "--test-all"}:
         _run_all_tests(); sys.exit(0)
     if "--test-geom" in _flags:
         _run_geom_suite(); sys.exit(0)
-    if "--test-comp" in _flags:
-        _run_components_suite(); sys.exit(0)
     if "--test-safe" in _flags:
         _run_safety_suite(); sys.exit(0)
 
@@ -6494,7 +5444,13 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    # Non-daemon: webview kapansa bile bot çalışmaya devam eder
+    bot_thread = threading.Thread(target=run_bot, daemon=False)
     bot_thread.start()
-    webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
-    webview.start()
+    try:
+        webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
+        webview.start()
+    except Exception as e:
+        log.warning(f"Webview error: {e}")
+    # Webview kapansa bile bot_thread bitene kadar bekle
+    bot_thread.join()
