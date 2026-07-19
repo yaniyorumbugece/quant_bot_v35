@@ -69,6 +69,11 @@ OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more vis
 RESEARCH_BARS_DEFAULT = int(os.environ.get("RESEARCH_BARS_DEFAULT", "10000"))
 RESEARCH_BARS_MIN = 3000
 RESEARCH_BARS_MAX = int(os.environ.get("RESEARCH_BARS_MAX", "100000"))
+RESEARCH_PROVIDER_ORDER = tuple(
+    p.strip().lower()
+    for p in os.environ.get("RESEARCH_DATA_PROVIDERS", "binance,bybit,okx,mexc").split(",")
+    if p.strip().lower() in {"binance", "bybit", "okx", "mexc"}
+) or ("binance", "bybit", "okx", "mexc")
 FAST_LENGTH = 8
 SLOW_LENGTH = 21
 VOL_LENGTH = 14
@@ -348,6 +353,7 @@ bot_state = {
     "backtest_bars_used": 0,
     "wfo_bars_requested": RESEARCH_BARS_DEFAULT,
     "wfo_bars_used": 0,
+    "research_data_source": "-",
     "active_parameters": get_active_parameters(),
     "parameters_store": get_all_parameters(),
 
@@ -3021,7 +3027,11 @@ class QuantBot:
         api_secret = os.environ.get("BORSANIN_SECRET_KEY")
         if not api_key or not api_secret: raise RuntimeError("API anahtarlari eksik!")
         self.exchange = ccxt.mexc({'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-        self.public_binance = ccxt.binance({'enableRateLimit': True})  # Added for 10s sub-minute data
+        self.public_binance = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        # Binance publishes a market-data-only endpoint that needs no API key.
+        self.public_binance.urls['api']['public'] = 'https://data-api.binance.vision/api/v3'
+        self.public_binance.urls['api']['v1'] = 'https://data-api.binance.vision/api/v1'
+        self.research_exchanges = {"binance": self.public_binance}
         self.signal_engine = SignalEngine()
         self.position = PositionManager()
         self.telegram = TelegramController(self)
@@ -3186,17 +3196,32 @@ class QuantBot:
         ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, SYMBOL, bot_state["timeframe"], None, OHLCV_LIMIT)
         return pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume']).assign(timestamp=lambda d: pd.to_datetime(d['timestamp'], unit='ms'))
 
-    async def fetch_ohlcv_large(self, symbol, timeframe, limit=RESEARCH_BARS_DEFAULT):
-        """Fetch an arbitrary research window through forward CCXT pagination.
+    def _research_exchange(self, provider):
+        """Return a lazy, public-only CCXT client for research candles."""
+        if provider == "mexc":
+            return self.exchange
+        cache = getattr(self, "research_exchanges", {})
+        if provider in cache:
+            return cache[provider]
+        if provider == "binance":
+            exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+            exchange.urls['api']['public'] = 'https://data-api.binance.vision/api/v3'
+            exchange.urls['api']['v1'] = 'https://data-api.binance.vision/api/v1'
+        elif provider == "bybit":
+            exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        elif provider == "okx":
+            exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        else:
+            raise ValueError(f"Unknown research data provider: {provider}")
+        cache[provider] = exchange
+        self.research_exchanges = cache
+        return exchange
 
-        MEXC caps one response at roughly 1000 candles.  The old five-iteration
-        loop silently capped every request at 5000 bars; this loop derives its page
-        budget from the requested size, de-duplicates exchange boundary candles and
-        stops if the exchange stops advancing the cursor.
-        """
+    async def _fetch_ohlcv_paginated(self, exchange, provider, symbol, timeframe, limit):
+        """Fetch one provider through forward CCXT pagination."""
         target_limit = min(max(int(limit), RESEARCH_BARS_MIN), RESEARCH_BARS_MAX)
         try:
-            tf_ms = int(self.exchange.parse_timeframe(timeframe) * 1000)
+            tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
         except Exception:
             tf_ms = {
                 "1m": 60_000, "5m": 300_000, "15m": 900_000,
@@ -3216,7 +3241,7 @@ class QuantBot:
         for page in range(max_pages):
             try:
                 batch = await asyncio.to_thread(
-                    self.exchange.fetch_ohlcv, symbol, timeframe, cursor, page_size
+                    exchange.fetch_ohlcv, symbol, timeframe, cursor, page_size
                 )
                 if not batch:
                     break
@@ -3227,22 +3252,58 @@ class QuantBot:
                 newest_ts = max(int(row[0]) for row in batch if row)
                 cursor = newest_ts + 1
                 log.info(
-                    f"OHLCV page {page + 1}: {len(candles)}/{target_limit} unique bars"
+                    f"[{provider.upper()}] OHLCV page {page + 1}: "
+                    f"{len(candles)}/{target_limit} unique bars"
                 )
                 if len(candles) >= target_limit or cursor <= previous_cursor or newest_ts >= now_ms - tf_ms:
                     break
             except Exception as e:
-                log.error(f"Error in fetch_ohlcv_large page {page + 1}: {e}")
+                log.error(f"[{provider.upper()}] OHLCV page {page + 1} failed: {e}")
                 raise
 
         ordered = [candles[k] for k in sorted(candles)][-target_limit:]
         if not ordered:
-            raise RuntimeError("No historical OHLCV data was returned by the exchange")
+            raise RuntimeError(f"{provider} returned no historical OHLCV data")
         if len(ordered) < target_limit:
-            log.warning(f"Requested {target_limit} bars but exchange returned {len(ordered)}")
+            log.warning(f"[{provider.upper()}] requested {target_limit}, received {len(ordered)} bars")
         df = pd.DataFrame(ordered, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.attrs["data_source"] = provider
         return df
+
+    async def fetch_ohlcv_large(self, symbol, timeframe, limit=RESEARCH_BARS_DEFAULT):
+        """Fetch free public research data with automatic provider fallback.
+
+        Order execution remains on MEXC. Backtest/WFO candles default to Binance's
+        keyless market-data endpoint, then Bybit and OKX; MEXC is only the last
+        fallback. Provider order can be changed with RESEARCH_DATA_PROVIDERS.
+        """
+        target_limit = min(max(int(limit), RESEARCH_BARS_MIN), RESEARCH_BARS_MAX)
+        errors = []
+        best_partial = None
+        for provider in RESEARCH_PROVIDER_ORDER:
+            try:
+                exchange = self._research_exchange(provider)
+                df = await self._fetch_ohlcv_paginated(
+                    exchange, provider, symbol, timeframe, target_limit
+                )
+                if best_partial is None or len(df) > len(best_partial):
+                    best_partial = df
+                if len(df) >= target_limit:
+                    bot_state["research_data_source"] = provider
+                    log.info(f"Research data source selected: {provider.upper()} ({len(df)} bars)")
+                    return df
+                errors.append(f"{provider}: only {len(df)}/{target_limit} bars")
+            except Exception as e:
+                errors.append(f"{provider}: {e}")
+                log.warning(f"Research provider {provider.upper()} unavailable; trying next source")
+
+        if best_partial is not None and len(best_partial) >= GeometricPipeline.MIN_TRAIN_BARS + 200:
+            provider = best_partial.attrs.get("data_source", "partial")
+            bot_state["research_data_source"] = provider
+            log.warning(f"Using best partial research dataset: {provider} ({len(best_partial)} bars)")
+            return best_partial
+        raise RuntimeError("All public research data providers failed: " + " | ".join(errors))
 
     async def close_position(self, reason, price):
         if not self.position.is_open: return
@@ -4572,7 +4633,7 @@ HTML_TEMPLATE = """
         const box = el('report');
         if(s.wfo_report){
             const w = s.wfo_report; let h = '<div class="accent" style="font-weight:700; margin-bottom:4px;">WFO Sonucu ('+G(w,'engine','-')+')</div>';
-            h += '<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(w,'bars_used',0)+' bar / '+G(w,'model','-')+'</span></div>';
+            h += '<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(w,'bars_used',0)+' bar · '+String(G(w,'data_source','-')).toUpperCase()+' / '+G(w,'model','-')+'</span></div>';
             h += '<div class="kv"><span class="k">Stabilite</span><span class="v">'+G(w,'stability_count',0)+'/'+G(w,'slices_evaluated',0)+'</span></div>';
             h += '<div class="kv"><span class="k">PF Varyans</span><span class="v">'+N(w.variance,4)+'</span></div>';
             const promoted = G(w,'promotion_status','not_promoted')==='auto_promoted';
@@ -4587,7 +4648,7 @@ HTML_TEMPLATE = """
             const r=s.backtest_report;
             if(r.status==='error'){ box.innerHTML='<div class="red">'+G(r,'message','hata')+'</div>'; box.style.display='block'; return; }
             let h='<div class="green" style="font-weight:700; margin-bottom:4px;">Backtest ('+G(r,'engine','-')+')</div>';
-            h+='<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(r,'bars_used',0)+' bar / '+G(r,'model','-')+'</span></div>';
+            h+='<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(r,'bars_used',0)+' bar · '+String(G(r,'data_source','-')).toUpperCase()+' / '+G(r,'model','-')+'</span></div>';
             if(r.schema && r.schema!=='-') h+='<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+r.schema+'</span></div>';
             h+='<div class="kv"><span class="k">İşlem / Kazanç</span><span class="v">'+G(r,'trade_count',0)+' / '+N(r.win_rate,1)+'%</span></div>';
             h+='<div class="kv"><span class="k">Net Kâr</span><span class="v '+(G(r,'total_pnl_usdt',0)>=0?'green':'red')+'">'+(G(r,'total_pnl_usdt',0)>=0?'+':'')+N(r.total_pnl_usdt,2)+' ('+N(r.total_pnl_pct,2)+'%)</span></div>';
@@ -4798,6 +4859,7 @@ def run_backtest_endpoint():
                 df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars))
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
+            data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
             active_params = get_active_parameters()
             # Geometric backtest: train on the first window, trade the purged remainder.
             report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
@@ -4816,6 +4878,7 @@ def run_backtest_endpoint():
                 "engine": report.get("engine", "legacy"),
                 "schema": report.get("schema", "-"),
                 "model": "LightGBM",
+                "data_source": data_source,
                 "bars_requested": requested_bars,
                 "bars_used": int(len(df)),
                 "trades": report["trades"][-10:]
@@ -4863,6 +4926,7 @@ def run_wfo_endpoint():
                 df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars))
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
+            data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
             # Purged walk-forward over the geometric pipeline (warm start +
             # neighbour-fold RKD, geometry schema fixed).
             engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
@@ -4912,6 +4976,7 @@ def run_wfo_endpoint():
                 "improvement_score": float(result.get("improvement_score", 0.0)),
                 "engine": result.get("engine", "legacy-grid"),
                 "model": "LightGBM",
+                "data_source": data_source,
                 "bars_requested": requested_bars,
                 "bars_used": int(len(df)),
                 "schema": result.get("schema", "-"),
@@ -5260,11 +5325,56 @@ def test_large_history_pagination():
 
     holder = type("HistoryHolder", (), {})()
     holder.exchange = PagedExchange()
-    df = asyncio.run(QuantBot.fetch_ohlcv_large(holder, SYMBOL, "1m", 6_000))
+    df = asyncio.run(QuantBot._fetch_ohlcv_paginated(
+        holder, holder.exchange, "test", SYMBOL, "1m", 6_000
+    ))
     assert len(df) == 6_000
     assert df["timestamp"].is_monotonic_increasing
     assert holder.exchange.calls > 5
     print(f"  {len(df)} unique bars in {holder.exchange.calls} pages ✓")
+
+
+def test_research_provider_fallback():
+    print("Testing automatic public-data fallback after a provider rejection...")
+    global RESEARCH_PROVIDER_ORDER
+
+    class FailingExchange:
+        def parse_timeframe(self, timeframe): return 60
+        def fetch_ohlcv(self, *args, **kwargs):
+            raise RuntimeError("simulated provider range rejection")
+
+    class WorkingExchange:
+        def __init__(self):
+            tf_ms = 60_000
+            end = int(datetime.now().timestamp() * 1000) // tf_ms * tf_ms
+            start = end - 3_050 * tf_ms
+            self.rows = [[start + i * tf_ms, 100, 101, 99, 100, 10] for i in range(3_050)]
+        def parse_timeframe(self, timeframe): return 60
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            return [row for row in self.rows if row[0] >= since][:limit]
+
+    class FallbackHolder:
+        def __init__(self):
+            self.exchanges = {"mexc": FailingExchange(), "binance": WorkingExchange()}
+        def _research_exchange(self, provider):
+            return self.exchanges[provider]
+        async def _fetch_ohlcv_paginated(self, exchange, provider, symbol, timeframe, limit):
+            return await QuantBot._fetch_ohlcv_paginated(
+                self, exchange, provider, symbol, timeframe, limit
+            )
+
+    previous_order = RESEARCH_PROVIDER_ORDER
+    RESEARCH_PROVIDER_ORDER = ("mexc", "binance")
+    try:
+        df = asyncio.run(QuantBot.fetch_ohlcv_large(
+            FallbackHolder(), SYMBOL, "1m", 3_000
+        ))
+        assert len(df) == 3_000
+        assert df.attrs["data_source"] == "binance"
+        assert bot_state["research_data_source"] == "binance"
+        print("  rejected MEXC -> BINANCE fallback selected ✓")
+    finally:
+        RESEARCH_PROVIDER_ORDER = previous_order
 
 
 def test_backtest_endpoint_repeatability():
@@ -5691,6 +5801,7 @@ def _run_geom_suite():
     test_cluster_and_graph()
     test_gbm_learner()
     test_large_history_pagination()
+    test_research_provider_fallback()
     test_backtest_endpoint_repeatability()
     test_meta_and_conformal()
     test_barrier_directional()
