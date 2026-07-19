@@ -41,6 +41,14 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template_string
 import webview
 
+# Optional: real LightGBM for the decision classifier. If not installed, the
+# pure-NumPy PureGradientBoosting is used automatically (single-file portable).
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except Exception:
+    HAS_LIGHTGBM = False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -127,6 +135,8 @@ DEFAULT_TRADING_CONFIG = {
     "recon_regress_max": 2.5,      # held-out recon may not exceed this × baseline
     # ── Genel ──
     "loop_interval_sec": 10,       # main decision loop cadence
+    # ── Backtest & WFO ──
+    "backtest_bars": 20000,        # historical bars fetched for Backtest / WFO runs
 }
 
 # Metadata for the UI: label, group, unit, min, max, step, and whether the change
@@ -153,6 +163,7 @@ TRADING_CONFIG_META = {
     "d_anchor_drift_max":  ("D_anchor Drift Maks.", "Sağlık Eşikleri", "", 0.1, 2.0, 0.05, "live"),
     "recon_regress_max":   ("Recon Regres. Maks.", "Sağlık Eşikleri", "×", 1.5, 10.0, 0.5, "live"),
     "loop_interval_sec":   ("Döngü Aralığı", "Genel", "sn", 2, 120, 1, "live"),
+    "backtest_bars":       ("Geçmiş Bar Sayısı", "Backtest & WFO", "bar", 1000, 100000, 1000, "live"),
 }
 
 def _coerce_cfg(cfg):
@@ -1573,6 +1584,66 @@ class PureGradientBoosting:
         return float((np.sum(ranks[pos]) - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
+class _ConstantProbaModel:
+    """Degenerate-label stand-in (all-0 or all-1 y): both LightGBM and the
+    pure-NumPy booster need at least two classes to fit; this keeps the
+    .fit/.predict_proba contract intact without a spurious trained model."""
+    def __init__(self, p):
+        self.p = float(np.clip(p, 1e-3, 1 - 1e-3))
+    def fit(self, X, y):
+        return self
+    def predict_proba(self, X):
+        return np.full(X.shape[0], self.p)
+
+
+class _LightGBMClassifier:
+    """Thin wrapper around lightgbm's native Booster API (lgb.train /
+    Booster.predict — NOT the sklearn wrapper, so this needs only the
+    `lightgbm` package, not scikit-learn too) exposing the same
+    .fit(X,y)->self / .predict_proba(X)->P(y=1) contract as
+    PureGradientBoosting, so callers never need to know which backend is
+    active. Falls back to a constant-probability stub on degenerate labels
+    (LightGBM's binary objective requires two classes; the NumPy booster
+    tolerates a single class, so behaviour must match regardless of backend)."""
+    def __init__(self, n_trees=40, depth=3, lr=0.1, min_leaf=20, seed=42):
+        self.n_trees, self.depth, self.lr, self.min_leaf, self.seed = n_trees, depth, lr, min_leaf, seed
+        self.booster = None
+        self.const = None
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=float)
+        if len(np.unique(y)) < 2:
+            self.const = _ConstantProbaModel(y.mean() if len(y) else 0.5)
+            return self
+        params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "max_depth": self.depth, "num_leaves": max(2, 2 ** self.depth),
+            "learning_rate": self.lr, "min_child_samples": max(1, self.min_leaf),
+            "verbosity": -1, "seed": self.seed, "deterministic": True,
+            "force_col_wise": True,
+        }
+        train_set = lgb.Dataset(X, label=y)
+        self.booster = lgb.train(params, train_set, num_boost_round=self.n_trees)
+        return self
+
+    def predict_proba(self, X):
+        if self.const is not None:
+            return self.const.predict_proba(X)
+        if self.booster is None:
+            return np.full(X.shape[0], 0.5)
+        return np.asarray(self.booster.predict(X))
+
+
+def make_classifier(n_trees=40, depth=3, lr=0.1, min_leaf=20, seed=42):
+    """Factory for the decision-layer classifier: real LightGBM when the
+    package is installed, otherwise the dependency-free NumPy booster. Both
+    backends expose the identical .fit(X,y)->self / .predict_proba(X)
+    contract, so GeometricPipeline never branches on which one is active."""
+    if HAS_LIGHTGBM:
+        return _LightGBMClassifier(n_trees=n_trees, depth=depth, lr=lr, min_leaf=min_leaf, seed=seed)
+    return PureGradientBoosting(n_trees=n_trees, depth=depth, lr=lr, min_leaf=min_leaf, seed=seed)
+
+
 class MetaLabeler:
     """
     Meta labeling: logistic model estimating P(primary signal wins the barrier race
@@ -2095,7 +2166,7 @@ class GeometricPipeline:
             if len(cols) == 0:
                 stab[f"{gname}_auc"] = 0.5
                 continue
-            gb = PureGradientBoosting(n_trees=18, depth=2, seed=self.seed)
+            gb = make_classifier(n_trees=18, depth=2, seed=self.seed)
             gb.fit(Xf[tr_mask][:, cols], y[tr_mask])
             va = usable & (np.arange(T) >= cal_start)
             stab[f"{gname}_auc"] = PureGradientBoosting.auc(y[va], gb.predict_proba(Xf[va][:, cols])) if np.any(va) else 0.5
@@ -2104,8 +2175,8 @@ class GeometricPipeline:
             if stab.get(f"{gname}_auc", 0.5) < 0.47:
                 self.feature_mask[np.where(np.concatenate([gmask, np.zeros(Xf.shape[1] - n_innov, dtype=bool)]))[0]] = False
 
-        # main classifier (LightGBM slot) — predicts P(up)
-        self.gbm = PureGradientBoosting(n_trees=40, depth=3, seed=self.seed)
+        # main classifier: real LightGBM when installed, NumPy fallback otherwise
+        self.gbm = make_classifier(n_trees=40, depth=3, seed=self.seed)
         self.gbm.fit(Xf[tr_mask][:, self.feature_mask], y[tr_mask])
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
         # symmetric directional thresholds: long if p_up high, short if p_up low
@@ -2195,6 +2266,7 @@ class GeometricPipeline:
             "lambda_l1": encoder.lambdas["l1"],
             "n_episodes": int(len([1 for f_ in np.diff(flags.astype(int)) if f_ == 1]) + (1 if flags[0] else 0)),
             "schema": self.schema.label(),
+            "gbm_engine": "lightgbm" if HAS_LIGHTGBM else "numpy",
         }
         self.diagnostics.append(diag_entry)
 
@@ -2224,14 +2296,21 @@ class GeometricPipeline:
         hist = store.get("schemas", {}).get(self.timeframe, [])
         return (hist[-1]["version"] + 1) if hist else 1
 
-    def _barrier_pcts(self, vol, vidx):
+    def _barrier_pcts(self, vol, vidx, tp_base_override=None):
         """Cost-floored, volatility-scaled barrier targets per bar (percent).
 
         TP must clear the cost wall with room to spare (≥ 3× roundtrip) or track the
         realized vol of the barrier horizon; SL risks less than the target so the
         payoff matrix can be positive at achievable hit rates.
-        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
-        base_tp = float(cfg("tp_base_pct"))
+        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors.
+
+        tp_base_override: used by PurgedWalkForwardEngine to grid-search the base
+        TP% WITHOUT mutating the process-global trading config — the live bot's
+        on_bar() reads the same global cfg() concurrently in another thread, so
+        temporarily overwriting CFG here would leak a backtest value into a real
+        trade for the duration of the search. Passing an explicit value keeps the
+        search thread-local and read-only with respect to the global config."""
+        base_tp = float(tp_base_override) if tp_base_override is not None else float(cfg("tp_base_pct"))
         cost = self.cost_pct
         hold = int(cfg("barrier_hold_bars"))
         tp_floor = float(cfg("tp_cost_floor_mult"))
@@ -2252,8 +2331,9 @@ class GeometricPipeline:
                                xin_row[:8]])
 
     # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
-    def batch_signals(self, df, start_at=0, precomputed=None):
-        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t."""
+    def batch_signals(self, df, start_at=0, precomputed=None, tp_base_override=None):
+        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t.
+        tp_base_override: see _barrier_pcts — thread-safe grid search knob."""
         n = len(df)
         out = {
             "signal": np.array(["HOLD"] * n, dtype=object),
@@ -2279,7 +2359,7 @@ class GeometricPipeline:
         Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
                                                        fit_mode=False, closes=closes)
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
-        tp_arr, sl_arr = self._barrier_pcts(vol, vidx)
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx, tp_base_override=tp_base_override)
         a_gate = self.conformal.a_min if self.conformal else 0.5
         cost = self.cost_pct
         for t in range(len(vidx)):
@@ -2529,14 +2609,16 @@ class PurgedWalkForwardEngine:
             return ({k: (v[:upto] if isinstance(v, np.ndarray) else v) for k, v in vol.items()},
                     {r: sigs[r][:upto] for r in GEOM_RESOLUTIONS}, valid[:upto])
 
-        base = get_active_parameters()
-        combos = []
-        for tp in (0.6, 1.0, 1.6):
-            for tm in (2.0, 3.0, 4.0):
-                cmb = dict(base)
-                cmb["TP_PERCENT"] = tp
-                cmb["TRAIL_MULT"] = tm
-                combos.append(cmb)
+        # Grid over the two knobs that actually govern live trading now (both
+        # exposed, editable and persisted in trading_config.json): the base TP%
+        # fed into the cost-floored/vol-scaled barrier target, and the trailing
+        # -stop distance multiplier. tp_base_pct is varied via batch_signals'
+        # tp_base_override (thread-safe — see _barrier_pcts) so it never touches
+        # the global CFG the live bot reads concurrently; trail_mult is varied
+        # for free inside Backtester.run on the same geo array.
+        tp_grid = (0.4, 0.7, 1.2)
+        trail_grid = (2.0, 3.0, 4.0)
+        combos = [{"tp_base_pct": tp, "TRAIL_MULT": tm} for tp in tp_grid for tm in trail_grid]
 
         fold_results = {i: [] for i in range(len(combos))}
         prev_encoder = None
@@ -2554,15 +2636,18 @@ class PurgedWalkForwardEngine:
             prev_encoder = pipeline.encoder
             prev_std = pipeline._prev_standardize
 
-            geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
-                                              precomputed=pre_slice(oos_end))
             oos_df = df.iloc[oos_start:oos_end].reset_index(drop=True)
-            geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
-                   for kk, vv in geo_full.items()}
-            for ci, cmb in enumerate(combos):
-                res = Backtester(oos_df).run(cmb, geo=geo)
-                fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
-                                         "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
+            for ti, tp_val in enumerate(tp_grid):
+                geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
+                                                  precomputed=pre_slice(oos_end),
+                                                  tp_base_override=tp_val)
+                geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
+                       for kk, vv in geo_full.items()}
+                for tri, tm_val in enumerate(trail_grid):
+                    ci = ti * len(trail_grid) + tri
+                    res = Backtester(oos_df).run({"TRAIL_MULT": tm_val}, geo=geo)
+                    fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
+                                             "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
 
         best_ci, best_stable, best_var = 0, -1, float("inf")
         for ci in fold_results:
@@ -2572,7 +2657,11 @@ class PurgedWalkForwardEngine:
             var = float(np.std(pfs)) if pfs else 0.0
             if stable > best_stable or (stable == best_stable and var < best_var):
                 best_ci, best_stable, best_var = ci, stable, var
-        challenger = dict(combos[best_ci])
+        # normalize to the CFG key shape — this is what /api/promote_challenger
+        # feeds straight into save_trading_config(), so "optimal parameters"
+        # found here actually become the live trading_config.json values.
+        best_combo = combos[best_ci]
+        challenger = {"tp_base_pct": best_combo["tp_base_pct"], "trail_mult": best_combo["TRAIL_MULT"]}
         # overfitting readout: mean primary-model IS→OOS AUC gap across folds
         gaps = [d.get("overfit_gap", 0.0) for d in pipeline.diagnostics]
         oos_aucs = [d.get("oos_auc", 0.5) for d in pipeline.diagnostics]
@@ -2692,8 +2781,6 @@ class PositionManager:
     def is_open(self): return self.side is not None
 
     def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0, min_trail_dist=0.0):
-        if params is None:
-            params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
         self.invested_amount = invested_amount
         self.has_taken_partial_tp = False
@@ -2711,8 +2798,12 @@ class PositionManager:
         # the stops inside the cost wall (used by learned-geometry entries)
         self.min_trail_dist = float(min_trail_dist)
 
-        self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
-        self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
+        # `params` is accepted for test-call compatibility but no longer the
+        # source of truth: trail_mult is the single, live, UI-editable value
+        # in trading_config.json (see cfg()) so WFO-promote and manual edits
+        # both take effect the same way.
+        self.trail_mult = float(params["TRAIL_MULT"]) if params and "TRAIL_MULT" in params else float(cfg("trail_mult"))
+        self.ping_stop_mult = 0.5
 
         trail_dist = max(gauss_vol*self.trail_mult, self.min_trail_dist)
         if side == "long":
@@ -3090,6 +3181,11 @@ class QuantBot:
         return pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume']).assign(timestamp=lambda d: pd.to_datetime(d['timestamp'], unit='ms'))
 
     async def fetch_ohlcv_large(self, symbol, timeframe, limit=3000):
+        """Pages through the exchange's OHLCV endpoint (1000 bars/call) until
+        `limit` bars are collected or the exchange runs out of history. The
+        page cap scales with the request so large backtests (tens of
+        thousands of bars) aren't silently truncated to the old fixed 5-page
+        (5000-bar) ceiling."""
         all_ohlcv = []
         target_limit = limit
         tf_ms = 60 * 1000  # 1m default
@@ -3100,14 +3196,17 @@ class QuantBot:
 
         now_ms = int(datetime.now().timestamp() * 1000)
         since = now_ms - (target_limit * tf_ms)
+        max_pages = max(5, math.ceil(target_limit / 1000) + 2)
 
-        for _ in range(5):
+        for page in range(max_pages):
             try:
                 batch = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, timeframe, since, 1000)
                 if not batch:
                     break
                 all_ohlcv.extend(batch)
                 all_ohlcv = sorted({x[0]: x for x in all_ohlcv}.values(), key=lambda x: x[0])
+                if page % 10 == 0 or len(all_ohlcv) >= target_limit:
+                    log.info(f"fetch_ohlcv_large: {len(all_ohlcv)}/{target_limit} bars fetched (page {page+1}/{max_pages})")
                 if len(all_ohlcv) >= target_limit:
                     break
                 since = all_ohlcv[-1][0] + tf_ms
@@ -3215,14 +3314,12 @@ class QuantBot:
             bot_state["timeframe_changed"] = False
             force_retrain = True
 
-        active_params = get_active_parameters()
-        bot_state["active_parameters"] = active_params
-        
-        trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
+        trail_mult = float(cfg("trail_mult"))
+        bot_state["active_parameters"] = {"TRAIL_MULT": trail_mult}  # legacy display key, kept for API compat
 
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
-        info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
+        info = self.signal_engine.process(df_completed, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
         geom = info.get("geom", {}) or {}
         log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), "
@@ -3938,6 +4035,8 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quant Bot V3.6 — Learned Geometry</title>
+    <link rel="icon" href="data:,">
+
     <script src="/static/lightweight-charts.js"></script>
     <style>
         :root{
@@ -4103,6 +4202,7 @@ HTML_TEMPLATE = """
                 <div class="kv"><span class="k">η · P(δ≠0)</span><span class="v" id="g-eta">-</span></div>
                 <div class="kv"><span class="k">Epizot</span><span class="v" id="g-ep">NORMAL</span></div>
                 <div class="kv"><span class="k">p GBM / Meta</span><span class="v" id="g-p">- / -</span></div>
+                <div class="kv"><span class="k">GBM Motoru</span><span class="v" id="g-engine">-</span></div>
                 <div class="kv"><span class="k">Conformal A</span><span class="v" id="g-a">-</span></div>
                 <div class="kv"><span class="k">E[net] · TP/SL</span><span class="v" id="g-en">-</span></div>
                 <div class="kv"><span class="k">D_anchor · Fold</span><span class="v" id="g-da">-</span></div>
@@ -4145,7 +4245,7 @@ HTML_TEMPLATE = """
                 <h4>Backtest & Purged WFO</h4>
                 <div class="kv"><span class="k">Challenger</span><span class="v accent" id="chal">Yok</span></div>
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
-                    <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır (3000b)</button>
+                    <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır</button>
                     <button class="btn btn-ghost" id="wfo-btn" onclick="runWFO()">Purged WFO Çalıştır</button>
                     <button class="btn btn-start" id="promo-btn" style="display:none;" onclick="promote()">Challenger'ı Yükselt</button>
                 </div>
@@ -4212,7 +4312,11 @@ HTML_TEMPLATE = """
     function runWFO(){ fetch('/api/run_wfo',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
     function promote(){
         if(!confirm('Challenger parametrelerini şampiyon (canlı) yapmak istiyor musunuz?')) return;
-        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.status==='success'?'Yükseltildi!':'Hata: '+(d.message||'')); refresh(); }).catch(()=>{});
+        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{
+            alert(d.status==='success'?'Yükseltildi! Yeni parametreler: '+JSON.stringify(d.parameters||{}):'Hata: '+(d.message||''));
+            loadConfig();   // Trading Parameters panel must reflect the promoted values immediately
+            refresh();
+        }).catch(()=>{});
     }
 
     // ── Trading Parameters panel ──
@@ -4353,10 +4457,11 @@ HTML_TEMPLATE = """
         el('chal').className = 'v ' + (chal?'accent':'muted');
         const promo = el('promo-btn');
         promo.style.display = (chal && !s.position_side) ? 'block' : 'none';
+        const barsLabel = (cfgOriginal && cfgOriginal.backtest_bars) ? (Math.round(cfgOriginal.backtest_bars/1000)+'k bar') : '';
         el('bt-btn').disabled = !!s.backtest_running;
-        el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : 'Backtest Çalıştır (3000b)';
+        el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : ('Backtest Çalıştır' + (barsLabel?' ('+barsLabel+')':''));
         el('wfo-btn').disabled = !!s.wfo_running;
-        el('wfo-btn').textContent = s.wfo_running ? 'WFO çalışıyor...' : 'Purged WFO Çalıştır';
+        el('wfo-btn').textContent = s.wfo_running ? 'WFO çalışıyor...' : ('Purged WFO Çalıştır' + (barsLabel?' ('+barsLabel+')':''));
         renderReport(s);
 
         // trades
@@ -4398,6 +4503,9 @@ HTML_TEMPLATE = """
         setText('g-ep', inEp ? ('EPİZOT'+(G(g,'cluster',-1)>=0?(' A'+g.cluster):'')) : 'NORMAL');
         el('g-ep').className = 'v ' + (inEp?'yellow':'green');
         setText('g-p', N(g.p_gbm,2)+' / '+N(g.p_meta,2));
+        const eng = gd.gbm_engine;
+        setText('g-engine', eng==='lightgbm' ? 'LightGBM' : (eng==='numpy' ? 'NumPy (fallback)' : '-'));
+        el('g-engine').className = 'v ' + (eng==='lightgbm' ? 'cyan' : 'muted');
         const aOk = G(g,'a_score',0) >= G(g,'a_gate',0.5);
         setText('g-a', N(g.a_score,2)+' (kapı '+N(g.a_gate,2)+')');
         el('g-a').className = 'v ' + (aOk?'green':'muted');
@@ -4617,21 +4725,29 @@ def run_backtest_endpoint():
         try:
             log.info("Backtest worker thread started. Fetching historical OHLCV data...")
             bot_state["backtest_running"] = True
+            # Clear BOTH report slots: whichever run finishes last is what the
+            # panel should show. Leaving the other stale meant re-running a
+            # Backtest after an earlier WFO (or vice versa) looked like the
+            # button "stopped working" — the UI kept displaying the old report.
             bot_state["backtest_report"] = None
-            
+            bot_state["wfo_report"] = None
+
             loop = bot_state.get("loop")
             if loop:
                 future = asyncio.run_coroutine_threadsafe(
-                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000),
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))),
                     loop
                 )
                 df = future.result()
             else:
                 import asyncio as local_asyncio
-                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000))
-                
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))))
+
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
-            active_params = get_active_parameters()
+            # TRAIL_MULT is the only params-dict key Backtester still reads (TP/SL
+            # come from the geometry pipeline's cost-floored barrier targets);
+            # source it from the live, UI-editable trading config.
+            active_params = {"TRAIL_MULT": float(cfg("trail_mult"))}
             # Geometric backtest: train on the first window, trade the purged remainder.
             report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
             log.info(f"Backtest simulation completed ({report.get('engine','geometric')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
@@ -4669,19 +4785,21 @@ def run_wfo_endpoint():
         try:
             log.info("WFO worker thread started. Fetching historical OHLCV data...")
             bot_state["wfo_running"] = True
+            # Clear BOTH report slots — see the matching comment in /api/backtest.
             bot_state["wfo_report"] = None
-            
+            bot_state["backtest_report"] = None
+
             loop = bot_state.get("loop")
             if loop:
                 future = asyncio.run_coroutine_threadsafe(
-                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000),
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))),
                     loop
                 )
                 df = future.result()
             else:
                 import asyncio as local_asyncio
-                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], 3000))
-                
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))))
+
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
             # Purged walk-forward over the geometric pipeline (warm start +
             # neighbour-fold RKD, geometry schema fixed).
@@ -4690,9 +4808,10 @@ def run_wfo_endpoint():
             log.info(f"WFO completed ({result.get('engine','geometric-purged-wfo')}). Challenger: {result['challenger']}, "
                      f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
 
+            # challenger is {"tp_base_pct": ..., "trail_mult": ...} — the exact
+            # keys /api/promote_challenger writes into trading_config.json, so
+            # "optimal parameters" found here are the ones the live bot reads.
             challenger = result["challenger"]
-            if challenger:
-                challenger = {k: v for k, v in challenger.items() if not k.startswith("slice_")}
 
             p_store = get_all_parameters()
             p_store["shadow_challenger"] = challenger
@@ -4738,32 +4857,36 @@ def promote_challenger_endpoint():
         shadow = p_store.get("shadow_challenger")
         if not shadow:
             return jsonify({"status": "error", "message": "Aktif Challenger parametresi bulunamadı!"}), 400
-            
+
+        # Apply the WFO winner into the SAME live config the Trading Parameters
+        # panel edits — this is what makes "promote" actually change behaviour,
+        # instead of writing into a store nothing reads anymore.
+        patch = {k: v for k, v in shadow.items() if k in DEFAULT_TRADING_CONFIG}
+        new_cfg = save_trading_config(patch)
+
         p_store["history"].append({
             "version": p_store.get("active_version", 1),
-            "parameters": p_store.get("champion"),
-            "retired_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "parameters": shadow,
+            "promoted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
-        p_store["champion"] = shadow
         p_store["shadow_challenger"] = None
         p_store["active_version"] = p_store.get("active_version", 1) + 1
-        
+
         with open(PARAMETERS_STORE_PATH, "w", encoding="utf-8") as f:
             import json
             json.dump(p_store, f, indent=4)
-            
+
         bot_state["parameters_store"] = p_store
-        bot_state["active_parameters"] = shadow
-        
+
         msg = (
-            f"🔄 *CHALLENGER PARAMETRESİ ŞAMPİYON YAPILDI!*\n\n"
-            f"📈 *Yeni Versiyon:* v{p_store['active_version']}\n"
-            f"Parameters: {shadow}"
+            f"🔄 *CHALLENGER PARAMETRELERİ UYGULANDI!*\n\n"
+            f"📈 *Versiyon:* v{p_store['active_version']}\n"
+            f"Parametreler: {patch}"
         )
         if bot_state.get("loop"):
             asyncio.run_coroutine_threadsafe(bot_instance.telegram.send_message(msg), bot_state["loop"])
-            
-        return jsonify({"status": "success", "parameters": shadow})
+
+        return jsonify({"status": "success", "parameters": patch, "config": new_cfg})
     except Exception as e:
         log.error(f"Error promoting challenger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -5043,6 +5166,30 @@ def test_gbm_learner():
     assert np.all((p > 0) & (p < 1))
 
 
+def test_classifier_factory():
+    print(f"Testing make_classifier factory (HAS_LIGHTGBM={HAS_LIGHTGBM})...")
+    rng = np.random.default_rng(7)
+    X = rng.normal(0, 1, (500, 6))
+    y = ((X[:, 0] - 0.3 * X[:, 2] + 0.1 * rng.normal(size=500)) > 0).astype(float)
+    clf = make_classifier(n_trees=25, depth=3, seed=7)
+    if HAS_LIGHTGBM:
+        assert isinstance(clf, _LightGBMClassifier), "factory must pick LightGBM when installed"
+    else:
+        assert isinstance(clf, PureGradientBoosting), "factory must fall back to the NumPy booster"
+    clf.fit(X[:380], y[:380])
+    p = clf.predict_proba(X[380:])
+    assert p.shape == (120,) and np.all((p >= 0) & (p <= 1))
+    auc = PureGradientBoosting.auc(y[380:], p)
+    print(f"  backend={'lightgbm' if HAS_LIGHTGBM else 'numpy'} holdout AUC={auc:.3f}")
+    assert auc > 0.7
+    # degenerate labels (single class) must not raise on either backend
+    deg = make_classifier(n_trees=10, depth=2, seed=7)
+    deg.fit(X[:50], np.zeros(50))
+    pd_ = deg.predict_proba(X[50:60])
+    assert np.all((pd_ >= 0) & (pd_ <= 1)) and not np.any(np.isnan(pd_))
+    print("  degenerate-label guard OK on both backends ✓")
+
+
 def test_meta_and_conformal():
     print("Testing meta labeling + conformal gate...")
     closes = np.array([100.0, 100.2, 100.5, 100.1, 99.4, 99.0, 101.0, 102.0])
@@ -5210,9 +5357,7 @@ def test_pipeline_end_to_end():
 def test_geometric_backtest_and_purged_wfo():
     print("Testing run_geometric_backtest + PurgedWalkForwardEngine...")
     df = _make_synth_df(1250, seed=7)
-    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
-              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
-              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    params = {"TRAIL_MULT": 3.0}
     rep = run_geometric_backtest(df, params, timeframe="1m")
     assert rep["engine"] == "geometric"
     assert rep["train_bars"] > 0 and "schema" in rep
@@ -5221,7 +5366,12 @@ def test_geometric_backtest_and_purged_wfo():
     res = eng.run()
     assert res["engine"] == "geometric-purged-wfo"
     assert res["slices_evaluated"] == 3
-    assert res["challenger"] is not None and "TP_PERCENT" in res["challenger"]
+    # challenger keys must match what /api/promote_challenger writes straight
+    # into trading_config.json — this IS the "WFO updates optimal parameters" contract.
+    assert res["challenger"] is not None
+    assert "tp_base_pct" in res["challenger"] and "trail_mult" in res["challenger"]
+    assert res["challenger"]["tp_base_pct"] in (0.4, 0.7, 1.2)
+    assert res["challenger"]["trail_mult"] in (2.0, 3.0, 4.0)
     assert len(res["diagnostics"]) >= 2
     versions = {d["schema"] for d in res["diagnostics"]}
     assert len(versions) == 1, "geometry schema must stay fixed across folds"
@@ -5424,6 +5574,7 @@ def _run_geom_suite():
     test_episode_hysteresis()
     test_cluster_and_graph()
     test_gbm_learner()
+    test_classifier_factory()
     test_meta_and_conformal()
     test_barrier_directional()
     test_two_sided_and_short_gate()

@@ -9,4 +9,5 @@ build/
 
 trading_config.json
 geometry_store.json
+parameters_store.json
 logs/
