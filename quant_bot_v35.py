@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  QUANT BOT V3.6 — LEARNED GEOMETRY (nihai mimari)                          ║
+║  QUANT BOT V3.7 — LIGHTGBM RESEARCH ENGINE                                 ║
 ║  MEXC Spot · PyWebView arayüz · Scale-Out (70/30) + MTF Trailing           ║
 ║                                                                            ║
 ║  Çekirdek: Vol-Norm → Multi-res Paths (5/15/30/60 dyadik) → Chen İmzaları  ║
@@ -37,17 +37,13 @@ import numpy as np
 import pandas as pd
 import ccxt
 import requests
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template_string
 import webview
-
-# Optional: real LightGBM for the decision classifier. If not installed, the
-# pure-NumPy PureGradientBoosting is used automatically (single-file portable).
-try:
-    import lightgbm as lgb
-    HAS_LIGHTGBM = True
-except Exception:
-    HAS_LIGHTGBM = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,7 +56,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(LOG_DIR / f"bot_v3.5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", encoding="utf-8")
+        logging.FileHandler(LOG_DIR / f"bot_v3.7_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", encoding="utf-8")
     ]
 )
 log = logging.getLogger("QuantBot")
@@ -70,6 +66,14 @@ log = logging.getLogger("QuantBot")
 # ═══════════════════════════════════════════════════════════════════════════════
 SYMBOL = "BTC/USDT"
 OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more visible history
+RESEARCH_BARS_DEFAULT = int(os.environ.get("RESEARCH_BARS_DEFAULT", "10000"))
+RESEARCH_BARS_MIN = 3000
+RESEARCH_BARS_MAX = int(os.environ.get("RESEARCH_BARS_MAX", "100000"))
+RESEARCH_PROVIDER_ORDER = tuple(
+    p.strip().lower()
+    for p in os.environ.get("RESEARCH_DATA_PROVIDERS", "binance,bybit,okx,mexc").split(",")
+    if p.strip().lower() in {"binance", "bybit", "okx", "mexc"}
+) or ("binance", "bybit", "okx", "mexc")
 FAST_LENGTH = 8
 SLOW_LENGTH = 21
 VOL_LENGTH = 14
@@ -135,8 +139,6 @@ DEFAULT_TRADING_CONFIG = {
     "recon_regress_max": 2.5,      # held-out recon may not exceed this × baseline
     # ── Genel ──
     "loop_interval_sec": 10,       # main decision loop cadence
-    # ── Backtest & WFO ──
-    "backtest_bars": 20000,        # historical bars fetched for Backtest / WFO runs
 }
 
 # Metadata for the UI: label, group, unit, min, max, step, and whether the change
@@ -163,7 +165,6 @@ TRADING_CONFIG_META = {
     "d_anchor_drift_max":  ("D_anchor Drift Maks.", "Sağlık Eşikleri", "", 0.1, 2.0, 0.05, "live"),
     "recon_regress_max":   ("Recon Regres. Maks.", "Sağlık Eşikleri", "×", 1.5, 10.0, 0.5, "live"),
     "loop_interval_sec":   ("Döngü Aralığı", "Genel", "sn", 2, 120, 1, "live"),
-    "backtest_bars":       ("Geçmiş Bar Sayısı", "Backtest & WFO", "bar", 1000, 100000, 1000, "live"),
 }
 
 def _coerce_cfg(cfg):
@@ -243,7 +244,7 @@ def get_active_parameters():
         "MIN_PROFIT_MARGIN": 0.3,
         "TRAIL_MULT": 3.0,
         "PING_STOP_MULT": 0.5,
-        "TP_PERCENT": 3.0
+        "TP_PERCENT": 0.6
     }
 
 def get_all_parameters():
@@ -260,6 +261,34 @@ def get_all_parameters():
         "shadow_challenger": None,
         "history": []
     }
+
+def save_parameters_store(store):
+    """Atomically persist the champion/challenger ledger."""
+    import json
+    tmp_path = PARAMETERS_STORE_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=4)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, PARAMETERS_STORE_PATH)
+
+def promote_parameter_set(store, parameters, source="manual"):
+    """Archive the current champion and activate a validated parameter set."""
+    promoted = dict(parameters or {})
+    store.setdefault("history", []).append({
+        "version": store.get("active_version", 1),
+        "parameters": store.get("champion"),
+        "retired_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+    })
+    store["champion"] = promoted
+    store["shadow_challenger"] = None
+    store["active_version"] = store.get("active_version", 1) + 1
+    store["last_promotion"] = {
+        "source": source,
+        "promoted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return store
 
 bot_state = {
     "is_trading_active": False,
@@ -320,6 +349,11 @@ bot_state = {
     "wfo_running": False,
     "backtest_report": None,
     "backtest_running": False,
+    "backtest_bars_requested": RESEARCH_BARS_DEFAULT,
+    "backtest_bars_used": 0,
+    "wfo_bars_requested": RESEARCH_BARS_DEFAULT,
+    "wfo_bars_used": 0,
+    "research_data_source": "-",
     "active_parameters": get_active_parameters(),
     "parameters_store": get_all_parameters(),
 
@@ -1497,81 +1531,83 @@ class TransitionGraph:
         return 3 + self.k
 
 
-class PureGradientBoosting:
+class LightGBMModel:
+    """Small adapter around the real LightGBM binary classifier.
+
+    The rest of the geometry pipeline expects a one-dimensional P(up) array, while
+    LightGBM follows the sklearn convention and returns [P(0), P(1)].  Keeping the
+    conversion here makes the model swap explicit and prevents an accidental return
+    to the old in-file gradient-boosting approximation.
     """
-    LightGBM-style gradient boosted trees (binary logistic), dependency-free NumPy
-    implementation (drops in for LightGBM in this box of the architecture; the
-    real library is used instead when installed).
-    """
 
-    def __init__(self, n_trees=40, depth=3, lr=0.1, min_leaf=20, n_bins=24, seed=42):
-        self.n_trees = n_trees
-        self.depth = depth
-        self.lr = lr
-        self.min_leaf = min_leaf
-        self.n_bins = n_bins
-        self.seed = seed
-        self.trees = []
-        self.f0 = 0.0
+    def __init__(self, n_trees=120, depth=4, lr=0.05, min_leaf=20, n_bins=255, seed=42):
+        if lgb is None:
+            raise RuntimeError(
+                "LightGBM is required. Install it with: pip install lightgbm>=4.0,<5"
+            )
+        self.n_trees = int(n_trees)
+        self.depth = int(depth)
+        self.lr = float(lr)
+        self.min_leaf = int(min_leaf)
+        self.n_bins = max(31, int(n_bins))
+        self.seed = int(seed)
+        self.model = None
+        self.constant_probability = None
 
-    def _fit_tree(self, X, g, hset, depth, rng):
-        n, d = X.shape
-        node = {"leaf": True, "value": float(np.sum(g) / (np.sum(hset) + 1e-9))}
-        if depth == 0 or n < 2 * self.min_leaf:
-            return node
-        best = None
-        feat_idx = rng.choice(d, size=max(1, int(math.sqrt(d)) + 2), replace=False)
-        base_score = (np.sum(g) ** 2) / (np.sum(hset) + 1e-9)
-        for j in feat_idx:
-            xs = X[:, j]
-            qs = np.quantile(xs, np.linspace(0.05, 0.95, self.n_bins))
-            for thr in np.unique(qs):
-                m = xs <= thr
-                nl = int(np.sum(m))
-                if nl < self.min_leaf or n - nl < self.min_leaf:
-                    continue
-                gl, gr = np.sum(g[m]), np.sum(g[~m])
-                hl, hr = np.sum(hset[m]), np.sum(hset[~m])
-                gain = gl * gl / (hl + 1e-9) + gr * gr / (hr + 1e-9) - base_score
-                if best is None or gain > best[0]:
-                    best = (gain, j, thr, m)
-        if best is None or best[0] <= 1e-9:
-            return node
-        _, j, thr, m = best
-        return {"leaf": False, "feat": int(j), "thr": float(thr),
-                "left": self._fit_tree(X[m], g[m], hset[m], depth - 1, rng),
-                "right": self._fit_tree(X[~m], g[~m], hset[~m], depth - 1, rng)}
+    def fit(self, X, y, X_valid=None, y_valid=None):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=int)
+        classes = np.unique(y)
+        if len(classes) < 2:
+            self.constant_probability = float(classes[0]) if len(classes) else 0.5
+            self.model = None
+            return self
 
-    def _predict_tree(self, node, X):
-        if node["leaf"]:
-            return np.full(X.shape[0], node["value"])
-        m = X[:, node["feat"]] <= node["thr"]
-        out = np.empty(X.shape[0])
-        out[m] = self._predict_tree(node["left"], X[m])
-        out[~m] = self._predict_tree(node["right"], X[~m])
-        return out
-
-    def fit(self, X, y):
-        y = np.asarray(y, dtype=float)
-        p_mean = float(np.clip(np.mean(y), 1e-3, 1 - 1e-3))
-        self.f0 = math.log(p_mean / (1 - p_mean))
-        F = np.full(len(y), self.f0)
-        rng = np.random.default_rng(self.seed)
-        self.trees = []
-        for _ in range(self.n_trees):
-            p = _sigmoid(F)
-            g = y - p                      # negative gradient
-            hset = p * (1 - p)             # hessian (Newton leaf values)
-            tree = self._fit_tree(X, g, hset, self.depth, rng)
-            self.trees.append(tree)
-            F += self.lr * self._predict_tree(tree, X)
+        self.constant_probability = None
+        self.model = lgb.LGBMClassifier(
+            objective="binary",
+            n_estimators=self.n_trees,
+            learning_rate=self.lr,
+            max_depth=self.depth,
+            num_leaves=min(2 ** self.depth, 31),
+            min_child_samples=self.min_leaf,
+            max_bin=self.n_bins,
+            subsample=0.90,
+            subsample_freq=1,
+            colsample_bytree=0.85,
+            reg_alpha=0.05,
+            reg_lambda=0.20,
+            random_state=self.seed,
+            n_jobs=-1,
+            deterministic=True,
+            verbosity=-1,
+        )
+        fit_kwargs = {}
+        if X_valid is not None and y_valid is not None:
+            X_valid = np.asarray(X_valid, dtype=float)
+            y_valid = np.asarray(y_valid, dtype=int)
+            if len(X_valid) and len(np.unique(y_valid)) > 1:
+                import inspect
+                fit_kwargs = {
+                    "eval_metric": "auc",
+                    "callbacks": [lgb.early_stopping(20, verbose=False), lgb.log_evaluation(0)],
+                }
+                # LightGBM 4.7 introduced eval_X/eval_y and deprecated eval_set;
+                # keep compatibility with both the 4.0-4.6 and 4.7 APIs.
+                if "eval_X" in inspect.signature(self.model.fit).parameters:
+                    fit_kwargs.update({"eval_X": X_valid, "eval_y": y_valid})
+                else:
+                    fit_kwargs["eval_set"] = [(X_valid, y_valid)]
+        self.model.fit(X, y, **fit_kwargs)
         return self
 
     def predict_proba(self, X):
-        F = np.full(X.shape[0], self.f0)
-        for tree in self.trees:
-            F += self.lr * self._predict_tree(tree, X)
-        return _sigmoid(F)
+        X = np.asarray(X, dtype=float)
+        if self.constant_probability is not None:
+            return np.full(len(X), self.constant_probability, dtype=float)
+        if self.model is None:
+            raise RuntimeError("LightGBM model has not been fitted")
+        return np.asarray(self.model.predict_proba(X)[:, 1], dtype=float)
 
     @staticmethod
     def auc(y, p):
@@ -1582,66 +1618,6 @@ class PureGradientBoosting:
         if n1 == 0 or n0 == 0:
             return 0.5
         return float((np.sum(ranks[pos]) - n1 * (n1 + 1) / 2) / (n1 * n0))
-
-
-class _ConstantProbaModel:
-    """Degenerate-label stand-in (all-0 or all-1 y): both LightGBM and the
-    pure-NumPy booster need at least two classes to fit; this keeps the
-    .fit/.predict_proba contract intact without a spurious trained model."""
-    def __init__(self, p):
-        self.p = float(np.clip(p, 1e-3, 1 - 1e-3))
-    def fit(self, X, y):
-        return self
-    def predict_proba(self, X):
-        return np.full(X.shape[0], self.p)
-
-
-class _LightGBMClassifier:
-    """Thin wrapper around lightgbm's native Booster API (lgb.train /
-    Booster.predict — NOT the sklearn wrapper, so this needs only the
-    `lightgbm` package, not scikit-learn too) exposing the same
-    .fit(X,y)->self / .predict_proba(X)->P(y=1) contract as
-    PureGradientBoosting, so callers never need to know which backend is
-    active. Falls back to a constant-probability stub on degenerate labels
-    (LightGBM's binary objective requires two classes; the NumPy booster
-    tolerates a single class, so behaviour must match regardless of backend)."""
-    def __init__(self, n_trees=40, depth=3, lr=0.1, min_leaf=20, seed=42):
-        self.n_trees, self.depth, self.lr, self.min_leaf, self.seed = n_trees, depth, lr, min_leaf, seed
-        self.booster = None
-        self.const = None
-
-    def fit(self, X, y):
-        y = np.asarray(y, dtype=float)
-        if len(np.unique(y)) < 2:
-            self.const = _ConstantProbaModel(y.mean() if len(y) else 0.5)
-            return self
-        params = {
-            "objective": "binary", "metric": "binary_logloss",
-            "max_depth": self.depth, "num_leaves": max(2, 2 ** self.depth),
-            "learning_rate": self.lr, "min_child_samples": max(1, self.min_leaf),
-            "verbosity": -1, "seed": self.seed, "deterministic": True,
-            "force_col_wise": True,
-        }
-        train_set = lgb.Dataset(X, label=y)
-        self.booster = lgb.train(params, train_set, num_boost_round=self.n_trees)
-        return self
-
-    def predict_proba(self, X):
-        if self.const is not None:
-            return self.const.predict_proba(X)
-        if self.booster is None:
-            return np.full(X.shape[0], 0.5)
-        return np.asarray(self.booster.predict(X))
-
-
-def make_classifier(n_trees=40, depth=3, lr=0.1, min_leaf=20, seed=42):
-    """Factory for the decision-layer classifier: real LightGBM when the
-    package is installed, otherwise the dependency-free NumPy booster. Both
-    backends expose the identical .fit(X,y)->self / .predict_proba(X)
-    contract, so GeometricPipeline never branches on which one is active."""
-    if HAS_LIGHTGBM:
-        return _LightGBMClassifier(n_trees=n_trees, depth=depth, lr=lr, min_leaf=min_leaf, seed=seed)
-    return PureGradientBoosting(n_trees=n_trees, depth=depth, lr=lr, min_leaf=min_leaf, seed=seed)
 
 
 class MetaLabeler:
@@ -2166,18 +2142,23 @@ class GeometricPipeline:
             if len(cols) == 0:
                 stab[f"{gname}_auc"] = 0.5
                 continue
-            gb = make_classifier(n_trees=18, depth=2, seed=self.seed)
+            gb = LightGBMModel(n_trees=80, depth=3, seed=self.seed)
             gb.fit(Xf[tr_mask][:, cols], y[tr_mask])
             va = usable & (np.arange(T) >= cal_start)
-            stab[f"{gname}_auc"] = PureGradientBoosting.auc(y[va], gb.predict_proba(Xf[va][:, cols])) if np.any(va) else 0.5
+            stab[f"{gname}_auc"] = LightGBMModel.auc(y[va], gb.predict_proba(Xf[va][:, cols])) if np.any(va) else 0.5
         self.feature_mask = np.ones(Xf.shape[1], dtype=bool)
         for gname, gmask in masks.items():
             if stab.get(f"{gname}_auc", 0.5) < 0.47:
                 self.feature_mask[np.where(np.concatenate([gmask, np.zeros(Xf.shape[1] - n_innov, dtype=bool)]))[0]] = False
 
-        # main classifier: real LightGBM when installed, NumPy fallback otherwise
-        self.gbm = make_classifier(n_trees=40, depth=3, seed=self.seed)
-        self.gbm.fit(Xf[tr_mask][:, self.feature_mask], y[tr_mask])
+        # Real LightGBM classifier — predicts P(up). The chronological calibration
+        # tail is used for early stopping and remains out of the fit window.
+        self.gbm = LightGBMModel(n_trees=300, depth=5, lr=0.03, seed=self.seed)
+        va_mask = usable & (np.arange(T) >= cal_start)
+        self.gbm.fit(
+            Xf[tr_mask][:, self.feature_mask], y[tr_mask],
+            Xf[va_mask][:, self.feature_mask], y[va_mask],
+        )
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
         # symmetric directional thresholds: long if p_up high, short if p_up low
         self.p_hi = float(np.quantile(p_all[:cal_start], cfg("gbm_gate_quantile") / 100.0))
@@ -2186,9 +2167,8 @@ class GeometricPipeline:
         # OVERFITTING diagnostic: primary-model AUC in-sample vs on the held-out
         # chronological tail. A large positive gap = the model memorized the train
         # window. Purely observational, surfaced in the dashboards.
-        va_mask = usable & (np.arange(T) >= cal_start)
-        train_auc = PureGradientBoosting.auc(y[tr_mask], p_all[tr_mask]) if np.any(tr_mask) else 0.5
-        oos_auc = PureGradientBoosting.auc(y[va_mask], p_all[va_mask]) if np.any(va_mask) else 0.5
+        train_auc = LightGBMModel.auc(y[tr_mask], p_all[tr_mask]) if np.any(tr_mask) else 0.5
+        oos_auc = LightGBMModel.auc(y[va_mask], p_all[va_mask]) if np.any(va_mask) else 0.5
         overfit_gap = float(train_auc - oos_auc)
 
         def _side_of(p):
@@ -2266,7 +2246,6 @@ class GeometricPipeline:
             "lambda_l1": encoder.lambdas["l1"],
             "n_episodes": int(len([1 for f_ in np.diff(flags.astype(int)) if f_ == 1]) + (1 if flags[0] else 0)),
             "schema": self.schema.label(),
-            "gbm_engine": "lightgbm" if HAS_LIGHTGBM else "numpy",
         }
         self.diagnostics.append(diag_entry)
 
@@ -2296,21 +2275,14 @@ class GeometricPipeline:
         hist = store.get("schemas", {}).get(self.timeframe, [])
         return (hist[-1]["version"] + 1) if hist else 1
 
-    def _barrier_pcts(self, vol, vidx, tp_base_override=None):
+    def _barrier_pcts(self, vol, vidx):
         """Cost-floored, volatility-scaled barrier targets per bar (percent).
 
         TP must clear the cost wall with room to spare (≥ 3× roundtrip) or track the
         realized vol of the barrier horizon; SL risks less than the target so the
         payoff matrix can be positive at achievable hit rates.
-        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors.
-
-        tp_base_override: used by PurgedWalkForwardEngine to grid-search the base
-        TP% WITHOUT mutating the process-global trading config — the live bot's
-        on_bar() reads the same global cfg() concurrently in another thread, so
-        temporarily overwriting CFG here would leak a backtest value into a real
-        trade for the duration of the search. Passing an explicit value keeps the
-        search thread-local and read-only with respect to the global config."""
-        base_tp = float(tp_base_override) if tp_base_override is not None else float(cfg("tp_base_pct"))
+        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
+        base_tp = float(cfg("tp_base_pct"))
         cost = self.cost_pct
         hold = int(cfg("barrier_hold_bars"))
         tp_floor = float(cfg("tp_cost_floor_mult"))
@@ -2331,9 +2303,8 @@ class GeometricPipeline:
                                xin_row[:8]])
 
     # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
-    def batch_signals(self, df, start_at=0, precomputed=None, tp_base_override=None):
-        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t.
-        tp_base_override: see _barrier_pcts — thread-safe grid search knob."""
+    def batch_signals(self, df, start_at=0, precomputed=None):
+        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t."""
         n = len(df)
         out = {
             "signal": np.array(["HOLD"] * n, dtype=object),
@@ -2359,7 +2330,7 @@ class GeometricPipeline:
         Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
                                                        fit_mode=False, closes=closes)
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
-        tp_arr, sl_arr = self._barrier_pcts(vol, vidx, tp_base_override=tp_base_override)
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx)
         a_gate = self.conformal.a_min if self.conformal else 0.5
         cost = self.cost_pct
         for t in range(len(vidx)):
@@ -2609,16 +2580,23 @@ class PurgedWalkForwardEngine:
             return ({k: (v[:upto] if isinstance(v, np.ndarray) else v) for k, v in vol.items()},
                     {r: sigs[r][:upto] for r in GEOM_RESOLUTIONS}, valid[:upto])
 
-        # Grid over the two knobs that actually govern live trading now (both
-        # exposed, editable and persisted in trading_config.json): the base TP%
-        # fed into the cost-floored/vol-scaled barrier target, and the trailing
-        # -stop distance multiplier. tp_base_pct is varied via batch_signals'
-        # tp_base_override (thread-safe — see _barrier_pcts) so it never touches
-        # the global CFG the live bot reads concurrently; trail_mult is varied
-        # for free inside Backtester.run on the same geo array.
-        tp_grid = (0.4, 0.7, 1.2)
-        trail_grid = (2.0, 3.0, 4.0)
-        combos = [{"tp_base_pct": tp, "TRAIL_MULT": tm} for tp in tp_grid for tm in trail_grid]
+        base = get_active_parameters()
+        # Index 0 is always the currently-live champion so the candidate must beat
+        # the exact production baseline, not merely win against an unrelated grid.
+        combos = [dict(base)]
+        tp_grid = sorted({float(base.get("TP_PERCENT", 0.6)), 0.6, 1.0, 1.6, 2.4})
+        trail_grid = sorted({float(base.get("TRAIL_MULT", 3.0)), 2.0, 2.5, 3.0, 3.5, 4.0})
+        for tp in tp_grid:
+            for tm in trail_grid:
+                cmb = dict(base)
+                cmb["TP_PERCENT"] = tp
+                cmb["TRAIL_MULT"] = tm
+                if not any(
+                    float(old.get("TP_PERCENT", 0.0)) == tp and
+                    float(old.get("TRAIL_MULT", 0.0)) == tm
+                    for old in combos
+                ):
+                    combos.append(cmb)
 
         fold_results = {i: [] for i in range(len(combos))}
         prev_encoder = None
@@ -2636,32 +2614,43 @@ class PurgedWalkForwardEngine:
             prev_encoder = pipeline.encoder
             prev_std = pipeline._prev_standardize
 
+            geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
+                                              precomputed=pre_slice(oos_end))
             oos_df = df.iloc[oos_start:oos_end].reset_index(drop=True)
-            for ti, tp_val in enumerate(tp_grid):
-                geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
-                                                  precomputed=pre_slice(oos_end),
-                                                  tp_base_override=tp_val)
-                geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
-                       for kk, vv in geo_full.items()}
-                for tri, tm_val in enumerate(trail_grid):
-                    ci = ti * len(trail_grid) + tri
-                    res = Backtester(oos_df).run({"TRAIL_MULT": tm_val}, geo=geo)
-                    fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
-                                             "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
+            geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
+                   for kk, vv in geo_full.items()}
+            for ci, cmb in enumerate(combos):
+                res = Backtester(oos_df).run(cmb, geo=geo)
+                fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
+                                         "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
 
-        best_ci, best_stable, best_var = 0, -1, float("inf")
+        summaries = {}
+        best_ci, best_key = 0, None
         for ci in fold_results:
             rs = fold_results[ci]
             stable = sum(1 for r in rs if r["pf"] > 1.10 and r["calmar"] > 0.8)
             pfs = [min(r["pf"], 10.0) for r in rs]
             var = float(np.std(pfs)) if pfs else 0.0
-            if stable > best_stable or (stable == best_stable and var < best_var):
-                best_ci, best_stable, best_var = ci, stable, var
-        # normalize to the CFG key shape — this is what /api/promote_challenger
-        # feeds straight into save_trading_config(), so "optimal parameters"
-        # found here actually become the live trading_config.json values.
-        best_combo = combos[best_ci]
-        challenger = {"tp_base_pct": best_combo["tp_base_pct"], "trail_mult": best_combo["TRAIL_MULT"]}
+            median_pf = float(np.median(pfs)) if pfs else 0.0
+            median_calmar = float(np.median([min(r["calmar"], 10.0) for r in rs])) if rs else 0.0
+            median_pnl = float(np.median([r["pnl"] for r in rs])) if rs else 0.0
+            total_trades = int(sum(r["trades"] for r in rs))
+            robust_score = median_pnl + 2.0 * median_calmar + median_pf - var
+            summaries[ci] = {
+                "stable_folds": int(stable), "pf_variance": var,
+                "median_pf": median_pf, "median_calmar": median_calmar,
+                "median_pnl": median_pnl, "total_trades": total_trades,
+                "robust_score": float(robust_score),
+            }
+            key = (stable, robust_score, total_trades, -var)
+            if best_key is None or key > best_key:
+                best_ci, best_key = ci, key
+        challenger = dict(combos[best_ci])
+        best_summary = summaries.get(best_ci, {})
+        champion_summary = summaries.get(0, {})
+        folds_evaluated = max((len(rs) for rs in fold_results.values()), default=0)
+        min_stable = max(2, int(math.ceil(folds_evaluated * 0.60)))
+        improvement = float(best_summary.get("robust_score", 0.0) - champion_summary.get("robust_score", 0.0))
         # overfitting readout: mean primary-model IS→OOS AUC gap across folds
         gaps = [d.get("overfit_gap", 0.0) for d in pipeline.diagnostics]
         oos_aucs = [d.get("oos_auc", 0.5) for d in pipeline.diagnostics]
@@ -2672,13 +2661,37 @@ class PurgedWalkForwardEngine:
             "verdict": ("high" if (gaps and np.mean(gaps) > 0.15) else
                         "moderate" if (gaps and np.mean(gaps) > 0.08) else "low"),
         }
+        eligible_for_promotion = bool(
+            best_ci != 0 and
+            improvement > 0.05 and
+            best_summary.get("stable_folds", 0) >= min_stable and
+            best_summary.get("total_trades", 0) >= max(10, 2 * folds_evaluated) and
+            overfit["verdict"] != "high"
+        )
+        if best_ci == 0:
+            promotion_reason = "current champion remains optimal"
+        elif improvement <= 0.05:
+            promotion_reason = "challenger improvement is too small"
+        elif best_summary.get("stable_folds", 0) < min_stable:
+            promotion_reason = f"challenger stable in fewer than {min_stable} folds"
+        elif best_summary.get("total_trades", 0) < max(10, 2 * folds_evaluated):
+            promotion_reason = "too few OOS trades"
+        elif overfit["verdict"] == "high":
+            promotion_reason = "high LightGBM IS-OOS overfit gap"
+        else:
+            promotion_reason = "validated OOS improvement"
         log.info(f"[WFO] overfit: mean IS-OOS AUC gap {overfit['mean_gap']:.3f} "
                  f"({overfit['verdict']}), mean OOS AUC {overfit['mean_oos_auc']:.3f}")
         return {
             "challenger": challenger,
-            "stability_count": int(best_stable),
-            "variance": float(best_var if best_var != float("inf") else 0.0),
-            "slices_evaluated": self.n_folds,
+            "stability_count": int(best_summary.get("stable_folds", 0)),
+            "variance": float(best_summary.get("pf_variance", 0.0)),
+            "slices_evaluated": int(folds_evaluated),
+            "eligible_for_promotion": eligible_for_promotion,
+            "promotion_reason": promotion_reason,
+            "improvement_score": improvement,
+            "challenger_summary": best_summary,
+            "champion_summary": champion_summary,
             "engine": "geometric-purged-wfo",
             "diagnostics": pipeline.diagnostics,
             "d_anchor_log": pipeline.panel.d_anchor_log,
@@ -2687,6 +2700,7 @@ class PurgedWalkForwardEngine:
             "allow_short": bool(pipeline.allow_short),
             "schema": pipeline.schema.label() if pipeline.schema else "-",
             "fold_results": {str(ci): fold_results[ci] for ci in fold_results},
+            "parameter_summaries": {str(ci): summaries[ci] for ci in summaries},
         }
 
 
@@ -2781,6 +2795,8 @@ class PositionManager:
     def is_open(self): return self.side is not None
 
     def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0, min_trail_dist=0.0):
+        if params is None:
+            params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
         self.invested_amount = invested_amount
         self.has_taken_partial_tp = False
@@ -2798,12 +2814,8 @@ class PositionManager:
         # the stops inside the cost wall (used by learned-geometry entries)
         self.min_trail_dist = float(min_trail_dist)
 
-        # `params` is accepted for test-call compatibility but no longer the
-        # source of truth: trail_mult is the single, live, UI-editable value
-        # in trading_config.json (see cfg()) so WFO-promote and manual edits
-        # both take effect the same way.
-        self.trail_mult = float(params["TRAIL_MULT"]) if params and "TRAIL_MULT" in params else float(cfg("trail_mult"))
-        self.ping_stop_mult = 0.5
+        self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
+        self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
 
         trail_dist = max(gauss_vol*self.trail_mult, self.min_trail_dist)
         if side == "long":
@@ -3015,7 +3027,11 @@ class QuantBot:
         api_secret = os.environ.get("BORSANIN_SECRET_KEY")
         if not api_key or not api_secret: raise RuntimeError("API anahtarlari eksik!")
         self.exchange = ccxt.mexc({'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-        self.public_binance = ccxt.binance({'enableRateLimit': True})  # Added for 10s sub-minute data
+        self.public_binance = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        # Binance publishes a market-data-only endpoint that needs no API key.
+        self.public_binance.urls['api']['public'] = 'https://data-api.binance.vision/api/v3'
+        self.public_binance.urls['api']['v1'] = 'https://data-api.binance.vision/api/v1'
+        self.research_exchanges = {"binance": self.public_binance}
         self.signal_engine = SignalEngine()
         self.position = PositionManager()
         self.telegram = TelegramController(self)
@@ -3180,43 +3196,114 @@ class QuantBot:
         ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, SYMBOL, bot_state["timeframe"], None, OHLCV_LIMIT)
         return pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume']).assign(timestamp=lambda d: pd.to_datetime(d['timestamp'], unit='ms'))
 
-    async def fetch_ohlcv_large(self, symbol, timeframe, limit=3000):
-        """Pages through the exchange's OHLCV endpoint (1000 bars/call) until
-        `limit` bars are collected or the exchange runs out of history. The
-        page cap scales with the request so large backtests (tens of
-        thousands of bars) aren't silently truncated to the old fixed 5-page
-        (5000-bar) ceiling."""
-        all_ohlcv = []
-        target_limit = limit
-        tf_ms = 60 * 1000  # 1m default
-        if timeframe == "5m": tf_ms = 5 * 60 * 1000
-        elif timeframe == "15m": tf_ms = 15 * 60 * 1000
-        elif timeframe == "1h": tf_ms = 60 * 60 * 1000
-        elif timeframe == "4h": tf_ms = 4 * 60 * 60 * 1000
+    def _research_exchange(self, provider):
+        """Return a lazy, public-only CCXT client for research candles."""
+        if provider == "mexc":
+            return self.exchange
+        cache = getattr(self, "research_exchanges", {})
+        if provider in cache:
+            return cache[provider]
+        if provider == "binance":
+            exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+            exchange.urls['api']['public'] = 'https://data-api.binance.vision/api/v3'
+            exchange.urls['api']['v1'] = 'https://data-api.binance.vision/api/v1'
+        elif provider == "bybit":
+            exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        elif provider == "okx":
+            exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        else:
+            raise ValueError(f"Unknown research data provider: {provider}")
+        cache[provider] = exchange
+        self.research_exchanges = cache
+        return exchange
+
+    async def _fetch_ohlcv_paginated(self, exchange, provider, symbol, timeframe, limit):
+        """Fetch one provider through forward CCXT pagination."""
+        target_limit = min(max(int(limit), RESEARCH_BARS_MIN), RESEARCH_BARS_MAX)
+        try:
+            tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+        except Exception:
+            tf_ms = {
+                "1m": 60_000, "5m": 300_000, "15m": 900_000,
+                "1h": 3_600_000, "4h": 14_400_000,
+            }.get(timeframe, 60_000)
 
         now_ms = int(datetime.now().timestamp() * 1000)
-        since = now_ms - (target_limit * tf_ms)
-        max_pages = max(5, math.ceil(target_limit / 1000) + 2)
+        # Ask for two extra intervals so exchange boundary alignment / the still-open
+        # current candle cannot leave the requested closed-bar window one row short.
+        cursor = now_ms - ((target_limit + 2) * tf_ms)
+        candles = {}
+        page_size = 1000
+        # Some venues return fewer candles than requested, so allow a generous but
+        # finite page budget while still detecting a stalled cursor below.
+        max_pages = max(5, int(math.ceil(target_limit / page_size)) * 3 + 3)
 
         for page in range(max_pages):
             try:
-                batch = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, timeframe, since, 1000)
+                batch = await asyncio.to_thread(
+                    exchange.fetch_ohlcv, symbol, timeframe, cursor, page_size
+                )
                 if not batch:
                     break
-                all_ohlcv.extend(batch)
-                all_ohlcv = sorted({x[0]: x for x in all_ohlcv}.values(), key=lambda x: x[0])
-                if page % 10 == 0 or len(all_ohlcv) >= target_limit:
-                    log.info(f"fetch_ohlcv_large: {len(all_ohlcv)}/{target_limit} bars fetched (page {page+1}/{max_pages})")
-                if len(all_ohlcv) >= target_limit:
+                previous_cursor = cursor
+                for row in batch:
+                    if row and len(row) >= 6:
+                        candles[int(row[0])] = row[:6]
+                newest_ts = max(int(row[0]) for row in batch if row)
+                cursor = newest_ts + 1
+                log.info(
+                    f"[{provider.upper()}] OHLCV page {page + 1}: "
+                    f"{len(candles)}/{target_limit} unique bars"
+                )
+                if len(candles) >= target_limit or cursor <= previous_cursor or newest_ts >= now_ms - tf_ms:
                     break
-                since = all_ohlcv[-1][0] + tf_ms
             except Exception as e:
-                log.error(f"Error in fetch_ohlcv_large page: {e}")
-                break
+                log.error(f"[{provider.upper()}] OHLCV page {page + 1} failed: {e}")
+                raise
 
-        df = pd.DataFrame(all_ohlcv[-target_limit:], columns=['timestamp','open','high','low','close','volume'])
+        ordered = [candles[k] for k in sorted(candles)][-target_limit:]
+        if not ordered:
+            raise RuntimeError(f"{provider} returned no historical OHLCV data")
+        if len(ordered) < target_limit:
+            log.warning(f"[{provider.upper()}] requested {target_limit}, received {len(ordered)} bars")
+        df = pd.DataFrame(ordered, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.attrs["data_source"] = provider
         return df
+
+    async def fetch_ohlcv_large(self, symbol, timeframe, limit=RESEARCH_BARS_DEFAULT):
+        """Fetch free public research data with automatic provider fallback.
+
+        Order execution remains on MEXC. Backtest/WFO candles default to Binance's
+        keyless market-data endpoint, then Bybit and OKX; MEXC is only the last
+        fallback. Provider order can be changed with RESEARCH_DATA_PROVIDERS.
+        """
+        target_limit = min(max(int(limit), RESEARCH_BARS_MIN), RESEARCH_BARS_MAX)
+        errors = []
+        best_partial = None
+        for provider in RESEARCH_PROVIDER_ORDER:
+            try:
+                exchange = self._research_exchange(provider)
+                df = await self._fetch_ohlcv_paginated(
+                    exchange, provider, symbol, timeframe, target_limit
+                )
+                if best_partial is None or len(df) > len(best_partial):
+                    best_partial = df
+                if len(df) >= target_limit:
+                    bot_state["research_data_source"] = provider
+                    log.info(f"Research data source selected: {provider.upper()} ({len(df)} bars)")
+                    return df
+                errors.append(f"{provider}: only {len(df)}/{target_limit} bars")
+            except Exception as e:
+                errors.append(f"{provider}: {e}")
+                log.warning(f"Research provider {provider.upper()} unavailable; trying next source")
+
+        if best_partial is not None and len(best_partial) >= GeometricPipeline.MIN_TRAIN_BARS + 200:
+            provider = best_partial.attrs.get("data_source", "partial")
+            bot_state["research_data_source"] = provider
+            log.warning(f"Using best partial research dataset: {provider} ({len(best_partial)} bars)")
+            return best_partial
+        raise RuntimeError("All public research data providers failed: " + " | ".join(errors))
 
     async def close_position(self, reason, price):
         if not self.position.is_open: return
@@ -3314,12 +3401,14 @@ class QuantBot:
             bot_state["timeframe_changed"] = False
             force_retrain = True
 
-        trail_mult = float(cfg("trail_mult"))
-        bot_state["active_parameters"] = {"TRAIL_MULT": trail_mult}  # legacy display key, kept for API compat
+        active_params = get_active_parameters()
+        bot_state["active_parameters"] = active_params
+        
+        trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
 
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
-        info = self.signal_engine.process(df_completed, force_retrain=force_retrain)
+        info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
         geom = info.get("geom", {}) or {}
         log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), "
@@ -3489,6 +3578,7 @@ class QuantBot:
                     cost = roundtrip_cost_pct()
                     bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
                     opt_tp = max(float(geom.get("tp_pct") or 0.0), cfg("tp_cost_floor_mult") * cost,
+                                 float(active_params.get("TP_PERCENT", cfg("tp_base_pct"))),
                                  2.0 * bar_vol_pct * math.sqrt(int(cfg("barrier_hold_bars"))))
                     opt_sl = max(float(geom.get("sl_pct") or 0.0), cfg("sl_cost_floor_mult") * cost, 0.5 * opt_tp)
                     min_trail_dist = price * opt_tp / 100.0 * 0.5
@@ -3660,8 +3750,8 @@ class QuantBot:
             except Exception as e_short:
                 log.error(f"Short entry error: {e_short}")
 
-        # Shadow Mode removed with the legacy engine — the WFO challenger now goes
-        # straight into the parameters store (promote/rollback via /api/promote_challenger).
+        # Shadow execution is gone. WFO auto-promotes only a validated OOS winner;
+        # rejected or position-blocked candidates remain visible as challengers.
         bot_state["shadow_active"] = False
 
     async def fast_orderbook_tick(self):
@@ -3688,7 +3778,7 @@ class QuantBot:
             await asyncio.sleep(FAST_LOOP_INTERVAL)
 
     async def main_loop(self):
-        log.info("QUANT BOT V3.6 (Learned Geometry) - Paper Trading Active")
+        log.info("QUANT BOT V3.7 (LightGBM Research Engine) - Paper Trading Active")
         bot_state["loop"] = asyncio.get_running_loop()
         await asyncio.to_thread(self.exchange.load_markets)
 
@@ -3956,7 +4046,11 @@ class Backtester:
                     entry_volatility = float(gv[idx-1])
                     # cost-floored, vol-scaled barrier targets from the pipeline;
                     # trailing may never come closer than half the target
-                    current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(tp_percent, cfg("tp_cost_floor_mult") * roundtrip_cost_pct())
+                    geo_tp = float(geo["tp"][idx-1]) if "tp" in geo else 0.0
+                    current_tp_percent = max(
+                        geo_tp, tp_percent,
+                        cfg("tp_cost_floor_mult") * roundtrip_cost_pct(),
+                    )
                     current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(0.3, cfg("sl_cost_floor_mult") * roundtrip_cost_pct())
                     min_trail_dist = entry_price * current_tp_percent / 100.0 * 0.5
                     max_price_seen = entry_price
@@ -4034,9 +4128,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Bot V3.6 — Learned Geometry</title>
-    <link rel="icon" href="data:,">
-
+    <title>Quant Bot V3.7 — LightGBM Research Engine</title>
     <script src="/static/lightweight-charts.js"></script>
     <style>
         :root{
@@ -4145,7 +4237,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <header>
-        <div class="brand"><span class="dot blink"></span> Quant Bot <span class="muted" style="font-weight:400;">V3.6 · Learned Geometry</span></div>
+        <div class="brand"><span class="dot blink"></span> Quant Bot <span class="muted" style="font-weight:400;">V3.7 · LightGBM</span></div>
         <div class="sym">BTC/USDT</div>
         <div id="price" class="price mono">$0.00</div>
         <div id="geo-badge" class="badge b-grey"><span class="bdot" style="background:var(--muted)"></span><span id="geo-badge-t">COLLECTING</span></div>
@@ -4202,7 +4294,6 @@ HTML_TEMPLATE = """
                 <div class="kv"><span class="k">η · P(δ≠0)</span><span class="v" id="g-eta">-</span></div>
                 <div class="kv"><span class="k">Epizot</span><span class="v" id="g-ep">NORMAL</span></div>
                 <div class="kv"><span class="k">p GBM / Meta</span><span class="v" id="g-p">- / -</span></div>
-                <div class="kv"><span class="k">GBM Motoru</span><span class="v" id="g-engine">-</span></div>
                 <div class="kv"><span class="k">Conformal A</span><span class="v" id="g-a">-</span></div>
                 <div class="kv"><span class="k">E[net] · TP/SL</span><span class="v" id="g-en">-</span></div>
                 <div class="kv"><span class="k">D_anchor · Fold</span><span class="v" id="g-da">-</span></div>
@@ -4245,6 +4336,11 @@ HTML_TEMPLATE = """
                 <h4>Backtest & Purged WFO</h4>
                 <div class="kv"><span class="k">Challenger</span><span class="v accent" id="chal">Yok</span></div>
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
+                    <label class="muted" style="font-size:10px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                        Araştırma barı
+                        <input id="research-bars" type="number" min="3000" max="100000" step="1000" value="10000"
+                               style="width:92px; background:#111722; color:#d7dbe3; border:1px solid #263044; border-radius:5px; padding:5px;">
+                    </label>
                     <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır</button>
                     <button class="btn btn-ghost" id="wfo-btn" onclick="runWFO()">Purged WFO Çalıştır</button>
                     <button class="btn btn-start" id="promo-btn" style="display:none;" onclick="promote()">Challenger'ı Yükselt</button>
@@ -4308,15 +4404,18 @@ HTML_TEMPLATE = """
             rebuildSeries();
         }).catch(()=>{});
     }
-    function runBacktest(){ fetch('/api/backtest',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
-    function runWFO(){ fetch('/api/run_wfo',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
+    function researchBars(){ return Math.min(100000, Math.max(3000, parseInt(el('research-bars').value||'10000',10))); }
+    function runResearch(url, buttonId){
+        const b=el(buttonId); b.disabled=true;
+        fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bars:researchBars()})})
+          .then(async r=>{ const d=await r.json(); if(!r.ok) throw new Error(d.message||'İşlem başlatılamadı'); refresh(); })
+          .catch(e=>{ alert(e.message); b.disabled=false; });
+    }
+    function runBacktest(){ runResearch('/api/backtest','bt-btn'); }
+    function runWFO(){ runResearch('/api/run_wfo','wfo-btn'); }
     function promote(){
         if(!confirm('Challenger parametrelerini şampiyon (canlı) yapmak istiyor musunuz?')) return;
-        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{
-            alert(d.status==='success'?'Yükseltildi! Yeni parametreler: '+JSON.stringify(d.parameters||{}):'Hata: '+(d.message||''));
-            loadConfig();   // Trading Parameters panel must reflect the promoted values immediately
-            refresh();
-        }).catch(()=>{});
+        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.status==='success'?'Yükseltildi!':'Hata: '+(d.message||'')); refresh(); }).catch(()=>{});
     }
 
     // ── Trading Parameters panel ──
@@ -4457,11 +4556,11 @@ HTML_TEMPLATE = """
         el('chal').className = 'v ' + (chal?'accent':'muted');
         const promo = el('promo-btn');
         promo.style.display = (chal && !s.position_side) ? 'block' : 'none';
-        const barsLabel = (cfgOriginal && cfgOriginal.backtest_bars) ? (Math.round(cfgOriginal.backtest_bars/1000)+'k bar') : '';
         el('bt-btn').disabled = !!s.backtest_running;
-        el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : ('Backtest Çalıştır' + (barsLabel?' ('+barsLabel+')':''));
+        el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : 'Backtest Çalıştır';
         el('wfo-btn').disabled = !!s.wfo_running;
-        el('wfo-btn').textContent = s.wfo_running ? 'WFO çalışıyor...' : ('Purged WFO Çalıştır' + (barsLabel?' ('+barsLabel+')':''));
+        el('wfo-btn').textContent = s.wfo_running ? 'WFO çalışıyor...' : 'Purged WFO Çalıştır';
+        el('research-bars').disabled = !!s.backtest_running || !!s.wfo_running;
         renderReport(s);
 
         // trades
@@ -4503,9 +4602,6 @@ HTML_TEMPLATE = """
         setText('g-ep', inEp ? ('EPİZOT'+(G(g,'cluster',-1)>=0?(' A'+g.cluster):'')) : 'NORMAL');
         el('g-ep').className = 'v ' + (inEp?'yellow':'green');
         setText('g-p', N(g.p_gbm,2)+' / '+N(g.p_meta,2));
-        const eng = gd.gbm_engine;
-        setText('g-engine', eng==='lightgbm' ? 'LightGBM' : (eng==='numpy' ? 'NumPy (fallback)' : '-'));
-        el('g-engine').className = 'v ' + (eng==='lightgbm' ? 'cyan' : 'muted');
         const aOk = G(g,'a_score',0) >= G(g,'a_gate',0.5);
         setText('g-a', N(g.a_score,2)+' (kapı '+N(g.a_gate,2)+')');
         el('g-a').className = 'v ' + (aOk?'green':'muted');
@@ -4537,8 +4633,12 @@ HTML_TEMPLATE = """
         const box = el('report');
         if(s.wfo_report){
             const w = s.wfo_report; let h = '<div class="accent" style="font-weight:700; margin-bottom:4px;">WFO Sonucu ('+G(w,'engine','-')+')</div>';
+            h += '<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(w,'bars_used',0)+' bar · '+String(G(w,'data_source','-')).toUpperCase()+' / '+G(w,'model','-')+'</span></div>';
             h += '<div class="kv"><span class="k">Stabilite</span><span class="v">'+G(w,'stability_count',0)+'/'+G(w,'slices_evaluated',0)+'</span></div>';
             h += '<div class="kv"><span class="k">PF Varyans</span><span class="v">'+N(w.variance,4)+'</span></div>';
+            const promoted = G(w,'promotion_status','not_promoted')==='auto_promoted';
+            h += '<div class="kv"><span class="k">Parametre</span><span class="v '+(promoted?'green':'yellow')+'">'+(promoted?'Otomatik güncellendi':G(w,'promotion_status','doğrulanmadı'))+'</span></div>';
+            if(w.promotion_reason) h += '<div class="muted" style="font-size:10px; margin-top:3px;">'+w.promotion_reason+'</div>';
             if(w.schema && w.schema!=='-') h += '<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+w.schema+'</span></div>';
             const dg = (w.diagnostics||[]);
             if(dg.length){ const d=dg[dg.length-1];
@@ -4548,6 +4648,7 @@ HTML_TEMPLATE = """
             const r=s.backtest_report;
             if(r.status==='error'){ box.innerHTML='<div class="red">'+G(r,'message','hata')+'</div>'; box.style.display='block'; return; }
             let h='<div class="green" style="font-weight:700; margin-bottom:4px;">Backtest ('+G(r,'engine','-')+')</div>';
+            h+='<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(r,'bars_used',0)+' bar · '+String(G(r,'data_source','-')).toUpperCase()+' / '+G(r,'model','-')+'</span></div>';
             if(r.schema && r.schema!=='-') h+='<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+r.schema+'</span></div>';
             h+='<div class="kv"><span class="k">İşlem / Kazanç</span><span class="v">'+G(r,'trade_count',0)+' / '+N(r.win_rate,1)+'%</span></div>';
             h+='<div class="kv"><span class="k">Net Kâr</span><span class="v '+(G(r,'total_pnl_usdt',0)>=0?'green':'red')+'">'+(G(r,'total_pnl_usdt',0)>=0?'+':'')+N(r.total_pnl_usdt,2)+' ('+N(r.total_pnl_pct,2)+'%)</span></div>';
@@ -4715,39 +4816,51 @@ def config_endpoint():
         log.error(f"Config update error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
+def _requested_research_bars():
+    data = request.get_json(silent=True) or {}
+    try:
+        bars = int(data.get("bars", RESEARCH_BARS_DEFAULT))
+    except (TypeError, ValueError):
+        raise ValueError("Bar count must be an integer")
+    return min(max(bars, RESEARCH_BARS_MIN), RESEARCH_BARS_MAX)
+
+
 @app.route('/api/backtest', methods=['POST'])
 def run_backtest_endpoint():
     global bot_instance
     if not bot_instance:
         return jsonify({"status": "error", "message": "Bot not initialized"}), 400
-        
+    try:
+        requested_bars = _requested_research_bars()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    with state_lock:
+        if bot_state.get("backtest_running") or bot_state.get("wfo_running"):
+            return jsonify({"status": "busy", "message": "A research job is already running"}), 409
+        # Set the flag before starting the thread. This closes the double-click race
+        # that could leave two workers fighting over the same report state.
+        bot_state["backtest_running"] = True
+        bot_state["backtest_report"] = None
+        bot_state["wfo_report"] = None
+        bot_state["backtest_bars_requested"] = requested_bars
+
     def _worker():
         try:
             log.info("Backtest worker thread started. Fetching historical OHLCV data...")
-            bot_state["backtest_running"] = True
-            # Clear BOTH report slots: whichever run finishes last is what the
-            # panel should show. Leaving the other stale meant re-running a
-            # Backtest after an earlier WFO (or vice versa) looked like the
-            # button "stopped working" — the UI kept displaying the old report.
-            bot_state["backtest_report"] = None
-            bot_state["wfo_report"] = None
-
             loop = bot_state.get("loop")
             if loop:
                 future = asyncio.run_coroutine_threadsafe(
-                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))),
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars),
                     loop
                 )
                 df = future.result()
             else:
                 import asyncio as local_asyncio
-                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))))
-
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars))
+                
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
-            # TRAIL_MULT is the only params-dict key Backtester still reads (TP/SL
-            # come from the geometry pipeline's cost-floored barrier targets);
-            # source it from the live, UI-editable trading config.
-            active_params = {"TRAIL_MULT": float(cfg("trail_mult"))}
+            data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
+            active_params = get_active_parameters()
             # Geometric backtest: train on the first window, trade the purged remainder.
             report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
             log.info(f"Backtest simulation completed ({report.get('engine','geometric')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
@@ -4764,43 +4877,56 @@ def run_backtest_endpoint():
                 "expectancy": float(report["expectancy"]),
                 "engine": report.get("engine", "legacy"),
                 "schema": report.get("schema", "-"),
+                "model": "LightGBM",
+                "data_source": data_source,
+                "bars_requested": requested_bars,
+                "bars_used": int(len(df)),
                 "trades": report["trades"][-10:]
             }
+            bot_state["backtest_bars_used"] = int(len(df))
         except Exception as e:
             log.error(f"Backtest API error: {e}")
             bot_state["backtest_report"] = {"status": "error", "message": str(e)}
         finally:
-            bot_state["backtest_running"] = False
+            with state_lock:
+                bot_state["backtest_running"] = False
 
     threading.Thread(target=_worker, daemon=True).start()
-    return jsonify({"status": "running"})
+    return jsonify({"status": "running", "bars": requested_bars})
 
 @app.route('/api/run_wfo', methods=['POST'])
 def run_wfo_endpoint():
     global bot_instance
     if not bot_instance:
         return jsonify({"status": "error", "message": "Bot not initialized"}), 400
-        
+    try:
+        requested_bars = _requested_research_bars()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    with state_lock:
+        if bot_state.get("backtest_running") or bot_state.get("wfo_running"):
+            return jsonify({"status": "busy", "message": "A research job is already running"}), 409
+        bot_state["wfo_running"] = True
+        bot_state["wfo_report"] = None
+        bot_state["backtest_report"] = None
+        bot_state["wfo_bars_requested"] = requested_bars
+
     def _worker():
         try:
             log.info("WFO worker thread started. Fetching historical OHLCV data...")
-            bot_state["wfo_running"] = True
-            # Clear BOTH report slots — see the matching comment in /api/backtest.
-            bot_state["wfo_report"] = None
-            bot_state["backtest_report"] = None
-
             loop = bot_state.get("loop")
             if loop:
                 future = asyncio.run_coroutine_threadsafe(
-                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))),
+                    bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars),
                     loop
                 )
                 df = future.result()
             else:
                 import asyncio as local_asyncio
-                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], int(cfg("backtest_bars"))))
-
+                df = local_asyncio.run(bot_instance.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], requested_bars))
+                
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
+            data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
             # Purged walk-forward over the geometric pipeline (warm start +
             # neighbour-fold RKD, geometry schema fixed).
             engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
@@ -4808,26 +4934,51 @@ def run_wfo_endpoint():
             log.info(f"WFO completed ({result.get('engine','geometric-purged-wfo')}). Challenger: {result['challenger']}, "
                      f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
 
-            # challenger is {"tp_base_pct": ..., "trail_mult": ...} — the exact
-            # keys /api/promote_challenger writes into trading_config.json, so
-            # "optimal parameters" found here are the ones the live bot reads.
             challenger = result["challenger"]
+            if challenger:
+                challenger = {k: v for k, v in challenger.items() if not k.startswith("slice_")}
 
             p_store = get_all_parameters()
-            p_store["shadow_challenger"] = challenger
+            promotion_status = "not_promoted"
+            promotion_reason = result.get("promotion_reason", "validation gate failed")
+            champion = p_store.get("champion") or {}
+            candidate_changed = challenger and any(
+                float(challenger.get(k, 0.0)) != float(champion.get(k, 0.0))
+                for k in ("TP_PERCENT", "TRAIL_MULT")
+            )
+            if result.get("eligible_for_promotion") and candidate_changed:
+                if bot_instance.position.is_open:
+                    p_store["shadow_challenger"] = challenger
+                    promotion_status = "pending_position_close"
+                    promotion_reason = "validated; waiting for the open position to close"
+                else:
+                    promote_parameter_set(p_store, challenger, source="purged_wfo_auto")
+                    promotion_status = "auto_promoted"
+                    promotion_reason = "validated OOS improvement; champion updated"
+            else:
+                # Preserve a genuinely different candidate for deliberate manual
+                # override, but do not show the current champion as its own challenger.
+                p_store["shadow_challenger"] = challenger if candidate_changed else None
 
-            with open(PARAMETERS_STORE_PATH, "w", encoding="utf-8") as f:
-                import json
-                json.dump(p_store, f, indent=4)
+            save_parameters_store(p_store)
 
             bot_state["parameters_store"] = p_store
+            bot_state["active_parameters"] = p_store.get("champion", get_active_parameters())
+            bot_state["wfo_bars_used"] = int(len(df))
 
             bot_state["wfo_report"] = {
                 "stability_count": result["stability_count"],
                 "variance": float(result["variance"]),
                 "slices_evaluated": result["slices_evaluated"],
                 "challenger": challenger,
+                "promotion_status": promotion_status,
+                "promotion_reason": promotion_reason,
+                "improvement_score": float(result.get("improvement_score", 0.0)),
                 "engine": result.get("engine", "legacy-grid"),
+                "model": "LightGBM",
+                "data_source": data_source,
+                "bars_requested": requested_bars,
+                "bars_used": int(len(df)),
                 "schema": result.get("schema", "-"),
                 "overfit": result.get("overfit", {}),
                 "diagnostics": result.get("diagnostics", []),
@@ -4838,10 +4989,11 @@ def run_wfo_endpoint():
             log.error(f"WFO API error: {e}")
             bot_state["wfo_report"] = {"status": "error", "message": str(e)}
         finally:
-            bot_state["wfo_running"] = False
+            with state_lock:
+                bot_state["wfo_running"] = False
 
     threading.Thread(target=_worker, daemon=True).start()
-    return jsonify({"status": "running"})
+    return jsonify({"status": "running", "bars": requested_bars})
 
 @app.route('/api/promote_challenger', methods=['POST'])
 def promote_challenger_endpoint():
@@ -4857,36 +5009,22 @@ def promote_challenger_endpoint():
         shadow = p_store.get("shadow_challenger")
         if not shadow:
             return jsonify({"status": "error", "message": "Aktif Challenger parametresi bulunamadı!"}), 400
-
-        # Apply the WFO winner into the SAME live config the Trading Parameters
-        # panel edits — this is what makes "promote" actually change behaviour,
-        # instead of writing into a store nothing reads anymore.
-        patch = {k: v for k, v in shadow.items() if k in DEFAULT_TRADING_CONFIG}
-        new_cfg = save_trading_config(patch)
-
-        p_store["history"].append({
-            "version": p_store.get("active_version", 1),
-            "parameters": shadow,
-            "promoted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        p_store["shadow_challenger"] = None
-        p_store["active_version"] = p_store.get("active_version", 1) + 1
-
-        with open(PARAMETERS_STORE_PATH, "w", encoding="utf-8") as f:
-            import json
-            json.dump(p_store, f, indent=4)
-
+            
+        promote_parameter_set(p_store, shadow, source="manual_override")
+        save_parameters_store(p_store)
+            
         bot_state["parameters_store"] = p_store
-
+        bot_state["active_parameters"] = shadow
+        
         msg = (
-            f"🔄 *CHALLENGER PARAMETRELERİ UYGULANDI!*\n\n"
-            f"📈 *Versiyon:* v{p_store['active_version']}\n"
-            f"Parametreler: {patch}"
+            f"🔄 *CHALLENGER PARAMETRESİ ŞAMPİYON YAPILDI!*\n\n"
+            f"📈 *Yeni Versiyon:* v{p_store['active_version']}\n"
+            f"Parameters: {shadow}"
         )
         if bot_state.get("loop"):
             asyncio.run_coroutine_threadsafe(bot_instance.telegram.send_message(msg), bot_state["loop"])
-
-        return jsonify({"status": "success", "parameters": patch, "config": new_cfg})
+            
+        return jsonify({"status": "success", "parameters": shadow})
     except Exception as e:
         log.error(f"Error promoting challenger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -4903,7 +5041,7 @@ def promote_challenger_endpoint():
 #   python quant_bot_v35.py --test-geom    # V3.6 learned-geometry tests only
 #   python quant_bot_v35.py --test-safe    # safety/execution tests only
 #
-# The suites don't need extra installs — same NumPy/pandas the bot already uses.
+# LightGBM is a required runtime dependency (see requirements.txt).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _make_synth_df(n=900, seed=42):
@@ -5154,40 +5292,131 @@ def test_cluster_and_graph():
 
 
 def test_gbm_learner():
-    print("Testing pure-NumPy gradient boosting (LightGBM slot)...")
+    print("Testing LightGBM classifier adapter...")
     rng = np.random.default_rng(2)
     X = rng.normal(0, 1, (600, 8))
     y = ((X[:, 0] + 0.5 * X[:, 1] + 0.1 * rng.normal(size=600)) > 0).astype(float)
-    gb = PureGradientBoosting(n_trees=30, depth=3, seed=2).fit(X[:450], y[:450])
+    gb = LightGBMModel(n_trees=100, depth=3, seed=2).fit(X[:450], y[:450])
     p = gb.predict_proba(X[450:])
-    auc = PureGradientBoosting.auc(y[450:], p)
+    auc = LightGBMModel.auc(y[450:], p)
     print(f"  holdout AUC = {auc:.3f}")
     assert auc > 0.85
     assert np.all((p > 0) & (p < 1))
 
 
-def test_classifier_factory():
-    print(f"Testing make_classifier factory (HAS_LIGHTGBM={HAS_LIGHTGBM})...")
-    rng = np.random.default_rng(7)
-    X = rng.normal(0, 1, (500, 6))
-    y = ((X[:, 0] - 0.3 * X[:, 2] + 0.1 * rng.normal(size=500)) > 0).astype(float)
-    clf = make_classifier(n_trees=25, depth=3, seed=7)
-    if HAS_LIGHTGBM:
-        assert isinstance(clf, _LightGBMClassifier), "factory must pick LightGBM when installed"
-    else:
-        assert isinstance(clf, PureGradientBoosting), "factory must fall back to the NumPy booster"
-    clf.fit(X[:380], y[:380])
-    p = clf.predict_proba(X[380:])
-    assert p.shape == (120,) and np.all((p >= 0) & (p <= 1))
-    auc = PureGradientBoosting.auc(y[380:], p)
-    print(f"  backend={'lightgbm' if HAS_LIGHTGBM else 'numpy'} holdout AUC={auc:.3f}")
-    assert auc > 0.7
-    # degenerate labels (single class) must not raise on either backend
-    deg = make_classifier(n_trees=10, depth=2, seed=7)
-    deg.fit(X[:50], np.zeros(50))
-    pd_ = deg.predict_proba(X[50:60])
-    assert np.all((pd_ >= 0) & (pd_ <= 1)) and not np.any(np.isnan(pd_))
-    print("  degenerate-label guard OK on both backends ✓")
+def test_large_history_pagination():
+    print("Testing paginated OHLCV fetch beyond the old five-page ceiling...")
+
+    class PagedExchange:
+        def __init__(self):
+            tf_ms = 60_000
+            end = int(datetime.now().timestamp() * 1000) // tf_ms * tf_ms
+            start = end - 6_050 * tf_ms
+            self.rows = [[start + i * tf_ms, 100, 101, 99, 100, 10] for i in range(6_050)]
+            self.calls = 0
+
+        def parse_timeframe(self, timeframe):
+            return 60
+
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            self.calls += 1
+            rows = [row for row in self.rows if row[0] >= since]
+            return rows[:min(limit, 700)]
+
+    holder = type("HistoryHolder", (), {})()
+    holder.exchange = PagedExchange()
+    df = asyncio.run(QuantBot._fetch_ohlcv_paginated(
+        holder, holder.exchange, "test", SYMBOL, "1m", 6_000
+    ))
+    assert len(df) == 6_000
+    assert df["timestamp"].is_monotonic_increasing
+    assert holder.exchange.calls > 5
+    print(f"  {len(df)} unique bars in {holder.exchange.calls} pages ✓")
+
+
+def test_research_provider_fallback():
+    print("Testing automatic public-data fallback after a provider rejection...")
+    global RESEARCH_PROVIDER_ORDER
+
+    class FailingExchange:
+        def parse_timeframe(self, timeframe): return 60
+        def fetch_ohlcv(self, *args, **kwargs):
+            raise RuntimeError("simulated provider range rejection")
+
+    class WorkingExchange:
+        def __init__(self):
+            tf_ms = 60_000
+            end = int(datetime.now().timestamp() * 1000) // tf_ms * tf_ms
+            start = end - 3_050 * tf_ms
+            self.rows = [[start + i * tf_ms, 100, 101, 99, 100, 10] for i in range(3_050)]
+        def parse_timeframe(self, timeframe): return 60
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            return [row for row in self.rows if row[0] >= since][:limit]
+
+    class FallbackHolder:
+        def __init__(self):
+            self.exchanges = {"mexc": FailingExchange(), "binance": WorkingExchange()}
+        def _research_exchange(self, provider):
+            return self.exchanges[provider]
+        async def _fetch_ohlcv_paginated(self, exchange, provider, symbol, timeframe, limit):
+            return await QuantBot._fetch_ohlcv_paginated(
+                self, exchange, provider, symbol, timeframe, limit
+            )
+
+    previous_order = RESEARCH_PROVIDER_ORDER
+    RESEARCH_PROVIDER_ORDER = ("mexc", "binance")
+    try:
+        df = asyncio.run(QuantBot.fetch_ohlcv_large(
+            FallbackHolder(), SYMBOL, "1m", 3_000
+        ))
+        assert len(df) == 3_000
+        assert df.attrs["data_source"] == "binance"
+        assert bot_state["research_data_source"] == "binance"
+        print("  rejected MEXC -> BINANCE fallback selected ✓")
+    finally:
+        RESEARCH_PROVIDER_ORDER = previous_order
+
+
+def test_backtest_endpoint_repeatability():
+    print("Testing that the backtest endpoint can complete repeatedly...")
+    import time
+    global bot_instance, run_geometric_backtest
+
+    class PositionStub:
+        is_open = False
+
+    class BotStub:
+        position = PositionStub()
+
+        async def fetch_ohlcv_large(self, symbol, timeframe, limit):
+            return _make_synth_df(limit, seed=91)
+
+    original_bot = bot_instance
+    original_runner = run_geometric_backtest
+    bot_instance = BotStub()
+    run_geometric_backtest = lambda df, params, timeframe="1m": {
+        "trade_count": 1, "total_pnl_pct": 1.0, "total_pnl_usdt": 10.0,
+        "profit_factor": 1.2, "max_drawdown_pct": 0.5, "calmar_ratio": 2.0,
+        "sharpe_ratio": 1.0, "win_rate": 100.0, "expectancy": 1.0,
+        "engine": "geometric-test", "schema": "test", "trades": [],
+    }
+    try:
+        bot_state["loop"] = None
+        bot_state["backtest_running"] = False
+        bot_state["wfo_running"] = False
+        client = app.test_client()
+        for run_no in (1, 2):
+            response = client.post("/api/backtest", json={"bars": 3_000})
+            assert response.status_code == 200, response.get_json()
+            deadline = time.time() + 5.0
+            while bot_state["backtest_running"] and time.time() < deadline:
+                time.sleep(0.01)
+            assert not bot_state["backtest_running"]
+            assert bot_state["backtest_report"]["bars_used"] == 3_000
+        print("  two consecutive runs completed and produced fresh reports ✓")
+    finally:
+        bot_instance = original_bot
+        run_geometric_backtest = original_runner
 
 
 def test_meta_and_conformal():
@@ -5200,7 +5429,7 @@ def test_meta_and_conformal():
     y = (X[:, 0] > 0).astype(float)
     ml = MetaLabeler().fit(X, y)
     p = ml.predict_proba(X)
-    assert PureGradientBoosting.auc(y, p) > 0.9
+    assert LightGBMModel.auc(y, p) > 0.9
     gate = ConformalGate(alpha=0.6, beta=0.4)
     pm_cal = rng.uniform(0.2, 0.9, 60)
     dm_cal = rng.uniform(0.1, 2.0, 60)
@@ -5357,7 +5586,9 @@ def test_pipeline_end_to_end():
 def test_geometric_backtest_and_purged_wfo():
     print("Testing run_geometric_backtest + PurgedWalkForwardEngine...")
     df = _make_synth_df(1250, seed=7)
-    params = {"TRAIL_MULT": 3.0}
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
     rep = run_geometric_backtest(df, params, timeframe="1m")
     assert rep["engine"] == "geometric"
     assert rep["train_bars"] > 0 and "schema" in rep
@@ -5366,12 +5597,7 @@ def test_geometric_backtest_and_purged_wfo():
     res = eng.run()
     assert res["engine"] == "geometric-purged-wfo"
     assert res["slices_evaluated"] == 3
-    # challenger keys must match what /api/promote_challenger writes straight
-    # into trading_config.json — this IS the "WFO updates optimal parameters" contract.
-    assert res["challenger"] is not None
-    assert "tp_base_pct" in res["challenger"] and "trail_mult" in res["challenger"]
-    assert res["challenger"]["tp_base_pct"] in (0.4, 0.7, 1.2)
-    assert res["challenger"]["trail_mult"] in (2.0, 3.0, 4.0)
+    assert res["challenger"] is not None and "TP_PERCENT" in res["challenger"]
     assert len(res["diagnostics"]) >= 2
     versions = {d["schema"] for d in res["diagnostics"]}
     assert len(versions) == 1, "geometry schema must stay fixed across folds"
@@ -5574,7 +5800,9 @@ def _run_geom_suite():
     test_episode_hysteresis()
     test_cluster_and_graph()
     test_gbm_learner()
-    test_classifier_factory()
+    test_large_history_pagination()
+    test_research_provider_fallback()
+    test_backtest_endpoint_repeatability()
     test_meta_and_conformal()
     test_barrier_directional()
     test_two_sided_and_short_gate()
@@ -5658,7 +5886,7 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot, daemon=False)
     bot_thread.start()
     try:
-        webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
+        webview.create_window(title='Quant Bot V3.7 - LightGBM Research Engine', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
         webview.start()
     except Exception as e:
         log.warning(f"Webview error: {e}")
