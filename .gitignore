@@ -7,3 +7,6 @@ node_modules/
 dist/
 build/
 
+trading_config.json
+geometry_store.json
+logs/
