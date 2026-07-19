@@ -354,7 +354,7 @@ bot_state = {
     "wfo_bars_requested": RESEARCH_BARS_DEFAULT,
     "wfo_bars_used": 0,
     "research_data_source": "-",
-    "active_parameters": get_active_parameters(),
+    "active_parameters": {"TRAIL_MULT": float(cfg("trail_mult"))},
     "parameters_store": get_all_parameters(),
 
     # V3.6 Learned Geometry state
@@ -1534,10 +1534,12 @@ class TransitionGraph:
 class LightGBMModel:
     """Small adapter around the real LightGBM binary classifier.
 
-    The rest of the geometry pipeline expects a one-dimensional P(up) array, while
-    LightGBM follows the sklearn convention and returns [P(0), P(1)].  Keeping the
-    conversion here makes the model swap explicit and prevents an accidental return
-    to the old in-file gradient-boosting approximation.
+    Uses LightGBM's native Booster API (lgb.train / Booster.predict) rather
+    than the sklearn wrapper (lgb.LGBMClassifier). The sklearn wrapper pulls
+    in a second hard dependency -- it raises at construction time if
+    scikit-learn isn't installed ("scikit-learn is required for
+    lightgbm.sklearn") even though scikit-learn is never otherwise used here.
+    The native API needs only the `lightgbm` package itself.
     """
 
     def __init__(self, n_trees=120, depth=4, lr=0.05, min_leaf=20, n_bins=255, seed=42):
@@ -1564,41 +1566,37 @@ class LightGBMModel:
             return self
 
         self.constant_probability = None
-        self.model = lgb.LGBMClassifier(
-            objective="binary",
-            n_estimators=self.n_trees,
-            learning_rate=self.lr,
-            max_depth=self.depth,
-            num_leaves=min(2 ** self.depth, 31),
-            min_child_samples=self.min_leaf,
-            max_bin=self.n_bins,
-            subsample=0.90,
-            subsample_freq=1,
-            colsample_bytree=0.85,
-            reg_alpha=0.05,
-            reg_lambda=0.20,
-            random_state=self.seed,
-            n_jobs=-1,
-            deterministic=True,
-            verbosity=-1,
-        )
-        fit_kwargs = {}
+        params = {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": self.lr,
+            "max_depth": self.depth,
+            "num_leaves": min(2 ** self.depth, 31),
+            "min_child_samples": self.min_leaf,
+            "max_bin": self.n_bins,
+            "bagging_fraction": 0.90,
+            "bagging_freq": 1,
+            "feature_fraction": 0.85,
+            "lambda_l1": 0.05,
+            "lambda_l2": 0.20,
+            "seed": self.seed,
+            "deterministic": True,
+            "verbosity": -1,
+            "force_col_wise": True,
+        }
+        train_set = lgb.Dataset(X, label=y)
+        callbacks = [lgb.log_evaluation(0)]
+        valid_sets = None
         if X_valid is not None and y_valid is not None:
             X_valid = np.asarray(X_valid, dtype=float)
             y_valid = np.asarray(y_valid, dtype=int)
             if len(X_valid) and len(np.unique(y_valid)) > 1:
-                import inspect
-                fit_kwargs = {
-                    "eval_metric": "auc",
-                    "callbacks": [lgb.early_stopping(20, verbose=False), lgb.log_evaluation(0)],
-                }
-                # LightGBM 4.7 introduced eval_X/eval_y and deprecated eval_set;
-                # keep compatibility with both the 4.0-4.6 and 4.7 APIs.
-                if "eval_X" in inspect.signature(self.model.fit).parameters:
-                    fit_kwargs.update({"eval_X": X_valid, "eval_y": y_valid})
-                else:
-                    fit_kwargs["eval_set"] = [(X_valid, y_valid)]
-        self.model.fit(X, y, **fit_kwargs)
+                valid_sets = [lgb.Dataset(X_valid, label=y_valid, reference=train_set)]
+                callbacks.append(lgb.early_stopping(20, verbose=False))
+        self.model = lgb.train(
+            params, train_set, num_boost_round=self.n_trees,
+            valid_sets=valid_sets, callbacks=callbacks,
+        )
         return self
 
     def predict_proba(self, X):
@@ -1607,7 +1605,7 @@ class LightGBMModel:
             return np.full(len(X), self.constant_probability, dtype=float)
         if self.model is None:
             raise RuntimeError("LightGBM model has not been fitted")
-        return np.asarray(self.model.predict_proba(X)[:, 1], dtype=float)
+        return np.asarray(self.model.predict(X), dtype=float)
 
     @staticmethod
     def auc(y, p):
@@ -2275,14 +2273,20 @@ class GeometricPipeline:
         hist = store.get("schemas", {}).get(self.timeframe, [])
         return (hist[-1]["version"] + 1) if hist else 1
 
-    def _barrier_pcts(self, vol, vidx):
+    def _barrier_pcts(self, vol, vidx, tp_base_override=None):
         """Cost-floored, volatility-scaled barrier targets per bar (percent).
 
         TP must clear the cost wall with room to spare (≥ 3× roundtrip) or track the
         realized vol of the barrier horizon; SL risks less than the target so the
         payoff matrix can be positive at achievable hit rates.
-        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
-        base_tp = float(cfg("tp_base_pct"))
+        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors.
+
+        tp_base_override: lets PurgedWalkForwardEngine grid-search the base TP%
+        without mutating the process-global trading config -- the live bot's
+        on_bar() reads the same global cfg() concurrently in another thread, so
+        temporarily overwriting CFG here would leak a backtest value into a real
+        trade for the duration of the search."""
+        base_tp = float(tp_base_override) if tp_base_override is not None else float(cfg("tp_base_pct"))
         cost = self.cost_pct
         hold = int(cfg("barrier_hold_bars"))
         tp_floor = float(cfg("tp_cost_floor_mult"))
@@ -2303,8 +2307,9 @@ class GeometricPipeline:
                                xin_row[:8]])
 
     # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
-    def batch_signals(self, df, start_at=0, precomputed=None):
-        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t."""
+    def batch_signals(self, df, start_at=0, precomputed=None, tp_base_override=None):
+        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t.
+        tp_base_override: see _barrier_pcts -- thread-safe grid-search knob."""
         n = len(df)
         out = {
             "signal": np.array(["HOLD"] * n, dtype=object),
@@ -2330,7 +2335,7 @@ class GeometricPipeline:
         Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
                                                        fit_mode=False, closes=closes)
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
-        tp_arr, sl_arr = self._barrier_pcts(vol, vidx)
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx, tp_base_override=tp_base_override)
         a_gate = self.conformal.a_min if self.conformal else 0.5
         cost = self.cost_pct
         for t in range(len(vidx)):
@@ -2553,8 +2558,10 @@ class PurgedWalkForwardEngine:
     Purged Walk-Forward over the geometric pipeline: expanding chronological folds
     with an embargo gap (signature warm-up + label horizon) between IS and OOS,
     warm start + neighbour-fold RKD between folds, geometry schema fixed after the
-    first window. The OOS trading-parameter mini-grid keeps the champion/challenger
-    contract of the legacy optimizer.
+    first window. The OOS trading-parameter mini-grid searches tp_base_pct and
+    trail_mult -- the same two keys the live bot reads from trading_config.json
+    via cfg() -- so a promoted challenger is guaranteed to change live behaviour,
+    not just a parameter store nothing downstream consults.
     """
 
     def __init__(self, df, timeframe="1m", n_folds=5, seed=42):
@@ -2580,23 +2587,20 @@ class PurgedWalkForwardEngine:
             return ({k: (v[:upto] if isinstance(v, np.ndarray) else v) for k, v in vol.items()},
                     {r: sigs[r][:upto] for r in GEOM_RESOLUTIONS}, valid[:upto])
 
-        base = get_active_parameters()
-        # Index 0 is always the currently-live champion so the candidate must beat
-        # the exact production baseline, not merely win against an unrelated grid.
-        combos = [dict(base)]
-        tp_grid = sorted({float(base.get("TP_PERCENT", 0.6)), 0.6, 1.0, 1.6, 2.4})
-        trail_grid = sorted({float(base.get("TRAIL_MULT", 3.0)), 2.0, 2.5, 3.0, 3.5, 4.0})
+        base_tp = float(cfg("tp_base_pct"))
+        base_trail = float(cfg("trail_mult"))
+        # Index 0 is always the exact live cfg baseline so the candidate must beat
+        # the production configuration, not merely win against an unrelated grid.
+        combos = [{"tp_base_pct": base_tp, "TRAIL_MULT": base_trail}]
+        tp_grid = sorted({base_tp, 0.4, 0.6, 1.0, 1.6})
+        trail_grid = sorted({base_trail, 2.0, 2.5, 3.0, 3.5, 4.0})
         for tp in tp_grid:
             for tm in trail_grid:
-                cmb = dict(base)
-                cmb["TP_PERCENT"] = tp
-                cmb["TRAIL_MULT"] = tm
                 if not any(
-                    float(old.get("TP_PERCENT", 0.0)) == tp and
-                    float(old.get("TRAIL_MULT", 0.0)) == tm
+                    old["tp_base_pct"] == tp and old["TRAIL_MULT"] == tm
                     for old in combos
                 ):
-                    combos.append(cmb)
+                    combos.append({"tp_base_pct": tp, "TRAIL_MULT": tm})
 
         fold_results = {i: [] for i in range(len(combos))}
         prev_encoder = None
@@ -2614,12 +2618,20 @@ class PurgedWalkForwardEngine:
             prev_encoder = pipeline.encoder
             prev_std = pipeline._prev_standardize
 
-            geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
-                                              precomputed=pre_slice(oos_end))
             oos_df = df.iloc[oos_start:oos_end].reset_index(drop=True)
-            geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
-                   for kk, vv in geo_full.items()}
+            # tp_base_pct changes which bars count as barrier hits, so the geo
+            # payload must be recomputed per TP candidate (thread-safe -- see
+            # _barrier_pcts); trail_mult is applied post-hoc by Backtester on a
+            # fixed geo, so every combo sharing a TP value reuses one geo array.
+            geo_by_tp = {}
+            for tp_val in tp_grid:
+                geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
+                                                  precomputed=pre_slice(oos_end),
+                                                  tp_base_override=tp_val)
+                geo_by_tp[tp_val] = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
+                                      for kk, vv in geo_full.items()}
             for ci, cmb in enumerate(combos):
+                geo = geo_by_tp[cmb["tp_base_pct"]]
                 res = Backtester(oos_df).run(cmb, geo=geo)
                 fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
                                          "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
@@ -2645,7 +2657,13 @@ class PurgedWalkForwardEngine:
             key = (stable, robust_score, total_trades, -var)
             if best_key is None or key > best_key:
                 best_ci, best_key = ci, key
-        challenger = dict(combos[best_ci])
+        # normalize to the exact cfg() key shape -- this is what
+        # /api/promote_challenger feeds straight into save_trading_config(), so
+        # "optimal parameters" found here become the live trading_config.json
+        # values instead of a parallel store nothing downstream reads.
+        best_combo = combos[best_ci]
+        challenger = {"tp_base_pct": float(best_combo["tp_base_pct"]),
+                      "trail_mult": float(best_combo["TRAIL_MULT"])}
         best_summary = summaries.get(best_ci, {})
         champion_summary = summaries.get(0, {})
         folds_evaluated = max((len(rs) for rs in fold_results.values()), default=0)
@@ -2795,8 +2813,6 @@ class PositionManager:
     def is_open(self): return self.side is not None
 
     def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0, min_trail_dist=0.0):
-        if params is None:
-            params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
         self.invested_amount = invested_amount
         self.has_taken_partial_tp = False
@@ -2814,8 +2830,12 @@ class PositionManager:
         # the stops inside the cost wall (used by learned-geometry entries)
         self.min_trail_dist = float(min_trail_dist)
 
-        self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
-        self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
+        # `params` is accepted for test-call compatibility but no longer the
+        # source of truth: trail_mult is the single, live, UI-editable value in
+        # trading_config.json (see cfg()), so WFO-promote and manual edits both
+        # take effect the same way instead of feeding a store nothing reads.
+        self.trail_mult = float(params["TRAIL_MULT"]) if params and "TRAIL_MULT" in params else float(cfg("trail_mult"))
+        self.ping_stop_mult = 0.5
 
         trail_dist = max(gauss_vol*self.trail_mult, self.min_trail_dist)
         if side == "long":
@@ -3401,14 +3421,12 @@ class QuantBot:
             bot_state["timeframe_changed"] = False
             force_retrain = True
 
-        active_params = get_active_parameters()
-        bot_state["active_parameters"] = active_params
-        
-        trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
+        trail_mult = float(cfg("trail_mult"))
+        bot_state["active_parameters"] = {"TRAIL_MULT": trail_mult}  # legacy display key, kept for API compat
 
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
-        info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
+        info = self.signal_engine.process(df_completed, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
         geom = info.get("geom", {}) or {}
         log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), "
@@ -3578,7 +3596,6 @@ class QuantBot:
                     cost = roundtrip_cost_pct()
                     bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
                     opt_tp = max(float(geom.get("tp_pct") or 0.0), cfg("tp_cost_floor_mult") * cost,
-                                 float(active_params.get("TP_PERCENT", cfg("tp_base_pct"))),
                                  2.0 * bar_vol_pct * math.sqrt(int(cfg("barrier_hold_bars"))))
                     opt_sl = max(float(geom.get("sl_pct") or 0.0), cfg("sl_cost_floor_mult") * cost, 0.5 * opt_tp)
                     min_trail_dist = price * opt_tp / 100.0 * 0.5
@@ -3912,7 +3929,10 @@ class Backtester:
 
         vol_len = int(params.get("VOL_LENGTH", 14))
         trail_mult = float(params.get("TRAIL_MULT", 3.0))
-        tp_percent = float(params.get("TP_PERCENT", 0.6))
+        # tp_base_pct is the live cfg() key (see DEFAULT_TRADING_CONFIG); geo["tp"]
+        # below is already computed from this same value (or a WFO grid override),
+        # so this floor tracks whatever produced geo_tp instead of a stale constant.
+        tp_percent = float(params.get("tp_base_pct", cfg("tp_base_pct")))
 
         # Simple realised volatility (True Range, rolling mean) for trailing stops.
         # No more Gaussian-filter/CVD/HMM machinery — signals come from `geo` only.
@@ -4129,6 +4149,7 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quant Bot V3.7 — LightGBM Research Engine</title>
+    <link rel="icon" href="data:,">
     <script src="/static/lightweight-charts.js"></script>
     <style>
         :root{
@@ -4415,7 +4436,11 @@ HTML_TEMPLATE = """
     function runWFO(){ runResearch('/api/run_wfo','wfo-btn'); }
     function promote(){
         if(!confirm('Challenger parametrelerini şampiyon (canlı) yapmak istiyor musunuz?')) return;
-        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.status==='success'?'Yükseltildi!':'Hata: '+(d.message||'')); refresh(); }).catch(()=>{});
+        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{
+            alert(d.status==='success'?'Yükseltildi! Yeni parametreler: '+JSON.stringify(d.parameters||{}):'Hata: '+(d.message||''));
+            loadConfig();   // Trading Parameters panel must reflect the promoted values immediately
+            refresh();
+        }).catch(()=>{});
     }
 
     // ── Trading Parameters panel ──
@@ -4860,7 +4885,10 @@ def run_backtest_endpoint():
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
             data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
-            active_params = get_active_parameters()
+            # TRAIL_MULT is the only params-dict key Backtester still reads (TP/SL
+            # come from the geometry pipeline's cost-floored barrier targets);
+            # source it from the live, UI-editable trading config.
+            active_params = {"TRAIL_MULT": float(cfg("trail_mult"))}
             # Geometric backtest: train on the first window, trade the purged remainder.
             report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
             log.info(f"Backtest simulation completed ({report.get('engine','geometric')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
@@ -4934,17 +4962,21 @@ def run_wfo_endpoint():
             log.info(f"WFO completed ({result.get('engine','geometric-purged-wfo')}). Challenger: {result['challenger']}, "
                      f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
 
+            # challenger is {"tp_base_pct": ..., "trail_mult": ...} -- the exact
+            # keys save_trading_config()/cfg() use, so a promotion below changes
+            # what the live bot actually reads, not a parallel store nothing
+            # downstream consults.
             challenger = result["challenger"]
-            if challenger:
-                challenger = {k: v for k, v in challenger.items() if not k.startswith("slice_")}
 
             p_store = get_all_parameters()
             promotion_status = "not_promoted"
             promotion_reason = result.get("promotion_reason", "validation gate failed")
-            champion = p_store.get("champion") or {}
-            candidate_changed = challenger and any(
-                float(challenger.get(k, 0.0)) != float(champion.get(k, 0.0))
-                for k in ("TP_PERCENT", "TRAIL_MULT")
+            # Re-read live cfg (not the stale pre-run snapshot) so a manual config
+            # edit made while this multi-minute WFO was running isn't mistaken for
+            # "no change".
+            candidate_changed = bool(challenger) and (
+                abs(float(challenger.get("tp_base_pct", 0.0)) - float(cfg("tp_base_pct"))) > 1e-9 or
+                abs(float(challenger.get("trail_mult", 0.0)) - float(cfg("trail_mult"))) > 1e-9
             )
             if result.get("eligible_for_promotion") and candidate_changed:
                 if bot_instance.position.is_open:
@@ -4952,18 +4984,20 @@ def run_wfo_endpoint():
                     promotion_status = "pending_position_close"
                     promotion_reason = "validated; waiting for the open position to close"
                 else:
+                    save_trading_config({"tp_base_pct": challenger["tp_base_pct"],
+                                          "trail_mult": challenger["trail_mult"]})
                     promote_parameter_set(p_store, challenger, source="purged_wfo_auto")
                     promotion_status = "auto_promoted"
-                    promotion_reason = "validated OOS improvement; champion updated"
+                    promotion_reason = "validated OOS improvement; live config updated"
             else:
                 # Preserve a genuinely different candidate for deliberate manual
-                # override, but do not show the current champion as its own challenger.
+                # override, but do not show the current config as its own challenger.
                 p_store["shadow_challenger"] = challenger if candidate_changed else None
 
             save_parameters_store(p_store)
 
             bot_state["parameters_store"] = p_store
-            bot_state["active_parameters"] = p_store.get("champion", get_active_parameters())
+            bot_state["active_parameters"] = {"TRAIL_MULT": float(cfg("trail_mult"))}
             bot_state["wfo_bars_used"] = int(len(df))
 
             bot_state["wfo_report"] = {
@@ -5009,22 +5043,28 @@ def promote_challenger_endpoint():
         shadow = p_store.get("shadow_challenger")
         if not shadow:
             return jsonify({"status": "error", "message": "Aktif Challenger parametresi bulunamadı!"}), 400
-            
+
+        # Apply into the SAME live config the Trading Parameters panel edits --
+        # this is what makes "promote" actually change behaviour, instead of
+        # writing into parameters_store.json's champion, which nothing outside
+        # the display layer reads.
+        patch = {k: v for k, v in shadow.items() if k in DEFAULT_TRADING_CONFIG}
+        new_cfg = save_trading_config(patch)
         promote_parameter_set(p_store, shadow, source="manual_override")
         save_parameters_store(p_store)
-            
+
         bot_state["parameters_store"] = p_store
-        bot_state["active_parameters"] = shadow
-        
+        bot_state["active_parameters"] = {"TRAIL_MULT": float(cfg("trail_mult"))}
+
         msg = (
-            f"🔄 *CHALLENGER PARAMETRESİ ŞAMPİYON YAPILDI!*\n\n"
-            f"📈 *Yeni Versiyon:* v{p_store['active_version']}\n"
-            f"Parameters: {shadow}"
+            f"🔄 *CHALLENGER PARAMETRELERİ UYGULANDI!*\n\n"
+            f"📈 *Versiyon:* v{p_store['active_version']}\n"
+            f"Parametreler: {patch}"
         )
         if bot_state.get("loop"):
             asyncio.run_coroutine_threadsafe(bot_instance.telegram.send_message(msg), bot_state["loop"])
-            
-        return jsonify({"status": "success", "parameters": shadow})
+
+        return jsonify({"status": "success", "parameters": patch, "config": new_cfg})
     except Exception as e:
         log.error(f"Error promoting challenger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -5488,9 +5528,7 @@ def test_backtester_short():
         idx = 700
         geo["signal"][idx] = "SELL"; geo["dir"][idx] = -1
         geo["exp_net"][idx] = 1.0
-    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
-              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
-              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    params = {"TRAIL_MULT": 3.0}
     rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
         params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
     shorts = [t for t in rep["trades"] if t["side"] == "short"]
@@ -5574,9 +5612,7 @@ def test_pipeline_end_to_end():
     assert ch["n"] == len(ch["A"]) == len(ch["episode"]) == len(ch["buy"]) \
         == len(ch["exit"]) == len(ch["state"]), "chart overlay arrays must align"
     assert all(0.0 <= a <= 1.0 for a in ch["A"])
-    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
-              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
-              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    params = {"TRAIL_MULT": 3.0}
     rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
         params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
     assert "trade_count" in rep and "profit_factor" in rep
@@ -5586,9 +5622,7 @@ def test_pipeline_end_to_end():
 def test_geometric_backtest_and_purged_wfo():
     print("Testing run_geometric_backtest + PurgedWalkForwardEngine...")
     df = _make_synth_df(1250, seed=7)
-    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
-              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
-              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
+    params = {"TRAIL_MULT": 3.0}
     rep = run_geometric_backtest(df, params, timeframe="1m")
     assert rep["engine"] == "geometric"
     assert rep["train_bars"] > 0 and "schema" in rep
@@ -5597,7 +5631,10 @@ def test_geometric_backtest_and_purged_wfo():
     res = eng.run()
     assert res["engine"] == "geometric-purged-wfo"
     assert res["slices_evaluated"] == 3
-    assert res["challenger"] is not None and "TP_PERCENT" in res["challenger"]
+    # challenger keys must match what /api/promote_challenger writes straight into
+    # trading_config.json -- this IS the "WFO updates optimal parameters" contract.
+    assert res["challenger"] is not None
+    assert "tp_base_pct" in res["challenger"] and "trail_mult" in res["challenger"]
     assert len(res["diagnostics"]) >= 2
     versions = {d["schema"] for d in res["diagnostics"]}
     assert len(versions) == 1, "geometry schema must stay fixed across folds"
@@ -5607,6 +5644,62 @@ def test_geometric_backtest_and_purged_wfo():
     assert len(res["delta_hat_series"]) >= 2
     print(f"  purged WFO: stability {res['stability_count']}/3 | "
           f"D_anchor log {[round(e['d_anchor'], 4) for e in res['d_anchor_log']]}")
+
+
+def test_promote_challenger_updates_live_config():
+    print("Testing that promoting a WFO challenger updates the live trading config...")
+    global bot_instance
+
+    class PositionStub:
+        is_open = False
+
+    class TelegramStub:
+        async def send_message(self, msg): pass
+
+    class BotStub:
+        position = PositionStub()
+        telegram = TelegramStub()
+
+    original_bot = bot_instance
+    cfg_snapshot = dict(CFG)
+    pstore_existed = PARAMETERS_STORE_PATH.exists()
+    pstore_snapshot = PARAMETERS_STORE_PATH.read_text() if pstore_existed else None
+    bot_instance = BotStub()
+    try:
+        challenger = {"tp_base_pct": 1.23, "trail_mult": 4.56}
+        assert abs(cfg("tp_base_pct") - challenger["tp_base_pct"]) > 1e-6, "fixture must differ from current cfg"
+        assert abs(cfg("trail_mult") - challenger["trail_mult"]) > 1e-6, "fixture must differ from current cfg"
+
+        p_store = get_all_parameters()
+        p_store["shadow_challenger"] = challenger
+        save_parameters_store(p_store)
+        bot_state["parameters_store"] = p_store
+        bot_state["loop"] = None
+
+        client = app.test_client()
+        resp = client.post("/api/promote_challenger")
+        body = resp.get_json()
+        assert resp.status_code == 200 and body["status"] == "success", body
+
+        # this IS the "WFO -> optimal parameters" contract: the live cfg() the
+        # bot loop reads must match the promoted challenger, not a parallel
+        # store nothing downstream consults.
+        assert abs(cfg("tp_base_pct") - challenger["tp_base_pct"]) < 1e-9, "promote must update live cfg tp_base_pct"
+        assert abs(cfg("trail_mult") - challenger["trail_mult"]) < 1e-9, "promote must update live cfg trail_mult"
+
+        import json as _json
+        on_disk = _json.loads(TRADING_CONFIG_PATH.read_text())
+        assert abs(on_disk["tp_base_pct"] - challenger["tp_base_pct"]) < 1e-9, "promote must persist to trading_config.json"
+        assert abs(on_disk["trail_mult"] - challenger["trail_mult"]) < 1e-9, "promote must persist to trading_config.json"
+        print(f"  promote -> live cfg tp_base_pct={cfg('tp_base_pct')} trail_mult={cfg('trail_mult')} "
+              f"(also persisted to disk) ✓")
+    finally:
+        bot_instance = original_bot
+        save_trading_config(cfg_snapshot)
+        if pstore_existed:
+            PARAMETERS_STORE_PATH.write_text(pstore_snapshot)
+        elif PARAMETERS_STORE_PATH.exists():
+            PARAMETERS_STORE_PATH.unlink()
 
 
 def test_signal_engine_contract():
@@ -5811,6 +5904,7 @@ def _run_geom_suite():
     test_anchor_panel()
     test_pipeline_end_to_end()
     test_geometric_backtest_and_purged_wfo()
+    test_promote_challenger_updates_live_config()
     test_signal_engine_contract()
     test_health_monitor_auto_hold()
     print("\nAll V3.6 learned-geometry tests passed!")
