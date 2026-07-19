@@ -5452,20 +5452,28 @@ bot_instance = None
 def run_bot():
     global bot_instance
     bot_instance = QuantBot()
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     loop = asyncio.new_event_loop()
+    loop.set_default_executor(executor)
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(bot_instance.main_loop())
+    except (RuntimeError, asyncio.CancelledError) as e:
+        log.warning(f"Bot loop ended: {e}")
     except Exception as e:
         log.error(f"Bot main loop error: {e}")
     finally:
         try:
-            # Cancel all pending tasks gracefully
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        try:
+            executor.shutdown(wait=False)
         except Exception:
             pass
         loop.close()
@@ -5495,7 +5503,13 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    # Non-daemon: webview kapansa bile bot çalışmaya devam eder
+    bot_thread = threading.Thread(target=run_bot, daemon=False)
     bot_thread.start()
-    webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
-    webview.start()
+    try:
+        webview.create_window(title='Quant Bot V3.6 - Learned Geometry', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
+        webview.start()
+    except Exception as e:
+        log.warning(f"Webview error: {e}")
+    # Webview kapansa bile bot_thread bitene kadar bekle
+    bot_thread.join()
