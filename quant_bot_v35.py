@@ -89,6 +89,121 @@ COMMISSION_RATE = 0.001  # MEXC standard spot taker fee (0.1%). Set to 0.0 if yo
 ALLOW_SHORT = os.environ.get("ALLOW_SHORT", "0").strip() in ("1", "true", "True", "yes")
 TRADING_VENUE = os.environ.get("TRADING_VENUE", "spot").strip().lower()  # "spot" | "futures"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADING CONFIG — user-editable, persisted live trading parameters
+#
+# Single source of truth for the knobs the operator tunes from the UI. Persisted
+# to trading_config.json so edits survive restarts. Read at runtime through
+# cfg(key); geometry-affecting knobs (gates, barrier, health) take effect on the
+# next fold refit, the rest apply on the next tick.
+# ═══════════════════════════════════════════════════════════════════════════════
+TRADING_CONFIG_PATH = Path(__file__).parent / "trading_config.json"
+
+DEFAULT_TRADING_CONFIG = {
+    # ── Sermaye & Risk ──
+    "risk_per_trade_pct": 2.0,     # % of equity risked per trade (position sizing)
+    "max_capital_pct": 95.0,       # max % of equity deployed in one position
+    "min_order_usdt": 5.0,         # exchange minimum notional
+    "paper_start_balance": 10000.0,
+    # ── Hedefler & Çıkışlar ──
+    "tp_base_pct": 0.6,            # base take-profit % (floored by cost model)
+    "trail_mult": 3.0,             # trailing-stop = mult × realised volatility
+    "partial_tp_ratio": 70.0,      # % of position taken at first trailing hit
+    "barrier_hold_bars": 30,       # barrier-race horizon (labels/meta/targets)
+    "tp_cost_floor_mult": 3.0,     # TP must clear this × roundtrip cost
+    "sl_cost_floor_mult": 1.5,     # SL floor = this × roundtrip cost
+    # ── Maliyet Modeli ──
+    "commission_pct": 0.1,         # per-side taker fee %
+    "slippage_pct": 0.05,          # per-side slippage %
+    "spread_pct": 0.01,            # half-spread %
+    # ── Karar Kapıları ──
+    "gbm_gate_quantile": 70.0,     # p_hi/p_lo set at this quantile of train probs
+    "conformal_accept_pct": 60.0,  # conformal target acceptance rate
+    "obi_wall": 0.3,               # order-book imbalance wall that blocks entries
+    "allow_short": False,          # opt-in two-sided (futures) shorts
+    # ── Sağlık Eşikleri (auto-HOLD) ──
+    "overfit_gap_max": 0.25,       # IS-OOS AUC gap ceiling
+    "d_anchor_drift_max": 0.60,    # representation drift ceiling vs fold-0 panel
+    "recon_regress_max": 2.5,      # held-out recon may not exceed this × baseline
+    # ── Genel ──
+    "loop_interval_sec": 10,       # main decision loop cadence
+}
+
+# Metadata for the UI: label, group, unit, min, max, step, and whether the change
+# takes effect live or only on the next geometry refit.
+TRADING_CONFIG_META = {
+    "risk_per_trade_pct":  ("Risk / İşlem", "Sermaye & Risk", "%", 0.1, 10.0, 0.1, "live"),
+    "max_capital_pct":     ("Maks. Sermaye", "Sermaye & Risk", "%", 5.0, 100.0, 1.0, "live"),
+    "min_order_usdt":      ("Min. Emir", "Sermaye & Risk", "USDT", 1.0, 100.0, 0.5, "live"),
+    "paper_start_balance": ("Paper Bakiye", "Sermaye & Risk", "USDT", 100.0, 1_000_000.0, 100.0, "restart"),
+    "tp_base_pct":         ("TP Taban", "Hedefler & Çıkışlar", "%", 0.1, 10.0, 0.05, "live"),
+    "trail_mult":          ("Trailing Çarpanı", "Hedefler & Çıkışlar", "×vol", 0.5, 10.0, 0.1, "live"),
+    "partial_tp_ratio":    ("Kısmi TP Oranı", "Hedefler & Çıkışlar", "%", 0.0, 100.0, 5.0, "live"),
+    "barrier_hold_bars":   ("Bariyer Ufku", "Hedefler & Çıkışlar", "bar", 5, 200, 1, "refit"),
+    "tp_cost_floor_mult":  ("TP Maliyet Tabanı", "Hedefler & Çıkışlar", "×maliyet", 1.0, 10.0, 0.5, "live"),
+    "sl_cost_floor_mult":  ("SL Maliyet Tabanı", "Hedefler & Çıkışlar", "×maliyet", 0.5, 10.0, 0.5, "live"),
+    "commission_pct":      ("Komisyon", "Maliyet Modeli", "%", 0.0, 1.0, 0.005, "live"),
+    "slippage_pct":        ("Slipaj", "Maliyet Modeli", "%", 0.0, 1.0, 0.005, "live"),
+    "spread_pct":          ("Spread (yarım)", "Maliyet Modeli", "%", 0.0, 1.0, 0.005, "live"),
+    "gbm_gate_quantile":   ("GBM Kapı Kantili", "Karar Kapıları", "%", 30.0, 95.0, 1.0, "refit"),
+    "conformal_accept_pct":("Conformal Kabul", "Karar Kapıları", "%", 20.0, 95.0, 1.0, "refit"),
+    "obi_wall":            ("OBI Duvarı", "Karar Kapıları", "", 0.0, 1.0, 0.05, "live"),
+    "allow_short":         ("Short'a İzin Ver", "Karar Kapıları", "bool", 0, 1, 1, "live"),
+    "overfit_gap_max":     ("Overfit Gap Maks.", "Sağlık Eşikleri", "AUC", 0.05, 0.60, 0.01, "live"),
+    "d_anchor_drift_max":  ("D_anchor Drift Maks.", "Sağlık Eşikleri", "", 0.1, 2.0, 0.05, "live"),
+    "recon_regress_max":   ("Recon Regres. Maks.", "Sağlık Eşikleri", "×", 1.5, 10.0, 0.5, "live"),
+    "loop_interval_sec":   ("Döngü Aralığı", "Genel", "sn", 2, 120, 1, "live"),
+}
+
+def _coerce_cfg(cfg):
+    """Clamp + type-coerce a config dict against the metadata bounds."""
+    out = dict(DEFAULT_TRADING_CONFIG)
+    for k, v in (cfg or {}).items():
+        if k not in DEFAULT_TRADING_CONFIG:
+            continue
+        meta = TRADING_CONFIG_META.get(k)
+        try:
+            if meta and meta[2] == "bool":
+                out[k] = bool(v)
+            elif isinstance(DEFAULT_TRADING_CONFIG[k], int) and meta and meta[2] != "%":
+                out[k] = int(round(float(v)))
+            else:
+                out[k] = float(v)
+            if meta and meta[2] != "bool":
+                lo, hi = meta[3], meta[4]
+                out[k] = min(max(out[k], lo), hi)
+        except (TypeError, ValueError):
+            out[k] = DEFAULT_TRADING_CONFIG[k]
+    return out
+
+def load_trading_config():
+    try:
+        if TRADING_CONFIG_PATH.exists():
+            import json
+            with open(TRADING_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return _coerce_cfg(json.load(f))
+    except Exception as e:
+        logging.getLogger("QuantBot").error(f"Error loading trading config: {e}")
+    return dict(DEFAULT_TRADING_CONFIG)
+
+def save_trading_config(new_cfg):
+    """Merge, clamp, persist and return the effective config."""
+    merged = _coerce_cfg({**CFG, **(new_cfg or {})})
+    CFG.clear(); CFG.update(merged)
+    try:
+        import json
+        with open(TRADING_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(CFG, f, indent=2)
+    except Exception as e:
+        logging.getLogger("QuantBot").error(f"Error saving trading config: {e}")
+    return dict(CFG)
+
+CFG = load_trading_config()
+
+def cfg(key):
+    """Live read of a trading-config value (falls back to the default)."""
+    return CFG.get(key, DEFAULT_TRADING_CONFIG.get(key))
+
 # Yerel saat dilimi farkini hesapla (Turkiye = UTC+3 = 10800 saniye)
 from datetime import timezone as _tz
 UTC_OFFSET = int(datetime.now(_tz.utc).astimezone().utcoffset().total_seconds())
@@ -148,7 +263,7 @@ bot_state = {
     "signal_type": "",
     "obi": 0.0,
 
-    "virtual_balance": 10000.0,
+    "virtual_balance": cfg("paper_start_balance"),
     "real_balance": 0.0,
 
     "position_side": None,
@@ -166,7 +281,7 @@ bot_state = {
     "winning_trades": 0,
     "losing_trades": 0,
     "max_drawdown": 0.0,
-    "peak_balance": 10000.0,
+    "peak_balance": cfg("paper_start_balance"),
     "start_real_balance": 0.0,
     "peak_real_balance": 0.0,
     "loop": None,
@@ -203,7 +318,7 @@ bot_state = {
              "episode": "NORMAL", "cluster": -1, "fold": 0, "dir": 0},
 
     # Two-sided trading toggles (opt-in short)
-    "allow_short": ALLOW_SHORT,
+    "allow_short": bool(cfg("allow_short")) or ALLOW_SHORT,
     "trading_venue": TRADING_VENUE,
 }
 
@@ -213,13 +328,13 @@ bot_state = {
 def update_portfolio_metrics(pnl_usdt, mode):
     # Determine base capital for calculation
     if mode == "PAPER":
-        base_capital = 10000.0
+        base_capital = cfg("paper_start_balance")
         current_balance = bot_state["virtual_balance"]
     else:
         current_balance = bot_state.get("real_balance", 0.0)
         base_capital = bot_state.get("start_real_balance", current_balance)
         if base_capital <= 0:
-            base_capital = 10000.0
+            base_capital = cfg("paper_start_balance")
 
     # Calculate portfolio return % for this trade relative to capital base
     pnl_pct = (pnl_usdt / base_capital) * 100 if base_capital > 0 else 0.0
@@ -229,7 +344,7 @@ def update_portfolio_metrics(pnl_usdt, mode):
     
     # Cumulative portfolio PnL % based on balance equity change
     if mode == "PAPER":
-        bot_state["total_pnl"] = ((current_balance - 10000.0) / 10000.0) * 100
+        bot_state["total_pnl"] = ((current_balance - cfg("paper_start_balance")) / cfg("paper_start_balance")) * 100
     else:
         bot_state["total_pnl"] = ((current_balance - base_capital) / base_capital) * 100 if base_capital > 0 else 0.0
 
@@ -253,7 +368,7 @@ def update_portfolio_metrics(pnl_usdt, mode):
     
     # Peak and Drawdown tracking
     if mode == "PAPER":
-        bot_state["peak_balance"] = max(bot_state.get("peak_balance", 10000.0), current_balance)
+        bot_state["peak_balance"] = max(bot_state.get("peak_balance", cfg("paper_start_balance")), current_balance)
         dd = ((bot_state["peak_balance"] - current_balance) / bot_state["peak_balance"]) * 100
         bot_state["max_drawdown"] = max(bot_state["max_drawdown"], dd)
     else:
@@ -356,10 +471,14 @@ GEO_BARRIER_HOLD = 30                  # barrier-race horizon: labels, meta and 
 GEOMETRY_STORE_PATH = Path(__file__).parent / "geometry_store.json"
 
 
-def roundtrip_cost_pct(commission_rate=COMMISSION_RATE, slippage_rate=0.0005, spread_rate=0.0001):
+def roundtrip_cost_pct(commission_rate=None, slippage_rate=None, spread_rate=None):
     """Total roundtrip trading cost in percent: commission both ways plus
-    entry/exit slippage and half-spread — the floor every target must clear."""
-    return 2.0 * commission_rate * 100.0 + 2.0 * (slippage_rate + spread_rate / 2.0) * 100.0
+    entry/exit slippage and half-spread — the floor every target must clear.
+    Reads live from the trading config unless explicit rates are passed."""
+    comm = cfg("commission_pct") if commission_rate is None else commission_rate * 100.0
+    slip = cfg("slippage_pct") if slippage_rate is None else slippage_rate * 100.0
+    sprd = cfg("spread_pct") if spread_rate is None else spread_rate * 100.0
+    return 2.0 * comm + 2.0 * (slip + sprd / 2.0)
 
 
 def _softplus(x):
@@ -1957,12 +2076,12 @@ class GeometricPipeline:
         # cost-blind 4-bar direction. Tail purged for the full hold.
         T = len(vidx2)
         tp_arr, sl_arr = self._barrier_pcts(vol, vidx2)
-        usable = np.array([vidx2[t] + GEO_BARRIER_HOLD < len(closes) for t in range(T)])
+        usable = np.array([vidx2[t] + int(cfg("barrier_hold_bars")) < len(closes) for t in range(T)])
         y = np.zeros(T)
         for t in range(T):
             if usable[t]:
                 y[t] = MetaLabeler.barrier_dir(
-                    closes, vidx2[t], tp_arr[t], max_hold=GEO_BARRIER_HOLD)
+                    closes, vidx2[t], tp_arr[t], max_hold=int(cfg("barrier_hold_bars")))
 
         cal_start = int(T * 0.80)          # recent, chronological, NOT stratified
         tr_mask = usable.copy(); tr_mask[cal_start:] = False
@@ -1990,8 +2109,8 @@ class GeometricPipeline:
         self.gbm.fit(Xf[tr_mask][:, self.feature_mask], y[tr_mask])
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
         # symmetric directional thresholds: long if p_up high, short if p_up low
-        self.p_hi = float(np.quantile(p_all[:cal_start], 0.70))
-        self.p_lo = float(np.quantile(p_all[:cal_start], 0.30))
+        self.p_hi = float(np.quantile(p_all[:cal_start], cfg("gbm_gate_quantile") / 100.0))
+        self.p_lo = float(np.quantile(p_all[:cal_start], 1.0 - cfg("gbm_gate_quantile") / 100.0))
 
         # OVERFITTING diagnostic: primary-model AUC in-sample vs on the held-out
         # chronological tail. A large positive gap = the model memorized the train
@@ -2020,7 +2139,7 @@ class GeometricPipeline:
                 continue
             meta_X.append(self._meta_features(conf, dsign, Xin[t], flags[t], states[t]))
             meta_y.append(MetaLabeler.barrier_outcome_dir(
-                closes, vidx2[t], tp_arr[t], sl_arr[t], side, max_hold=GEO_BARRIER_HOLD))
+                closes, vidx2[t], tp_arr[t], sl_arr[t], side, max_hold=int(cfg("barrier_hold_bars"))))
         self.meta = MetaLabeler()
         if len(meta_X) >= 12 and 0 < np.mean(meta_y) < 1:
             self.meta.fit(np.stack(meta_X), np.array(meta_y))
@@ -2036,7 +2155,7 @@ class GeometricPipeline:
                 self._meta_features(conf, dsign, Xin[t], flags[t], states[t])[None, :])[0]))
             dm.append(self.panel.dmin({r: sigs[r][vidx2[t]] for r in GEOM_RESOLUTIONS}))
         if len(pm) >= 5:
-            self.conformal.calibrate(pm, dm)
+            self.conformal.calibrate(pm, dm, target_accept=cfg("conformal_accept_pct") / 100.0)
 
         # panel bookkeeping + drift series
         self.panel.refresh(sigs, valid, fold)
@@ -2112,15 +2231,18 @@ class GeometricPipeline:
         realized vol of the barrier horizon; SL risks less than the target so the
         payoff matrix can be positive at achievable hit rates.
         Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
-        base_tp = float(get_active_parameters().get("TP_PERCENT", 0.3))
+        base_tp = float(cfg("tp_base_pct"))
         cost = self.cost_pct
+        hold = int(cfg("barrier_hold_bars"))
+        tp_floor = float(cfg("tp_cost_floor_mult"))
+        sl_floor = float(cfg("sl_cost_floor_mult"))
         bar_vol_pct = vol["rv"][vidx] * 100.0
         tp = np.maximum.reduce([
             np.full(len(vidx), base_tp),
-            np.full(len(vidx), 3.0 * cost),
-            2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD),
+            np.full(len(vidx), tp_floor * cost),
+            2.0 * bar_vol_pct * math.sqrt(hold),
         ])
-        sl = np.maximum(1.5 * cost, 0.5 * tp)
+        sl = np.maximum(sl_floor * cost, 0.5 * tp)
         return tp, sl
 
     def _meta_features(self, conf, dir_sign, xin_row, flag, state):
@@ -2251,33 +2373,34 @@ class GeometricPipeline:
     # Thresholds beyond which a READY pipeline is treated as untrustworthy and
     # the live signal is forced to HOLD. This is the answer to "a layer breaks
     # silently and still prints a plausible number" — the number is checked.
-    OVERFIT_GAP_MAX = 0.25       # IS-OOS AUC gap: > this ⇒ the model memorised
-    D_ANCHOR_DRIFT_MAX = 0.60    # representation drift vs fold-0 panel relations
-    RECON_REGRESS_MAX = 2.5      # held-out recon may not exceed 2.5× the fold-0 baseline
     DELTA_HAT_DRIFT_MAX = 3.0    # data-side δ̂ may not move more than 3× vs baseline
     STALE_BARS_MULT = 4          # encoder older than 4× the refit cadence ⇒ stale
 
     def health_status(self, n_bars=None):
         """Return {'health': 'ok'|'degraded', 'reasons': [...]} from the latest
         fold diagnostics. Any tripped guard degrades the pipeline; SignalEngine
-        then emits HOLD regardless of what the decision chain produced."""
+        then emits HOLD regardless of what the decision chain produced.
+        Thresholds are live from the trading config."""
         reasons = []
         if not self.diagnostics or self.status != "ready":
             return {"health": "ok" if self.status == "ready" else "warmup", "reasons": []}
         d = self.diagnostics[-1]
+        gap_max = cfg("overfit_gap_max")
+        drift_max = cfg("d_anchor_drift_max")
+        recon_max = cfg("recon_regress_max")
 
         gap = float(d.get("overfit_gap", 0.0))
-        if gap > self.OVERFIT_GAP_MAX:
-            reasons.append(f"overfit gap {gap:.2f}>{self.OVERFIT_GAP_MAX}")
+        if gap > gap_max:
+            reasons.append(f"overfit gap {gap:.2f}>{gap_max:.2f}")
 
         d_anchor = abs(float(d.get("d_anchor", 0.0)))
-        if d_anchor > self.D_ANCHOR_DRIFT_MAX:
-            reasons.append(f"D_anchor drift {d_anchor:.2f}>{self.D_ANCHOR_DRIFT_MAX}")
+        if d_anchor > drift_max:
+            reasons.append(f"D_anchor drift {d_anchor:.2f}>{drift_max:.2f}")
 
         recon = float(d.get("heldout_recon", 0.0))
         if (self.baseline_heldout and recon == recon
-                and recon > self.RECON_REGRESS_MAX * self.baseline_heldout):
-            reasons.append(f"recon {recon:.3f}>{self.RECON_REGRESS_MAX}×baseline")
+                and recon > recon_max * self.baseline_heldout):
+            reasons.append(f"recon {recon:.3f}>{recon_max:.1f}×baseline")
 
         dh = float(d.get("delta_hat_data", 0.0))
         if self.baseline_delta_hat and self.baseline_delta_hat > 1e-9:
@@ -2388,7 +2511,7 @@ class PurgedWalkForwardEngine:
         self.timeframe = timeframe
         self.n_folds = n_folds
         self.seed = seed
-        self.embargo = max(GEOM_RESOLUTIONS) + GEO_BARRIER_HOLD
+        self.embargo = max(GEOM_RESOLUTIONS) + int(cfg("barrier_hold_bars"))
 
     def run(self):
         df = self.df
@@ -2483,7 +2606,7 @@ def run_geometric_backtest(df, params, timeframe="1m", seed=42):
     df = df.reset_index(drop=True)
     n = len(df)
     split = max(GeometricPipeline.MIN_TRAIN_BARS, int(n * 0.35))
-    embargo = max(GEOM_RESOLUTIONS) + GEO_BARRIER_HOLD
+    embargo = max(GEOM_RESOLUTIONS) + int(cfg("barrier_hold_bars"))
     if n < split + embargo + 120:
         raise ValueError(f"Not enough bars for geometric backtest ({n})")
     pipeline = GeometricPipeline(timeframe, seed=seed, encoder_epochs=45)
@@ -3156,8 +3279,9 @@ class QuantBot:
 
             if reason == "PARTIAL_TP":
                 try:
-                    close_qty = self.position.qty * 0.70
-                    log.info(f"PARTIAL TP (70%) TRIGGERED! Qty to close: {close_qty:.6f} at {price:.2f}")
+                    ptp = cfg("partial_tp_ratio") / 100.0; keep = 1.0 - ptp
+                    close_qty = self.position.qty * ptp
+                    log.info(f"PARTIAL TP ({ptp*100:.0f}%) TRIGGERED! Qty to close: {close_qty:.6f} at {price:.2f}")
 
                     pos_mode = self.position.mode
                     pos_side = self.position.side
@@ -3197,7 +3321,7 @@ class QuantBot:
                         bot_state["virtual_balance"] -= comm_exit
 
                     pnl_pct = (actual_exit_price - pos_entry_price)/pos_entry_price*100 if pos_side=="long" else (pos_entry_price - actual_exit_price)/pos_entry_price*100
-                    realized_pnl_usdt = (pos_invested * 0.70) * (pnl_pct / 100)
+                    realized_pnl_usdt = (pos_invested * ptp) * (pnl_pct / 100)
                     
                     # Update virtual balance for Paper
                     if pos_mode == "PAPER":
@@ -3217,8 +3341,8 @@ class QuantBot:
                     })
 
                     # Adjust remaining position (30%)
-                    self.position.qty *= 0.30
-                    self.position.invested_amount *= 0.30
+                    self.position.qty *= keep
+                    self.position.invested_amount *= keep
                     self.position.has_taken_partial_tp = True
                     bot_state["position_qty"] = float(self.position.qty)
 
@@ -3252,10 +3376,10 @@ class QuantBot:
         # OBI & Risk Parity filtering
         obi_filter_pass = True
         obi_now = bot_state.get("obi", 0)
-        if info['signal'] == "BUY" and obi_now < -0.3:
+        if info['signal'] == "BUY" and obi_now < -cfg("obi_wall"):
             obi_filter_pass = False
             log.info(f"BUY blocked by OBI ({obi_now:.2f} Sell Wall)")
-        elif info['signal'] == "SELL" and obi_now > 0.3:
+        elif info['signal'] == "SELL" and obi_now > cfg("obi_wall"):
             obi_filter_pass = False
             log.info(f"SELL blocked by OBI ({obi_now:.2f} Buy Wall)")
 
@@ -3267,9 +3391,9 @@ class QuantBot:
                     entry_vol = float(info['gauss_vol'])
                     cost = roundtrip_cost_pct()
                     bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
-                    opt_tp = max(float(geom.get("tp_pct") or 0.0), 3.0 * cost,
-                                 2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
-                    opt_sl = max(float(geom.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
+                    opt_tp = max(float(geom.get("tp_pct") or 0.0), cfg("tp_cost_floor_mult") * cost,
+                                 2.0 * bar_vol_pct * math.sqrt(int(cfg("barrier_hold_bars"))))
+                    opt_sl = max(float(geom.get("sl_pct") or 0.0), cfg("sl_cost_floor_mult") * cost, 0.5 * opt_tp)
                     min_trail_dist = price * opt_tp / 100.0 * 0.5
                     stop_dist = max(entry_vol * trail_mult, min_trail_dist, price * 0.01)
                     active_mode = bot_state["trading_mode"]
@@ -3283,20 +3407,20 @@ class QuantBot:
                             bot_state["start_real_balance"] = real_usdt
                             bot_state["peak_real_balance"] = real_usdt
 
-                        if real_usdt >= 5:
+                        if real_usdt >= cfg("min_order_usdt"):
                             side = "buy"
-                            risk_amount = real_usdt * (TARGET_RISK_PERCENT / 100.0)
+                            risk_amount = real_usdt * (cfg("risk_per_trade_pct") / 100.0)
                             target_qty = risk_amount / stop_dist
-                            max_qty = (real_usdt * MAX_CAPITAL_ALLOCATION) / price
+                            max_qty = (real_usdt * (cfg("max_capital_pct") / 100.0)) / price
                             qty = min(target_qty, max_qty)
                             
                             # Precision check & min 5 USDT enforcement
                             formatted_qty = self.exchange.amount_to_precision(SYMBOL, qty)
                             order_qty = float(formatted_qty)
                             
-                            if order_qty * price < 5.0:
+                            if order_qty * price < cfg("min_order_usdt"):
                                 # Scale up to minimum order size if real balance allows
-                                min_qty = 5.2 / price
+                                min_qty = (cfg("min_order_usdt") * 1.04) / price
                                 formatted_min = self.exchange.amount_to_precision(SYMBOL, min_qty)
                                 if real_usdt >= float(formatted_min) * price:
                                     order_qty = float(formatted_min)
@@ -3339,11 +3463,11 @@ class QuantBot:
                             asyncio.create_task(self.telegram.send_message(msg))
                     else:
                         # PAPER TRADING
-                        if bot_state["virtual_balance"] >= 5:
+                        if bot_state["virtual_balance"] >= cfg("min_order_usdt"):
                             side = "buy"
-                            risk_amount = bot_state["virtual_balance"] * (TARGET_RISK_PERCENT / 100.0)
+                            risk_amount = bot_state["virtual_balance"] * (cfg("risk_per_trade_pct") / 100.0)
                             target_qty = risk_amount / stop_dist
-                            max_qty = (bot_state["virtual_balance"] * MAX_CAPITAL_ALLOCATION) / price
+                            max_qty = (bot_state["virtual_balance"] * (cfg("max_capital_pct") / 100.0)) / price
                             qty = min(target_qty, max_qty)
                             
                             # Apply paper slippage on entry (0.05%)
@@ -3390,9 +3514,9 @@ class QuantBot:
                 cost = roundtrip_cost_pct()
                 g_state = info.get("geom", {}) or {}
                 bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
-                opt_tp = max(float(g_state.get("tp_pct") or 0.0), 3.0 * cost,
-                             2.0 * bar_vol_pct * math.sqrt(GEO_BARRIER_HOLD))
-                opt_sl = max(float(g_state.get("sl_pct") or 0.0), 1.5 * cost, 0.5 * opt_tp)
+                opt_tp = max(float(g_state.get("tp_pct") or 0.0), cfg("tp_cost_floor_mult") * cost,
+                             2.0 * bar_vol_pct * math.sqrt(int(cfg("barrier_hold_bars"))))
+                opt_sl = max(float(g_state.get("sl_pct") or 0.0), cfg("sl_cost_floor_mult") * cost, 0.5 * opt_tp)
                 min_trail_dist = price * opt_tp / 100.0 * 0.5
                 stop_dist = max(entry_vol * trail_mult, min_trail_dist)
                 if stop_dist <= 0:
@@ -3407,10 +3531,10 @@ class QuantBot:
                         asyncio.create_task(self.telegram.send_message(
                             "⚠️ *Geo SHORT sinyali (REAL)*: Canlı futures short otomatik açılmıyor. "
                             "Önce PAPER/backtest ile doğrula; futures emirleri bilinçli olarak devreye alınmalı."))
-                elif bot_state["virtual_balance"] >= 5:
-                    risk_amount = bot_state["virtual_balance"] * (TARGET_RISK_PERCENT / 100.0)
+                elif bot_state["virtual_balance"] >= cfg("min_order_usdt"):
+                    risk_amount = bot_state["virtual_balance"] * (cfg("risk_per_trade_pct") / 100.0)
                     target_qty = risk_amount / stop_dist
-                    max_qty = (bot_state["virtual_balance"] * MAX_CAPITAL_ALLOCATION) / price
+                    max_qty = (bot_state["virtual_balance"] * (cfg("max_capital_pct") / 100.0)) / price
                     qty = min(target_qty, max_qty)
 
                     slippage_price = price * 0.9995          # short fills below mid
@@ -3544,7 +3668,7 @@ class QuantBot:
             
             if not changed:
                 try:
-                    await asyncio.wait_for(tf_change_event.wait(), timeout=LOOP_INTERVAL)
+                    await asyncio.wait_for(tf_change_event.wait(), timeout=cfg("loop_interval_sec"))
                     log.info("Tick woke up (interval or timeframe trigger).")
                 except asyncio.TimeoutError:
                     pass
@@ -3558,11 +3682,12 @@ class QuantBot:
                 await asyncio.sleep(5)
 
 class Backtester:
-    def __init__(self, df, commission_rate=0.001, slippage_rate=0.0005, spread_rate=0.0001):
+    def __init__(self, df, commission_rate=None, slippage_rate=None, spread_rate=None):
         self.df = df
-        self.commission_rate = commission_rate
-        self.slippage_rate = slippage_rate
-        self.spread_rate = spread_rate
+        # cost rates default to the live trading config (percent → fraction)
+        self.commission_rate = cfg("commission_pct") / 100.0 if commission_rate is None else commission_rate
+        self.slippage_rate = cfg("slippage_pct") / 100.0 if slippage_rate is None else slippage_rate
+        self.spread_rate = cfg("spread_pct") / 100.0 if spread_rate is None else spread_rate
 
     def run(self, params, geo=None):
         """geo: optional per-bar arrays from GeometricPipeline.batch_signals — when
@@ -3667,20 +3792,21 @@ class Backtester:
                     exit_reason = "Geo Exit (Conformal/Transition)"
 
                 if exit_reason == "PARTIAL_TP":
-                    close_qty = qty * 0.70
+                    ptp = cfg("partial_tp_ratio") / 100.0; keep = 1.0 - ptp
+                    close_qty = qty * ptp
                     slippage_factor = self.slippage_rate + self.spread_rate / 2
                     exec_price = price * (1 - slippage_factor) if position_side == "long" else price * (1 + slippage_factor)
                     pnl_pct = (exec_price - entry_price) / entry_price * 100 if position_side == "long" else (entry_price - exec_price) / entry_price * 100
                     fee = close_qty * exec_price * self.commission_rate
-                    pnl_usdt = (invested_amount * 0.70) * (pnl_pct / 100) - fee
+                    pnl_usdt = (invested_amount * ptp) * (pnl_pct / 100) - fee
                     
                     balance += pnl_usdt
                     pnl_list.append(pnl_pct)
                     if pnl_pct > 0: gross_profit += pnl_usdt
                     else: gross_loss += abs(pnl_usdt)
                     
-                    qty *= 0.30
-                    invested_amount *= 0.30
+                    qty *= keep
+                    invested_amount *= keep
                     has_taken_partial_tp = True
                 elif exit_reason is not None:
                     slippage_factor = self.slippage_rate + self.spread_rate / 2
@@ -3733,8 +3859,8 @@ class Backtester:
                     entry_volatility = float(gv[idx-1])
                     # cost-floored, vol-scaled barrier targets from the pipeline;
                     # trailing may never come closer than half the target
-                    current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(tp_percent, 3.0 * roundtrip_cost_pct())
-                    current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(0.3, 1.5 * roundtrip_cost_pct())
+                    current_tp_percent = float(geo["tp"][idx-1]) if "tp" in geo else max(tp_percent, cfg("tp_cost_floor_mult") * roundtrip_cost_pct())
+                    current_sl_percent = float(geo["sl"][idx-1]) if "sl" in geo else max(0.3, cfg("sl_cost_floor_mult") * roundtrip_cost_pct())
                     min_trail_dist = entry_price * current_tp_percent / 100.0 * 0.5
                     max_price_seen = entry_price
                     min_price_seen = entry_price
@@ -3742,9 +3868,9 @@ class Backtester:
                     stop_dist = max(gv[idx-1] * trail_mult, min_trail_dist)
                     if stop_dist <= 0: stop_dist = entry_price * 0.01
 
-                    risk_amount = balance * (TARGET_RISK_PERCENT / 100.0)
+                    risk_amount = balance * (cfg("risk_per_trade_pct") / 100.0)
                     target_qty = risk_amount / stop_dist
-                    max_qty = (balance * MAX_CAPITAL_ALLOCATION) / entry_price
+                    max_qty = (balance * (cfg("max_capital_pct") / 100.0)) / entry_price
                     qty = min(target_qty, max_qty)
                     invested_amount = qty * entry_price
 
@@ -3811,664 +3937,567 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Bot V3.6 - Learned Geometry</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <title>Quant Bot V3.6 — Learned Geometry</title>
     <script src="/static/lightweight-charts.js"></script>
     <style>
-        :root {
-            --bg-color: #131722;
-            --panel-bg: #1e222d;
-            --border-color: #2a2e39;
-            --text-main: #d1d4dc;
-            --text-muted: #787b86;
-            --tv-green: #2962ff;
-            --profit-green: #089981;
-            --loss-red: #f23645;
-            --warning-yellow: #f5b041;
-            --paper-blue: #00bcd4;
+        :root{
+            --bg:#0d1017; --panel:#161b24; --panel2:#1b212c; --border:#262d3a;
+            --text:#d7dbe3; --muted:#7d879c; --accent:#4c8dff; --green:#22c55e;
+            --red:#ef4444; --yellow:#f5b73d; --cyan:#22d3ee; --purple:#c084fc;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; user-select: none; }
-        body { background-color: var(--bg-color); color: var(--text-main); height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+        *{box-sizing:border-box; margin:0; padding:0; font-family:'Segoe UI',system-ui,sans-serif;}
+        body{background:var(--bg); color:var(--text); height:100vh; overflow:hidden; display:flex; flex-direction:column; font-size:13px;}
+        .row{display:flex; align-items:center;}
+        .grow{flex:1;}
+        .muted{color:var(--muted);}
+        .green{color:var(--green);} .red{color:var(--red);} .yellow{color:var(--yellow);}
+        .cyan{color:var(--cyan);} .accent{color:var(--accent);}
+        .mono{font-family:'Consolas','Roboto Mono',monospace;}
 
-        header { background-color: var(--panel-bg); border-bottom: 1px solid var(--border-color); padding: 8px 20px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
-        .header-title { font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-        .controls { display: flex; gap: 12px; align-items: center; }
-        .mode-toggle { display: flex; background: rgba(0,0,0,0.2); border-radius: 6px; padding: 2px; border: 1px solid var(--border-color); }
-        .mode-btn { padding: 5px 10px; border: none; background: transparent; color: var(--text-muted); font-size: 0.75rem; font-weight: 600; cursor: pointer; border-radius: 4px; transition: 0.2s; }
-        .mode-btn.paper-active { background: rgba(0, 188, 212, 0.2); color: var(--paper-blue); border: 1px solid rgba(0, 188, 212, 0.5); }
-        .mode-btn.real-active { background: rgba(242, 54, 69, 0.2); color: var(--loss-red); border: 1px solid rgba(242, 54, 69, 0.5); }
+        header{background:var(--panel); border-bottom:1px solid var(--border); padding:8px 16px; display:flex; align-items:center; gap:16px; flex-shrink:0;}
+        .brand{font-weight:700; font-size:15px; display:flex; align-items:center; gap:8px;}
+        .brand .dot{width:9px; height:9px; border-radius:50%; background:var(--accent);}
+        .sym{font-weight:600; color:var(--muted);}
+        .price{font-size:20px; font-weight:700; font-family:'Consolas',monospace;}
+        .badge{padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; border:1px solid transparent; display:flex; align-items:center; gap:6px;}
+        .badge .bdot{width:7px; height:7px; border-radius:50%; }
+        .b-green{background:rgba(34,197,94,.12); color:var(--green); border-color:rgba(34,197,94,.3);}
+        .b-yellow{background:rgba(245,183,61,.12); color:var(--yellow); border-color:rgba(245,183,61,.3);}
+        .b-red{background:rgba(239,68,68,.12); color:var(--red); border-color:rgba(239,68,68,.3);}
+        .b-grey{background:rgba(125,135,156,.12); color:var(--muted); border-color:rgba(125,135,156,.3);}
+        @keyframes blink{0%,100%{opacity:1;}50%{opacity:.35;}}
+        .blink{animation:blink 1.4s infinite;}
 
-        .status-badge { padding: 5px 10px; border-radius: 4px; font-size: 0.75rem; font-weight: 700; display: flex; align-items: center; gap: 6px; border: 1px solid;}
-        .status-active { background-color: rgba(8, 153, 129, 0.1); color: var(--profit-green); border-color: rgba(8, 153, 129, 0.3);}
-        .status-paused { background-color: rgba(245, 176, 65, 0.1); color: var(--warning-yellow); border-color: rgba(245, 176, 65, 0.3);}
-        .dot-blink { width: 7px; height: 7px; border-radius: 50%; animation: blink 1.5s infinite; }
-        .bg-green { background-color: var(--profit-green); }
-        .bg-yellow { background-color: var(--warning-yellow); }
-        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .modes{display:flex; background:rgba(0,0,0,.25); border-radius:7px; padding:2px; border:1px solid var(--border);}
+        .mode{padding:5px 12px; border:none; background:transparent; color:var(--muted); font-size:12px; font-weight:700; cursor:pointer; border-radius:5px;}
+        .mode.on-paper{background:rgba(76,141,255,.18); color:var(--accent);}
+        .mode.on-real{background:rgba(239,68,68,.18); color:var(--red);}
+        .btn{padding:7px 16px; border-radius:6px; font-weight:700; cursor:pointer; border:none; font-size:12px; color:#fff;}
+        .btn-start{background:var(--green);} .btn-stop{background:var(--red);}
+        .btn-ghost{background:var(--panel2); color:var(--text); border:1px solid var(--border); font-weight:600;}
+        .btn:disabled{opacity:.5; cursor:not-allowed;}
 
-        .btn { padding: 6px 14px; border-radius: 4px; font-weight: 600; cursor: pointer; border: none; font-size: 0.8rem; transition: 0.2s; }
-        .btn-start { background-color: var(--profit-green); color: white; }
-        .btn-stop { background-color: var(--loss-red); color: white; }
+        .metrics{background:var(--panel); border-bottom:1px solid var(--border); padding:7px 16px; display:flex; gap:26px; overflow-x:auto; flex-shrink:0;}
+        .metric{display:flex; flex-direction:column; gap:1px; min-width:70px;}
+        .metric .k{font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted);}
+        .metric .v{font-size:15px; font-weight:700; font-family:'Consolas',monospace;}
 
-        /* Metrics Bar */
-        .metrics-bar { background-color: var(--panel-bg); border-bottom: 1px solid var(--border-color); padding: 6px 20px; display: flex; gap: 20px; align-items: center; overflow-x: auto; flex-shrink: 0; }
-        .m-item { display: flex; flex-direction: column; gap: 1px; min-width: 80px; }
-        .m-label { color: var(--text-muted); font-size: 0.65rem; font-weight: 500; text-transform: uppercase; }
-        .m-val { font-size: 0.9rem; font-weight: 600; }
-        .color-green { color: var(--profit-green); }
-        .color-red { color: var(--loss-red); }
-        .color-blue { color: var(--paper-blue); }
+        .main{display:grid; grid-template-columns:1fr 340px; flex:1; min-height:0;}
+        .left{display:flex; flex-direction:column; border-right:1px solid var(--border); min-width:0;}
+        .tfbar{display:flex; gap:6px; padding:7px 12px; border-bottom:1px solid var(--border); background:var(--panel); flex-shrink:0; align-items:center;}
+        .tf{background:var(--bg); color:var(--muted); border:1px solid var(--border); padding:4px 10px; border-radius:5px; font-size:12px; cursor:pointer;}
+        .tf.on{background:rgba(76,141,255,.15); color:var(--accent); border-color:rgba(76,141,255,.4);}
+        .chart-wrap{flex:1; position:relative; min-height:0;}
+        #chart{position:absolute; inset:0;}
+        .legend{position:absolute; top:8px; left:8px; z-index:5; background:rgba(22,27,36,.85); border:1px solid var(--border); border-radius:6px; padding:6px 9px; font-size:11px; display:flex; flex-direction:column; gap:2px; pointer-events:none;}
 
-        /* Main Layout */
-        .main-content { display: grid; grid-template-columns: 1fr 280px; flex: 1; min-height: 0; }
-        .chart-area { display: flex; flex-direction: column; border-right: 1px solid var(--border-color); overflow: hidden; }
-        .tf-bar { display: flex; gap: 6px; padding: 6px 15px; align-items: center; border-bottom: 1px solid var(--border-color); background: var(--panel-bg); flex-shrink: 0; }
-        .tf-btn { background: var(--bg-color); color: var(--text-muted); border: 1px solid var(--border-color); padding: 3px 8px; border-radius: 3px; font-size: 0.75rem; cursor: pointer; }
-        .tf-btn.active { background: rgba(41, 98, 255, 0.15); color: var(--tv-green); border-color: rgba(41, 98, 255, 0.5); }
-        .chart-wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; }
-        #tv-chart-container { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+        .side{background:var(--panel); overflow-y:auto; display:flex; flex-direction:column;}
+        .card{border-bottom:1px solid var(--border); padding:11px 13px;}
+        .card h4{font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin-bottom:9px; display:flex; justify-content:space-between; align-items:center;}
+        .kv{display:flex; justify-content:space-between; margin-bottom:5px; font-size:12px;}
+        .kv .k{color:var(--muted);} .kv .v{font-weight:600; font-family:'Consolas',monospace;}
+        .health-note{font-size:11px; color:var(--red); margin-top:4px; line-height:1.4;}
+        .pill{display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:700;}
+        .pill-long{background:rgba(34,197,94,.15); color:var(--green);}
+        .pill-short{background:rgba(239,68,68,.15); color:var(--red);}
 
-        /* Right Panel */
-        .right-panel { background-color: var(--panel-bg); display: flex; flex-direction: column; gap: 0; overflow-y: auto; }
-        .panel-box { border-bottom: 1px solid var(--border-color); padding: 10px 12px; }
-        .box-title { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; text-transform: uppercase; display: flex; justify-content: space-between;}
-        .kv-row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 0.8rem; }
-        .kv-key { color: var(--text-muted); }
-        .kv-val { font-weight: 500; }
+        /* Parameters panel */
+        .cfg-group{margin-bottom:10px;}
+        .cfg-group-title{font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--accent); margin:8px 0 5px; font-weight:700;}
+        .cfg-row{display:flex; align-items:center; gap:8px; margin-bottom:5px;}
+        .cfg-row label{flex:1; font-size:11.5px; color:var(--text);}
+        .cfg-row .unit{font-size:10px; color:var(--muted); min-width:34px; text-align:right;}
+        .cfg-row input[type=number]{width:74px; background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:5px; padding:4px 6px; font-size:12px; font-family:'Consolas',monospace; text-align:right;}
+        .cfg-row input[type=number]:focus{outline:none; border-color:var(--accent);}
+        .cfg-row input.changed{border-color:var(--yellow); background:rgba(245,183,61,.08);}
+        .cfg-row .tag{font-size:9px; padding:1px 4px; border-radius:3px; font-weight:700;}
+        .tag-live{background:rgba(34,197,94,.15); color:var(--green);}
+        .tag-refit{background:rgba(245,183,61,.15); color:var(--yellow);}
+        .tag-restart{background:rgba(239,68,68,.15); color:var(--red);}
+        .switch{position:relative; width:38px; height:20px;}
+        .switch input{opacity:0; width:0; height:0;}
+        .slider{position:absolute; inset:0; background:var(--panel2); border:1px solid var(--border); border-radius:20px; cursor:pointer; transition:.2s;}
+        .slider:before{content:""; position:absolute; height:14px; width:14px; left:2px; top:2px; background:var(--muted); border-radius:50%; transition:.2s;}
+        .switch input:checked + .slider{background:rgba(76,141,255,.3); border-color:var(--accent);}
+        .switch input:checked + .slider:before{transform:translateX(18px); background:var(--accent);}
+        .cfg-actions{display:flex; gap:8px; margin-top:10px;}
+        .cfg-actions .btn{flex:1;}
+        #cfg-toast{font-size:11px; text-align:center; margin-top:6px; min-height:14px;}
 
-        /* Orderbook */
-        .ob-container { display: flex; flex-direction: column; gap: 1px; font-size: 0.75rem; font-family: 'Roboto Mono', monospace; font-weight: 500;}
-        .ob-row { display: flex; justify-content: space-between; padding: 1px 4px; position: relative; z-index: 1;}
-        .ob-row span { z-index: 2; position: relative; }
-        .ob-price-ask { color: var(--loss-red); }
-        .ob-price-bid { color: var(--profit-green); }
-        .ob-qty { color: var(--text-main); }
-        .ob-bg-ask { position: absolute; right: 0; top: 0; height: 100%; background: rgba(242, 54, 69, 0.12); z-index: 0; }
-        .ob-bg-bid { position: absolute; right: 0; top: 0; height: 100%; background: rgba(8, 153, 129, 0.12); z-index: 0; }
-        .ob-spread { text-align: center; font-weight: 700; padding: 4px 0; border-top: 1px solid var(--border-color); border-bottom: 1px solid var(--border-color); margin: 2px 0; font-size: 0.85rem;}
+        .ob{display:flex; flex-direction:column; gap:1px; font-family:'Consolas',monospace; font-size:11px;}
+        .ob-row{display:flex; justify-content:space-between; padding:1px 5px; position:relative;}
+        .ob-row span{position:relative; z-index:2;}
+        .ob-bar{position:absolute; right:0; top:0; height:100%; z-index:1;}
+        .ob-ask .ob-bar{background:rgba(239,68,68,.12);} .ob-ask span:first-child{color:var(--red);}
+        .ob-bid .ob-bar{background:rgba(34,197,94,.12);} .ob-bid span:first-child{color:var(--green);}
+        .ob-mid{text-align:center; font-weight:700; padding:4px 0; border-block:1px solid var(--border); margin:2px 0;}
 
-        .regime-box { text-align: center; padding: 6px; border-radius: 4px; font-weight: 700; font-size: 0.8rem; border: 1px solid; background: rgba(0,0,0,0.2); margin-top: 4px; }
-        .regime-trend { color: var(--profit-green); border-color: rgba(8,153,129,0.3); }
-        .regime-range { color: var(--warning-yellow); border-color: rgba(245,176,65,0.3); }
+        .trades{background:var(--panel); border-top:1px solid var(--border); height:170px; min-height:170px; display:flex; flex-direction:column; flex-shrink:0;}
+        .trades h3{padding:7px 16px; font-size:12px; border-bottom:1px solid var(--border); color:var(--muted); display:flex; justify-content:space-between;}
+        .trades-body{flex:1; overflow-y:auto;}
+        table{width:100%; border-collapse:collapse; font-size:11.5px;}
+        th,td{padding:4px 16px; text-align:left; border-bottom:1px solid var(--border);}
+        th{color:var(--muted); font-weight:500; background:rgba(0,0,0,.15); position:sticky; top:0;}
+        td.mono{font-family:'Consolas',monospace;}
 
-        /* Trades Table */
-        .trades-area { background-color: var(--panel-bg); border-top: 1px solid var(--border-color); height: 160px; min-height: 160px; max-height: 160px; display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
-        .trades-area h3 { padding: 6px 20px; font-size: 0.8rem; border-bottom: 1px solid var(--border-color); color: var(--text-muted); display: flex; justify-content: space-between;}
-        .trades-table-wrapper { flex: 1; overflow-y: auto; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
-        th, td { padding: 4px 20px; text-align: left; border-bottom: 1px solid var(--border-color); }
-        th { color: var(--text-muted); font-weight: 500; background-color: rgba(0,0,0,0.1); }
-        .badge-long { background-color: rgba(8, 153, 129, 0.15); color: var(--profit-green); padding: 1px 5px; border-radius: 3px; font-weight: 600;}
-        .badge-short { background-color: rgba(242, 54, 69, 0.15); color: var(--loss-red); padding: 1px 5px; border-radius: 3px; font-weight: 600;}
-        .price-up { color: var(--profit-green); }
-        .price-down { color: var(--loss-red); }
-        .price-neutral { color: var(--text-main); }
+        ::-webkit-scrollbar{width:8px; height:8px;} ::-webkit-scrollbar-thumb{background:var(--border); border-radius:4px;}
+        ::-webkit-scrollbar-track{background:transparent;}
     </style>
 </head>
 <body>
     <header>
-        <div class="header-title"><i class="fa-solid fa-robot" style="color: #2962ff;"></i> Quant Bot V3.6 — Learned Geometry</div>
-        <div class="mode-toggle">
-            <button id="btn-mode-paper" class="mode-btn paper-active" onclick="setTradingMode('PAPER')"><i class="fa-solid fa-flask"></i> PAPER</button>
-            <button id="btn-mode-real" class="mode-btn" onclick="setTradingMode('REAL')"><i class="fa-solid fa-fire"></i> REAL</button>
+        <div class="brand"><span class="dot blink"></span> Quant Bot <span class="muted" style="font-weight:400;">V3.6 · Learned Geometry</span></div>
+        <div class="sym">BTC/USDT</div>
+        <div id="price" class="price mono">$0.00</div>
+        <div id="geo-badge" class="badge b-grey"><span class="bdot" style="background:var(--muted)"></span><span id="geo-badge-t">COLLECTING</span></div>
+        <div class="grow"></div>
+        <div class="modes">
+            <button id="m-paper" class="mode on-paper" onclick="setMode('PAPER')">PAPER</button>
+            <button id="m-real" class="mode" onclick="setMode('REAL')">REAL</button>
         </div>
-        <div class="controls">
-            <div id="status-badge" class="status-badge status-paused"><div id="status-dot" class="dot-blink bg-yellow"></div><span id="status-text">OBSERVATION</span></div>
-            <button id="toggle-btn" class="btn btn-start" onclick="toggleBot()">&#9654; BEGIN TRADE</button>
-        </div>
+        <div id="run-badge" class="badge b-yellow"><span class="bdot blink" style="background:var(--yellow)"></span><span id="run-t">OBSERVATION</span></div>
+        <button id="run-btn" class="btn btn-start" onclick="toggleBot()">&#9654; BAŞLAT</button>
     </header>
 
-    <div class="metrics-bar">
-        <div class="m-item"><span class="m-label">Balance</span><span class="m-val color-blue" id="st-balance">$10,000</span></div>
-        <div class="m-item"><span class="m-label">Net Profit</span><span class="m-val" id="st-net-profit">0.00%</span></div>
-        <div class="m-item"><span class="m-label">Win Rate</span><span class="m-val" id="st-win-rate">0.00%</span></div>
-        <div class="m-item"><span class="m-label">Profit Factor</span><span class="m-val" id="st-profit-factor">0.00</span></div>
-        <div class="m-item"><span class="m-label">Sharpe</span><span class="m-val" id="st-sharpe">0.00</span></div>
-        <div class="m-item"><span class="m-label">OBI</span><span class="m-val" id="st-obi" style="font-weight:700;">0.00</span></div>
-        <div class="m-item"><span class="m-label">Avg W/L</span><span class="m-val" id="st-avg-wl" style="font-size:0.8rem;">0% / 0%</span></div>
-        <div class="m-item"><span class="m-label">Cons W/L</span><span class="m-val" id="st-cons" style="font-size:0.8rem;">0 / 0</span></div>
+    <div class="metrics">
+        <div class="metric"><span class="k">Bakiye</span><span class="v cyan" id="m-bal">$0</span></div>
+        <div class="metric"><span class="k">Net Kâr</span><span class="v" id="m-pnl">0.00%</span></div>
+        <div class="metric"><span class="k">Kazanç %</span><span class="v" id="m-wr">0%</span></div>
+        <div class="metric"><span class="k">Profit Factor</span><span class="v" id="m-pf">0.00</span></div>
+        <div class="metric"><span class="k">Sharpe</span><span class="v" id="m-sharpe">0.00</span></div>
+        <div class="metric"><span class="k">İşlem</span><span class="v" id="m-tc">0</span></div>
+        <div class="metric"><span class="k">OBI</span><span class="v" id="m-obi">0.00</span></div>
+        <div class="metric"><span class="k">Ort. K/Z</span><span class="v" id="m-awl" style="font-size:12px;">0/0</span></div>
     </div>
 
-    <div class="main-content">
-        <div class="chart-area">
-            <div class="tf-bar">
-                <span style="font-size:0.85rem; font-weight:600; margin-right:8px;">BTC/USDT</span>
-                <button class="tf-btn active" onclick="setTF('1m')">1m</button>
-                <button class="tf-btn" onclick="setTF('5m')">5m</button>
-                <button class="tf-btn" onclick="setTF('15m')">15m</button>
-                <button class="tf-btn" onclick="setTF('1h')">1h</button>
-                <button class="tf-btn" onclick="setTF('4h')">4h</button>
-                <div style="flex:1;"></div>
-                <div id="current-price" class="price-neutral" style="font-size:1.3rem; font-weight:700;">$0.00</div>
+    <div class="main">
+        <div class="left">
+            <div class="tfbar">
+                <span class="muted" style="font-size:11px; margin-right:4px;">Zaman:</span>
+                <button class="tf on" onclick="setTF('1m',this)">1m</button>
+                <button class="tf" onclick="setTF('5m',this)">5m</button>
+                <button class="tf" onclick="setTF('15m',this)">15m</button>
+                <button class="tf" onclick="setTF('1h',this)">1h</button>
+                <button class="tf" onclick="setTF('4h',this)">4h</button>
+                <div class="grow"></div>
+                <span id="sig-chip" class="badge b-grey" style="font-size:11px;">HOLD</span>
             </div>
             <div class="chart-wrap">
-                <div id="tv-chart-container"></div>
-                <div id="chart-legend" style="position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(30, 34, 45, 0.85); border: 1px solid var(--border-color); padding: 6px 10px; border-radius: 4px; font-size: 0.72rem; color: var(--text-main); pointer-events: none; display: flex; flex-direction: column; gap: 3px;">
-                    <div><span style="color:#089981; font-weight:700;">▮</span> Conformal A ≥ kapı</div>
-                    <div><span style="color:#787b86; font-weight:700;">▮</span> Conformal A &lt; kapı</div>
-                    <div><span style="color:#f5b041; font-weight:700;">●</span> Epizot başlangıcı (δ≠0, A-küme)</div>
-                    <div><span style="color:#089981; font-weight:700;">▲</span> GEO Long &nbsp;·&nbsp; <span style="color:#e040fb; font-weight:700;">▼</span> GEO Short &nbsp;·&nbsp; <span style="color:#f23645; font-weight:700;">▼</span> Exit</div>
-                    <div id="legend-geo-status" style="color:#787b86;">Geometri: -</div>
+                <div id="chart"></div>
+                <div class="legend">
+                    <div><span class="green">▮</span> Conformal A ≥ kapı &nbsp; <span class="muted">▮</span> A &lt; kapı</div>
+                    <div><span class="yellow">●</span> Epizot &nbsp; <span class="green">▲</span> GEO Long &nbsp; <span class="purple">▼</span> GEO Short</div>
+                    <div id="lg-geo" class="muted">Geometri: -</div>
                 </div>
             </div>
         </div>
 
-        <div class="right-panel">
-            <div class="panel-box">
-                <div class="box-title"><span><i class="fa-solid fa-list"></i> Order Book</span><span style="color:var(--profit-green); font-size:0.65rem;">LIVE</span></div>
-                <div style="display:flex; justify-content:space-between; color:var(--text-muted); font-size:0.65rem; padding:0 4px; margin-bottom:3px;"><span>Price (USDT)</span><span>Qty (BTC)</span></div>
-                <div id="ob-asks" class="ob-container"></div>
-                <div id="ob-spread" class="ob-spread price-neutral">$0.00</div>
-                <div id="ob-bids" class="ob-container"></div>
+        <div class="side">
+            <!-- Learned Geometry -->
+            <div class="card">
+                <h4>Öğrenilmiş Geometri <span id="geo-health" class="pill" style="background:rgba(125,135,156,.15); color:var(--muted);">-</span></h4>
+                <div id="geo-health-note" class="health-note" style="display:none;"></div>
+                <div class="kv"><span class="k">Durum</span><span class="v" id="g-status">-</span></div>
+                <div class="kv"><span class="k">Şema M</span><span class="v cyan" id="g-schema" style="font-size:11px;">-</span></div>
+                <div class="kv"><span class="k">κ (öğr./init)</span><span class="v" id="g-kappa">- / -</span></div>
+                <div class="kv"><span class="k">η · P(δ≠0)</span><span class="v" id="g-eta">-</span></div>
+                <div class="kv"><span class="k">Epizot</span><span class="v" id="g-ep">NORMAL</span></div>
+                <div class="kv"><span class="k">p GBM / Meta</span><span class="v" id="g-p">- / -</span></div>
+                <div class="kv"><span class="k">Conformal A</span><span class="v" id="g-a">-</span></div>
+                <div class="kv"><span class="k">E[net] · TP/SL</span><span class="v" id="g-en">-</span></div>
+                <div class="kv"><span class="k">D_anchor · Fold</span><span class="v" id="g-da">-</span></div>
+                <div class="kv"><span class="k">Panel (aktif/emekli)</span><span class="v" id="g-panel">-</span></div>
             </div>
 
-            <div class="panel-box">
-                <div class="box-title">Active Position</div>
-                <div id="pos-info" style="text-align:center; color:var(--text-muted); padding:4px 0; font-size:0.8rem;">No Open Position</div>
+            <!-- Position -->
+            <div class="card">
+                <h4>Açık Pozisyon</h4>
+                <div id="pos" class="muted" style="text-align:center; padding:4px;">Pozisyon yok</div>
             </div>
 
-            <div class="panel-box">
-                <div class="box-title">Signal & Regime</div>
-                <div class="kv-row"><span class="kv-key">Signal:</span><span class="kv-val" id="signal-val">HOLD</span></div>
-                <div id="regime-box" class="regime-box">LOADING...</div>
-            </div>
-
-            <div class="panel-box">
-                <div class="box-title">Learned Geometry <span id="geom-status" style="font-size:0.65rem; color:var(--warning-yellow);">COLLECTING</span></div>
-                <div class="kv-row"><span class="kv-key">Schema M:</span><span class="kv-val" id="geom-schema" style="font-size:0.68rem;">-</span></div>
-                <div class="kv-row"><span class="kv-key">κ (learned/init):</span><span class="kv-val" id="geom-kappa">- / -</span></div>
-                <div class="kv-row"><span class="kv-key">η (speed):</span><span class="kv-val" id="geom-eta">-</span></div>
-                <div class="kv-row"><span class="kv-key">P(δ≠0):</span><span class="kv-val" id="geom-pdelta">-</span></div>
-                <div class="kv-row"><span class="kv-key">Episode:</span><span class="kv-val" id="geom-episode">NORMAL</span></div>
-                <div class="kv-row"><span class="kv-key">Direction:</span><span class="kv-val" id="geom-dir">FLAT</span></div>
-                <div class="kv-row"><span class="kv-key">p GBM / Meta:</span><span class="kv-val" id="geom-p">- / -</span></div>
-                <div class="kv-row"><span class="kv-key">Conformal A:</span><span class="kv-val" id="geom-a">-</span></div>
-                <div class="kv-row"><span class="kv-key">E[net] · TP/SL:</span><span class="kv-val" id="geom-expnet" style="font-size:0.7rem;">-</span></div>
-                <div class="kv-row"><span class="kv-key">Overfit gap:</span><span class="kv-val" id="geom-overfit">-</span></div>
-                <div class="kv-row"><span class="kv-key">D_anchor:</span><span class="kv-val" id="geom-danchor">-</span></div>
-                <div class="kv-row"><span class="kv-key">δ̂ (5/15/30/60):</span><span class="kv-val" id="geom-dhat" style="font-size:0.68rem;">-</span></div>
-                <div class="kv-row"><span class="kv-key">r·√|κ| (5/15/30/60):</span><span class="kv-val" id="geom-reff" style="font-size:0.68rem;">-</span></div>
-                <div class="kv-row"><span class="kv-key">Heldout Recon:</span><span class="kv-val" id="geom-recon">-</span></div>
-                <div class="kv-row"><span class="kv-key">Anchor Panel:</span><span class="kv-val" id="geom-panel" style="font-size:0.7rem;">-</span></div>
-                <div class="kv-row"><span class="kv-key">Fold:</span><span class="kv-val" id="geom-fold">0</span></div>
-                <div class="kv-row" style="margin-top:6px; border-top:1px dashed var(--border-color); padding-top:6px;">
-                    <span class="kv-key">Short (Futures):</span>
-                    <button id="short-toggle" onclick="toggleShort()" class="btn" style="padding:2px 8px; font-size:0.68rem; background:#2a2e39; color:var(--text-muted);">OFF</button>
+            <!-- Trading Parameters -->
+            <div class="card">
+                <h4>Trading Parametreleri
+                    <span class="muted" style="font-size:9px; font-weight:400;">
+                        <span class="tag tag-live">CANLI</span>
+                        <span class="tag tag-refit">REFIT</span>
+                        <span class="tag tag-restart">RESTART</span>
+                    </span>
+                </h4>
+                <div id="cfg-body"><div class="muted" style="font-size:11px;">Yükleniyor...</div></div>
+                <div class="cfg-actions">
+                    <button class="btn btn-ghost" onclick="resetConfig()">Varsayılan</button>
+                    <button class="btn btn-start" id="cfg-save" onclick="saveConfig()">Kaydet</button>
                 </div>
-                <div style="font-size:0.6rem; color:var(--text-muted); margin-top:3px;">REAL futures short otomatik açılmaz — önce PAPER/backtest.</div>
+                <div id="cfg-toast" class="muted"></div>
             </div>
 
-            <div class="panel-box">
-                <div class="box-title">Champion Params (Live) <span style="font-size:0.65rem; color:var(--profit-green);" id="champion-version">v1</span></div>
-                <div id="champion-params" style="font-size:0.72rem; color:var(--text-main); display:grid; grid-template-columns:1fr 1fr; gap:2px 8px;">
-                    <!-- JS populated -->
-                </div>
+            <!-- Order Book -->
+            <div class="card">
+                <h4>Emir Defteri <span class="green" style="font-size:9px;">CANLI</span></h4>
+                <div id="ob-asks" class="ob"></div>
+                <div id="ob-mid" class="ob-mid muted">$0.00</div>
+                <div id="ob-bids" class="ob"></div>
             </div>
 
-            <div class="panel-box">
-                <div class="box-title">Backtest & Purged WFO</div>
-                <div class="kv-row"><span class="kv-key">Challenger:</span><span class="kv-val color-blue" id="shadow-challenger-title">None</span></div>
-                <div id="challenger-params" style="font-size:0.7rem; color:var(--text-muted); display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; margin-bottom:6px; display:none;">
-                    <!-- JS populated -->
-                </div>
-
+            <!-- Backtest & WFO -->
+            <div class="card">
+                <h4>Backtest & Purged WFO</h4>
+                <div class="kv"><span class="k">Challenger</span><span class="v accent" id="chal">Yok</span></div>
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
-                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runBacktest()" id="btn-backtest">Run Backtest (3000b)</button>
-                    <button class="btn" style="background:#2a2e39; color:white; font-size:0.7rem; padding:4px;" onclick="runWFO()" id="btn-wfo">Run Purged WFO</button>
-                    <button class="btn" style="background:var(--tv-green); color:white; font-size:0.7rem; padding:4px; display:none;" onclick="promoteChallenger()" id="btn-promote">Promote Challenger</button>
+                    <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır (3000b)</button>
+                    <button class="btn btn-ghost" id="wfo-btn" onclick="runWFO()">Purged WFO Çalıştır</button>
+                    <button class="btn btn-start" id="promo-btn" style="display:none;" onclick="promote()">Challenger'ı Yükselt</button>
                 </div>
-            </div>
-
-            <div class="panel-box" id="wfo-report-box" style="display:none; font-size:0.75rem;">
-                <div class="box-title">WFO / Backtest Report</div>
-                <div id="wfo-report-content"></div>
+                <div id="report" style="display:none; margin-top:10px; font-size:11px;"></div>
             </div>
         </div>
     </div>
 
-    <div class="trades-area">
-        <h3><span>Trade History</span> <span id="th-mode-label" style="font-size:0.65rem; color:var(--paper-blue);">[PAPER]</span></h3>
-        <div class="trades-table-wrapper">
+    <div class="trades">
+        <h3><span>İşlem Geçmişi</span><span id="th-mode" class="cyan" style="font-size:10px;">[PAPER]</span></h3>
+        <div class="trades-body">
             <table>
-                <thead><tr><th>Time</th><th>Strategy</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th></tr></thead>
-                <tbody id="trades-body"><tr><td colspan="7" style="text-align:center;">No trades yet</td></tr></tbody>
+                <thead><tr><th>Zaman</th><th>Tip</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>PnL</th><th>Neden</th></tr></thead>
+                <tbody id="tbody"><tr><td colspan="7" class="muted" style="text-align:center;">Henüz işlem yok</td></tr></tbody>
             </table>
         </div>
     </div>
 
     <script>
-        let tvChart = null;
-        let candleSeries = null;
-        let aHist = null;          // Conformal A histogram (learned-geometry overlay)
-        let lastPrice = 0;
-        let activeTF = '1m';
+    // ── safe helpers (null/NaN-proof so one bad field never breaks the UI) ──
+    const N = (x, d=2, fb='-') => (x===null||x===undefined||(typeof x==='number'&&isNaN(x))) ? fb : Number(x).toFixed(d);
+    const G = (o, k, fb=0) => (o && o[k]!==undefined && o[k]!==null) ? o[k] : fb;
+    const el = id => document.getElementById(id);
+    function setText(id, t){ const e=el(id); if(e) e.textContent = t; }
+    function setHTML(id, t){ const e=el(id); if(e) e.innerHTML = t; }
 
-        function initChart() {
-            const container = document.getElementById('tv-chart-container');
-            tvChart = LightweightCharts.createChart(container, {
-                layout: { textColor: '#d1d4dc', background: { type: 'solid', color: '#131722' } },
-                grid: { vertLines: { color: 'rgba(42, 46, 57, 0.3)' }, horzLines: { color: 'rgba(42, 46, 57, 0.3)' } },
-                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-                rightPriceScale: { borderColor: 'rgba(197, 203, 206, 0.4)' },
-                timeScale: { borderColor: 'rgba(197, 203, 206, 0.4)', timeVisible: true, secondsVisible: false },
-                width: container.clientWidth,
-                height: container.clientHeight
-            });
+    let chart=null, candles=null, aHist=null, lastPrice=0, cfgMeta=null, cfgOriginal={}, cfgDirty=false;
 
-            candleSeries = tvChart.addCandlestickSeries({
-                upColor: '#089981', downColor: '#f23645', borderVisible: false,
-                wickUpColor: '#089981', wickDownColor: '#f23645'
-            });
+    function initChart(){
+        const c = el('chart');
+        chart = LightweightCharts.createChart(c, {
+            layout:{ textColor:'#d7dbe3', background:{type:'solid', color:'#0d1017'} },
+            grid:{ vertLines:{color:'rgba(38,45,58,.4)'}, horzLines:{color:'rgba(38,45,58,.4)'} },
+            rightPriceScale:{ borderColor:'rgba(38,45,58,.8)' },
+            timeScale:{ borderColor:'rgba(38,45,58,.8)', timeVisible:true, secondsVisible:false },
+            width:c.clientWidth, height:c.clientHeight
+        });
+        candles = chart.addCandlestickSeries({ upColor:'#22c55e', downColor:'#ef4444', borderVisible:false, wickUpColor:'#22c55e', wickDownColor:'#ef4444' });
+        aHist = chart.addHistogramSeries({ priceScaleId:'geo', priceLineVisible:false, lastValueVisible:false });
+        chart.priceScale('geo').applyOptions({ scaleMargins:{ top:0.86, bottom:0 } });
+        new ResizeObserver(es => { const r=es[0].contentRect; if(chart) chart.applyOptions({width:r.width, height:r.height}); }).observe(c);
+    }
+    function rebuildSeries(){
+        if(!chart) return;
+        try { chart.removeSeries(candles); chart.removeSeries(aHist); } catch(e){}
+        candles = chart.addCandlestickSeries({ upColor:'#22c55e', downColor:'#ef4444', borderVisible:false, wickUpColor:'#22c55e', wickDownColor:'#ef4444' });
+        aHist = chart.addHistogramSeries({ priceScaleId:'geo', priceLineVisible:false, lastValueVisible:false });
+        chart.priceScale('geo').applyOptions({ scaleMargins:{ top:0.86, bottom:0 } });
+    }
 
-            // Learned-geometry overlay: Conformal A score as a bottom histogram pane
-            aHist = tvChart.addHistogramSeries({
-                priceScaleId: 'geo',
-                priceLineVisible: false,
-                lastValueVisible: false,
-                priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
-            });
-            tvChart.priceScale('geo').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+    function toggleBot(){ fetch('/api/toggle_bot',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
+    function setMode(m){
+        if(m==='REAL' && !confirm('DİKKAT: REAL moda geçiyorsunuz. Gerçek MEXC bakiyeniz kullanılacak. Emin misiniz?')) return;
+        fetch('/api/set_trading_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})}).then(()=>refresh()).catch(()=>{});
+    }
+    function setTF(tf, btn){
+        fetch('/api/set_timeframe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tf:tf})}).then(()=>{
+            document.querySelectorAll('.tf').forEach(b=>b.classList.remove('on'));
+            if(btn) btn.classList.add('on');
+            rebuildSeries();
+        }).catch(()=>{});
+    }
+    function runBacktest(){ fetch('/api/backtest',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
+    function runWFO(){ fetch('/api/run_wfo',{method:'POST'}).then(()=>refresh()).catch(()=>{}); }
+    function promote(){
+        if(!confirm('Challenger parametrelerini şampiyon (canlı) yapmak istiyor musunuz?')) return;
+        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.status==='success'?'Yükseltildi!':'Hata: '+(d.message||'')); refresh(); }).catch(()=>{});
+    }
 
-            new ResizeObserver(entries => {
-                const { width, height } = entries[0].contentRect;
-                tvChart.applyOptions({ width, height });
-            }).observe(container);
-        }
-
-        function toggleBot() {
-            fetch('/api/toggle_bot', {method: 'POST'}).then(r => r.json()).then(() => updateUI());
-        }
-
-        function toggleShort() {
-            if (!window._shortOn) {
-                if(!confirm("SHORT sinyallerini aç (futures / iki yönlü)?\n\nPAPER'da ve backtest'te tam simüle edilir. REAL modda canlı futures short OTOMATİK AÇILMAZ — önce doğrula.")) return;
-            }
-            fetch('/api/toggle_short', {method: 'POST'}).then(r => r.json()).then(() => updateUI());
-        }
-
-        function setTF(tf) {
-            fetch('/api/set_timeframe', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tf: tf}) })
-            .then(() => {
-                activeTF = tf;
-                document.querySelectorAll('.tf-btn').forEach(b => { b.classList.remove('active'); if(b.innerText === tf) b.classList.add('active'); });
-                // Timeframe değişince eski grafik verilerini temizle
-                if (candleSeries && tvChart) {
-                    tvChart.removeSeries(candleSeries);
-                    tvChart.removeSeries(aHist);
-                    candleSeries = tvChart.addCandlestickSeries({
-                        upColor: '#089981', downColor: '#f23645', borderVisible: false,
-                        wickUpColor: '#089981', wickDownColor: '#f23645'
-                    });
-                    aHist = tvChart.addHistogramSeries({
-                        priceScaleId: 'geo', priceLineVisible: false,
-                        lastValueVisible: false,
-                        priceFormat: { type: 'price', precision: 2, minMove: 0.01 }
-                    });
-                    tvChart.priceScale('geo').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
-                }
-            });
-        }
-
-        function setTradingMode(mode) {
-            if (mode === 'REAL') {
-                if(!confirm("WARNING: Switching to REAL TRADING mode. This will use real USDT from your MEXC account. Are you sure?")) return;
-            }
-            fetch('/api/set_trading_mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) })
-            .then(() => updateUI());
-        }
-
-        function updateUI() {
-            fetch('/api/state')
-                .then(r => r.json())
-                .then(s => {
-                    // Mode
-                    const pBtn = document.getElementById('btn-mode-paper');
-                    const rBtn = document.getElementById('btn-mode-real');
-                    if (s.trading_mode === "PAPER") {
-                        pBtn.className = "mode-btn paper-active"; rBtn.className = "mode-btn";
-                        document.getElementById('st-balance').innerText = "$" + s.virtual_balance.toFixed(2);
-                        document.getElementById('th-mode-label').innerText = "[PAPER]";
-                    } else {
-                        pBtn.className = "mode-btn"; rBtn.className = "mode-btn real-active";
-                        document.getElementById('st-balance').innerText = "$" + s.real_balance.toFixed(2);
-                        document.getElementById('th-mode-label').innerText = "[REAL]";
-                    }
-
-                    // Header state
-                    const btn = document.getElementById('toggle-btn');
-                    const sBadge = document.getElementById('status-badge');
-                    const sText = document.getElementById('status-text');
-                    const sDot = document.getElementById('status-dot');
-                    if (s.is_trading_active) {
-                        btn.className = "btn btn-stop"; btn.innerHTML = "&#9632; STOP";
-                        sBadge.className = "status-badge status-active"; sText.innerText = "LIVE TRADING"; sDot.className = "dot-blink bg-green";
-                    } else {
-                        btn.className = "btn btn-start"; btn.innerHTML = "&#9654; BEGIN TRADE";
-                        sBadge.className = "status-badge status-paused"; sText.innerText = "OBSERVATION"; sDot.className = "dot-blink bg-yellow";
-                    }
-
-                    // Metrics
-                    const winRate = s.trade_count > 0 ? (s.winning_trades / s.trade_count * 100) : 0;
-                    const pf = s.gross_loss < 0 ? Math.abs(s.gross_profit / s.gross_loss) : (s.gross_profit > 0 ? 99.99 : 0);
-                    document.getElementById('st-net-profit').innerText = (s.total_pnl >= 0 ? "+" : "") + s.total_pnl.toFixed(2) + "%";
-                    document.getElementById('st-net-profit').className = "m-val " + (s.total_pnl >= 0 ? "color-green" : "color-red");
-                    document.getElementById('st-win-rate').innerText = winRate.toFixed(1) + "%";
-                    document.getElementById('st-profit-factor').innerText = pf.toFixed(2);
-                    document.getElementById('st-sharpe').innerText = s.sharpe_ratio.toFixed(2);
-                    document.getElementById('st-sharpe').className = "m-val " + (s.sharpe_ratio >= 0 ? "color-green" : "color-red");
-                    document.getElementById('st-obi').innerText = s.obi > 0 ? "+" + s.obi.toFixed(2) : s.obi.toFixed(2);
-                    document.getElementById('st-obi').className = "m-val " + (s.obi > 0.3 ? "color-green" : (s.obi < -0.3 ? "color-red" : "price-neutral"));
-                    document.getElementById('st-avg-wl').innerHTML = '<span class="color-green">+' + s.avg_win.toFixed(2) + '%</span> / <span class="color-red">' + s.avg_loss.toFixed(2) + '%</span>';
-                    document.getElementById('st-cons').innerHTML = '<span class="color-green">' + s.max_cons_wins + '</span> / <span class="color-red">' + s.max_cons_losses + '</span>';
-
-                    // Price
-                    const cpDiv = document.getElementById('current-price');
-                    if (s.price > lastPrice) cpDiv.className = "price-up";
-                    else if (s.price < lastPrice) cpDiv.className = "price-down";
-                    else cpDiv.className = "price-neutral";
-                    cpDiv.innerText = "$" + s.price.toFixed(2);
-                    lastPrice = s.price;
-
-                    // Signal
-                    let sigText = s.signal;
-                    if (s.signal_type) sigText += " (" + s.signal_type + ")";
-                    document.getElementById('signal-val').innerHTML = sigText;
-                    document.getElementById('signal-val').style.color = s.signal === 'BUY' ? 'var(--profit-green)' : (s.signal === 'SELL' ? 'var(--loss-red)' : 'var(--text-main)');
-
-                    // Regime box: geometric episode/health state
-                    {
-                        const g = s.geom || {};
-                        const box = document.getElementById('regime-box');
-                        if (g.status === 'ready' && g.health === 'degraded') {
-                            box.innerText = 'GEOMETRY DEGRADED';
-                            box.className = "regime-box regime-range";
-                            box.style.color = 'var(--loss-red)';
-                        } else if (g.status === 'ready') {
-                            const inEp = g.episode === 'EPISODE';
-                            box.innerText = inEp ? ('EPİZOT' + (g.cluster >= 0 ? ' (A' + g.cluster + ')' : '')) : 'NORMAL (GEO)';
-                            box.className = "regime-box " + (inEp ? "regime-range" : "regime-trend");
-                            box.style.color = '';
-                        } else {
-                            box.innerText = (g.status || 'collecting').toUpperCase();
-                            box.className = "regime-box regime-trend";
-                            box.style.color = 'var(--warning-yellow)';
-                        }
-                    }
-
-                    // Learned Geometry panel (V3.6)
-                    if (s.geom) {
-                        const g = s.geom;
-                        const gst = document.getElementById('geom-status');
-                        const degraded = (g.status === 'ready' && g.health === 'degraded');
-                        gst.innerText = degraded ? 'DEGRADED' : (g.status || 'collecting').toUpperCase();
-                        gst.style.color = degraded ? 'var(--loss-red)'
-                            : (g.status === 'ready' ? 'var(--profit-green)' : 'var(--warning-yellow)');
-                        gst.title = degraded && g.health_reasons ? g.health_reasons.join('; ') : '';
-                        document.getElementById('geom-schema').innerText = g.schema || '-';
-                        document.getElementById('geom-kappa').innerText = (g.kappa || 0).toFixed(3) + ' / ' + (g.kappa_init || 0).toFixed(3);
-                        document.getElementById('geom-eta').innerText = (g.eta || 0).toFixed(3);
-                        const gd = g.diag || {};
-                        document.getElementById('geom-pdelta').innerText = (gd.p_delta_nonzero !== undefined) ? (gd.p_delta_nonzero * 100).toFixed(1) + '%' : '-';
-                        const epEl = document.getElementById('geom-episode');
-                        if (g.episode === 'EPISODE') {
-                            epEl.innerText = 'EPISODE' + (g.cluster >= 0 ? ' (A' + g.cluster + ')' : '');
-                            epEl.style.color = 'var(--warning-yellow)';
-                        } else {
-                            epEl.innerText = 'NORMAL';
-                            epEl.style.color = 'var(--profit-green)';
-                        }
-                        document.getElementById('geom-p').innerText = (g.p_gbm !== undefined ? g.p_gbm.toFixed(2) : '-') + ' / ' + (g.p_meta !== undefined ? g.p_meta.toFixed(2) : '-');
-                        const aEl = document.getElementById('geom-a');
-                        aEl.innerText = (g.a_score || 0).toFixed(2) + ' (gate ' + (g.a_gate !== undefined ? g.a_gate.toFixed(2) : '0.50') + ')';
-                        aEl.style.color = (g.a_score || 0) >= (g.a_gate || 0.5) ? 'var(--profit-green)' : 'var(--text-muted)';
-                        const enEl = document.getElementById('geom-expnet');
-                        if (g.exp_net !== undefined && g.tp_pct) {
-                            enEl.innerText = (g.exp_net >= 0 ? '+' : '') + g.exp_net.toFixed(2) + '% · ' +
-                                g.tp_pct.toFixed(2) + '/' + g.sl_pct.toFixed(2) + '%';
-                            enEl.style.color = g.exp_net > 0 ? 'var(--profit-green)' : 'var(--loss-red)';
-                        } else {
-                            enEl.innerText = '-';
-                            enEl.style.color = 'var(--text-muted)';
-                        }
-                        document.getElementById('geom-danchor').innerText = (gd.d_anchor !== undefined) ? gd.d_anchor.toFixed(4) : '-';
-                        const resKeys = ['5', '15', '30', '60'];
-                        const dh = g.delta_hat || {};
-                        document.getElementById('geom-dhat').innerText = resKeys.every(k => dh[k] !== undefined)
-                            ? resKeys.map(k => dh[k].toFixed(2)).join(' / ') : '-';
-                        const re = gd.r_eff || {};
-                        document.getElementById('geom-reff').innerText = resKeys.every(k => re[k] !== undefined)
-                            ? resKeys.map(k => re[k].toFixed(2)).join(' / ') : '-';
-                        document.getElementById('geom-recon').innerText = (gd.heldout_recon !== undefined) ? gd.heldout_recon.toFixed(4) : '-';
-                        const pn = g.panel || {};
-                        document.getElementById('geom-panel').innerText = (pn.core_active !== undefined)
-                            ? (pn.core_active + ' act / ' + (pn.core_retired || 0) + ' ret')
-                            : '-';
-                        document.getElementById('geom-fold').innerText = g.fold || 0;
-
-                        // Direction badge
-                        const dirEl = document.getElementById('geom-dir');
-                        if (g.dir === 1) { dirEl.innerText = '▲ LONG'; dirEl.style.color = 'var(--profit-green)'; }
-                        else if (g.dir === -1) { dirEl.innerText = '▼ SHORT'; dirEl.style.color = 'var(--loss-red)'; }
-                        else { dirEl.innerText = 'FLAT'; dirEl.style.color = 'var(--text-muted)'; }
-
-                        // Overfit gap (train-OOS AUC)
-                        const ofEl = document.getElementById('geom-overfit');
-                        if (gd.overfit_gap !== undefined) {
-                            ofEl.innerText = gd.overfit_gap.toFixed(3) + ' (OOS ' + (gd.oos_auc !== undefined ? gd.oos_auc.toFixed(2) : '-') + ')';
-                            ofEl.style.color = gd.overfit_gap > 0.15 ? 'var(--loss-red)' : (gd.overfit_gap > 0.08 ? 'var(--warning-yellow)' : 'var(--profit-green)');
-                        } else { ofEl.innerText = '-'; ofEl.style.color = 'var(--text-muted)'; }
-
-                        // Short toggle button reflects backend state
-                        const stEl = document.getElementById('short-toggle');
-                        if (g.allow_short) { stEl.innerText = 'ON'; stEl.style.background = 'rgba(242,54,69,0.2)'; stEl.style.color = 'var(--loss-red)'; }
-                        else { stEl.innerText = 'OFF'; stEl.style.background = '#2a2e39'; stEl.style.color = 'var(--text-muted)'; }
-
-                        document.getElementById('legend-geo-status').innerText = 'Geometri: ' + (g.status || '-').toUpperCase() +
-                            (g.status === 'ready' && g.schema ? ' · ' + g.schema : '');
-                    }
-
-                    // Position
-                    const pInfo = document.getElementById('pos-info');
-                    if (s.position_side) {
-                        pInfo.innerHTML = '<div class="kv-row"><span class="kv-key">Side:</span><span class="' + (s.position_side === 'long' ? 'badge-long' : 'badge-short') + '">' + s.position_side.toUpperCase() + '</span></div>' +
-                            '<div class="kv-row"><span class="kv-key">Entry:</span><span class="kv-val">$' + s.position_entry.toFixed(2) + '</span></div>' +
-                            '<div class="kv-row" style="margin-top:3px; border-top:1px dashed var(--border-color); padding-top:3px;"><span class="kv-key">PnL:</span><span class="kv-val ' + (s.position_pnl >= 0 ? 'color-green' : 'color-red') + '">' + (s.position_pnl >= 0 ? '+' : '') + s.position_pnl.toFixed(2) + '%</span></div>';
-                    } else {
-                        pInfo.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:4px 0; font-size:0.8rem;">No Open Position</div>';
-                    }
-
-                    // Champion Params
-                    const champPStore = s.parameters_store || {};
-                    document.getElementById('champion-version').innerText = 'v' + (champPStore.active_version || 1);
-                    const activeP = s.active_parameters || {};
-                    document.getElementById('champion-params').innerHTML = Object.entries(activeP).map(([k, v]) => 
-                        '<div><span class="kv-key">' + k.replace('_LENGTH', '').replace('_MULT', '') + ':</span> <span class="kv-val">' + v + '</span></div>'
-                    ).join('');
-
-                    // Shadow challenger & buttons
-                    const challengerP = champPStore.shadow_challenger;
-                    const cTitle = document.getElementById('shadow-challenger-title');
-                    const cParams = document.getElementById('challenger-params');
-                    const promoteBtn = document.getElementById('btn-promote');
-                    if (challengerP) {
-                        cTitle.innerText = "Active Challenger";
-                        cTitle.className = "kv-val color-blue";
-                        cParams.style.display = "grid";
-                        cParams.innerHTML = Object.entries(challengerP).map(([k, v]) => 
-                            '<div><span class="kv-key">' + k.replace('_LENGTH', '').replace('_MULT', '') + ':</span> <span class="kv-val">' + v + '</span></div>'
-                        ).join('');
-                        
-                        if (!s.position_side) {
-                            promoteBtn.style.display = "block";
-                        } else {
-                            promoteBtn.style.display = "none";
-                        }
-                    } else {
-                        cTitle.innerText = "None";
-                        cTitle.className = "kv-val color-red";
-                        cParams.style.display = "none";
-                        promoteBtn.style.display = "none";
-                    }
-
-                    // Task spinners
-                    const btBtn = document.getElementById('btn-backtest');
-                    if (s.backtest_running) {
-                        btBtn.innerText = "Running Backtest...";
-                        btBtn.disabled = true;
-                    } else {
-                        btBtn.innerText = "Run Backtest (3000b)";
-                        btBtn.disabled = false;
-                    }
-
-                    const wfoBtn = document.getElementById('btn-wfo');
-                    if (s.wfo_running) {
-                        wfoBtn.innerText = "Running WFO Grid...";
-                        wfoBtn.disabled = true;
-                    } else {
-                        wfoBtn.innerText = "Run WFO (10 slices)";
-                        wfoBtn.disabled = false;
-                    }
-
-                    // Reports display
-                    const wfoBox = document.getElementById('wfo-report-box');
-                    const wfoContent = document.getElementById('wfo-report-content');
-                    if (s.wfo_report) {
-                        wfoBox.style.display = "block";
-                        let wfoHtml =
-                            '<div style="font-weight:600; color:var(--paper-blue); margin-bottom:4px;">WFO Result (Challenger Chosen):</div>' +
-                            '<div class="kv-row"><span class="kv-key">Engine:</span><span class="kv-val" style="font-size:0.65rem;">' + (s.wfo_report.engine || 'legacy-grid') + '</span></div>' +
-                            '<div class="kv-row"><span class="kv-key">Stability folds:</span><span class="kv-val">' + s.wfo_report.stability_count + '/' + (s.wfo_report.slices_evaluated || 10) + '</span></div>' +
-                            '<div class="kv-row"><span class="kv-key">PF Variance:</span><span class="kv-val">' + s.wfo_report.variance.toFixed(4) + '</span></div>';
-                        if (s.wfo_report.schema && s.wfo_report.schema !== '-') {
-                            wfoHtml += '<div class="kv-row"><span class="kv-key">Geometry:</span><span class="kv-val" style="font-size:0.65rem;">' + s.wfo_report.schema + '</span></div>';
-                        }
-                        const ov = s.wfo_report.overfit;
-                        if (ov && ov.mean_gap !== undefined) {
-                            const ovColor = ov.verdict === 'high' ? 'var(--loss-red)' : (ov.verdict === 'moderate' ? 'var(--warning-yellow)' : 'var(--profit-green)');
-                            wfoHtml += '<div class="kv-row"><span class="kv-key">Overfit (IS-OOS AUC):</span><span class="kv-val" style="color:' + ovColor + ';">' +
-                                ov.mean_gap.toFixed(3) + ' · OOS ' + ov.mean_oos_auc.toFixed(2) + ' [' + ov.verdict + ']</span></div>';
-                        }
-                        const dg = (s.wfo_report.diagnostics || []);
-                        if (dg.length > 0) {
-                            const dl = dg[dg.length - 1];
-                            wfoHtml += '<div style="font-size:0.65rem; color:var(--text-muted); margin-top:3px;">' +
-                                'P(δ≠0)=' + (dl.p_delta_nonzero * 100).toFixed(1) + '% · κ=' + dl.kappa.toFixed(2) +
-                                ' · heldout=' + dl.heldout_recon.toFixed(3) +
-                                ' · D_anchor=' + dl.d_anchor.toFixed(4) + '</div>';
-                        }
-                        wfoHtml += '<div style="font-size:0.65rem; color:var(--text-muted); margin-top:4px; word-break:break-all;">' + JSON.stringify(s.wfo_report.challenger) + '</div>';
-                        wfoContent.innerHTML = wfoHtml;
-                    } else if (s.backtest_report) {
-                        wfoBox.style.display = "block";
-                        const r = s.backtest_report;
-                        if (r.status === "error") {
-                            wfoContent.innerHTML = '<div style="color:var(--loss-red);">' + r.message + '</div>';
-                        } else {
-                            wfoContent.innerHTML =
-                                '<div style="font-weight:600; color:var(--profit-green); margin-bottom:4px;">Backtest Result (' + (r.engine || 'legacy') + '):</div>' +
-                                (r.schema && r.schema !== '-' ? '<div class="kv-row"><span class="kv-key">Geometry:</span><span class="kv-val" style="font-size:0.65rem;">' + r.schema + '</span></div>' : '') +
-                                '<div class="kv-row"><span class="kv-key">Trades / Win rate:</span><span class="kv-val">' + r.trade_count + ' / ' + r.win_rate.toFixed(1) + '%</span></div>' +
-                                '<div class="kv-row"><span class="kv-key">Net Profit:</span><span class="kv-val ' + (r.total_pnl_usdt >= 0 ? "color-green" : "color-red") + '">' + (r.total_pnl_usdt >= 0 ? "+" : "") + r.total_pnl_usdt.toFixed(2) + ' USDT (' + (r.total_pnl_pct >= 0 ? "+" : "") + r.total_pnl_pct.toFixed(2) + '%)</span></div>' +
-                                '<div class="kv-row"><span class="kv-key">Profit Factor:</span><span class="kv-val">' + r.profit_factor.toFixed(2) + '</span></div>' +
-                                '<div class="kv-row"><span class="kv-key">Calmar / Sharpe:</span><span class="kv-val">' + r.calmar_ratio.toFixed(2) + ' / ' + r.sharpe_ratio.toFixed(2) + '</span></div>' +
-                                '<div class="kv-row"><span class="kv-key">Max Drawdown:</span><span class="kv-val color-red">' + r.max_drawdown_pct.toFixed(2) + '%</span></div>';
-                        }
-                    } else {
-                        wfoBox.style.display = "none";
-                    }
-
-                    // Trades
-                    if (s.trades.length > 0) {
-                        document.getElementById('trades-body').innerHTML = s.trades.map(t =>
-                            '<tr><td style="color:var(--text-muted);">' + t.time + '</td><td>' + t.type + '</td>' +
-                            '<td><span class="' + (t.side === 'LONG' || t.side === 'long' ? 'badge-long' : 'badge-short') + '">' + t.side + '</span></td>' +
-                            '<td>$' + parseFloat(t.entry).toFixed(2) + '</td><td>' + (t.exit > 0 ? '$' + parseFloat(t.exit).toFixed(2) : '-') + '</td>' +
-                            '<td class="' + (String(t.pnl).startsWith('+') ? 'color-green' : (String(t.pnl).startsWith('-') ? 'color-red' : '')) + '">' + t.pnl + '</td><td>' + t.reason + '</td></tr>'
-                        ).join('');
-                    }
-
-                    // TradingView Chart — learned-geometry overlay
-                    if (!tvChart) initChart();
-                    if (s.chart_data && s.chart_data.length > 0) {
-                        candleSeries.setData(s.chart_data.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close })));
-
-                        // Conformal A histogram: yellow = episode, green = A above the gate
-                        aHist.setData(s.chart_data
-                            .filter(d => d.geo_a !== null && d.geo_a !== undefined)
-                            .map(d => ({
-                                time: d.time,
-                                value: d.geo_a,
-                                color: d.geo_episode
-                                    ? 'rgba(245, 176, 65, 0.55)'
-                                    : (d.geo_a >= d.geo_gate ? 'rgba(8, 153, 129, 0.65)' : 'rgba(120, 123, 134, 0.40)')
-                            })));
-
-                        // Markers: episode starts (with anomaly cluster), GEO entries, geometric exits
-                        let markers = [];
-                        let prevEp = false;
-                        s.chart_data.forEach(d => {
-                            if (d.geo_episode && !prevEp) {
-                                markers.push({
-                                    time: d.time, position: 'aboveBar', color: '#f5b041',
-                                    shape: 'circle',
-                                    text: d.geo_state > 0 ? 'A' + (d.geo_state - 1) : 'EP'
-                                });
-                            }
-                            prevEp = !!d.geo_episode;
-                            if (d.geo_buy) {
-                                markers.push({ time: d.time, position: 'belowBar', color: '#089981', shape: 'arrowUp', text: 'GEO L' });
-                            }
-                            if (d.geo_sell) {
-                                markers.push({ time: d.time, position: 'aboveBar', color: '#e040fb', shape: 'arrowDown', text: 'GEO S' });
-                            }
-                            if (d.geo_exit) {
-                                markers.push({ time: d.time, position: 'aboveBar', color: '#f23645', shape: 'arrowDown', text: 'EXIT' });
-                            }
-                        });
-                        candleSeries.setMarkers(markers);
-                    }
-
-                    // Order Book
-                    if (s.orderbook && s.orderbook.bids.length > 0 && s.orderbook.asks.length > 0) {
-                        const topAsks = s.orderbook.asks.slice(0, 7).reverse();
-                        const topBids = s.orderbook.bids.slice(0, 7);
-                        let maxVol = 0;
-                        [...topAsks, ...topBids].forEach(arr => { if (arr[1] > maxVol) maxVol = arr[1]; });
-                        document.getElementById('ob-asks').innerHTML = topAsks.map(arr => {
-                            const pct = Math.min((arr[1] / maxVol) * 100, 100);
-                            return '<div class="ob-row"><div class="ob-bg-ask" style="width:' + pct + '%;"></div><span class="ob-price-ask">' + parseFloat(arr[0]).toFixed(2) + '</span><span class="ob-qty">' + parseFloat(arr[1]).toFixed(4) + '</span></div>';
-                        }).join('');
-                        document.getElementById('ob-bids').innerHTML = topBids.map(arr => {
-                            const pct = Math.min((arr[1] / maxVol) * 100, 100);
-                            return '<div class="ob-row"><div class="ob-bg-bid" style="width:' + pct + '%;"></div><span class="ob-price-bid">' + parseFloat(arr[0]).toFixed(2) + '</span><span class="ob-qty">' + parseFloat(arr[1]).toFixed(4) + '</span></div>';
-                        }).join('');
-                        document.getElementById('ob-spread').innerText = "$" + s.price.toFixed(2);
-                    }
-                }).catch(err => { console.error('updateUI failed:', err); });
-        }
-
-        function runBacktest() {
-            fetch('/api/backtest', { method: 'POST' }).then(() => updateUI());
-        }
-
-        function runWFO() {
-            fetch('/api/run_wfo', { method: 'POST' }).then(() => updateUI());
-        }
-
-        function promoteChallenger() {
-            if(!confirm("Are you sure you want to promote the shadow challenger parameters to champion (active live parameter set)?")) return;
-            fetch('/api/promote_challenger', { method: 'POST' }).then(r => r.json()).then(data => {
-                if (data.status === 'success') {
-                    alert('Challenger successfully promoted!');
+    // ── Trading Parameters panel ──
+    function loadConfig(){
+        fetch('/api/config').then(r=>r.json()).then(d=>{
+            cfgMeta = d.meta || {}; cfgOriginal = Object.assign({}, d.config||{});
+            renderConfig(d.config||{}, cfgMeta);
+        }).catch(()=>{ setHTML('cfg-body','<div class="red" style="font-size:11px;">Config yüklenemedi</div>'); });
+    }
+    function renderConfig(config, meta){
+        const groups = {};
+        Object.keys(meta).forEach(k=>{
+            const m = meta[k]; const grp = m[1];
+            (groups[grp] = groups[grp] || []).push([k, m]);
+        });
+        let html = '';
+        Object.keys(groups).forEach(grp=>{
+            html += '<div class="cfg-group"><div class="cfg-group-title">'+grp+'</div>';
+            groups[grp].forEach(([k,m])=>{
+                const [label,,unit,lo,hi,step,when] = m;
+                const val = config[k];
+                const tag = when==='live'?'tag-live':(when==='refit'?'tag-refit':'tag-restart');
+                const tagT = when==='live'?'CANLI':(when==='refit'?'REFIT':'RESTART');
+                if(unit==='bool'){
+                    html += '<div class="cfg-row"><label>'+label+'</label>'
+                          + '<span class="tag '+tag+'">'+tagT+'</span>'
+                          + '<label class="switch"><input type="checkbox" data-k="'+k+'" '+(val?'checked':'')+' onchange="markDirty()"><span class="slider"></span></label></div>';
                 } else {
-                    alert('Promotion failed: ' + data.message);
+                    html += '<div class="cfg-row"><label>'+label+'</label>'
+                          + '<span class="tag '+tag+'">'+tagT+'</span>'
+                          + '<input type="number" data-k="'+k+'" value="'+val+'" min="'+lo+'" max="'+hi+'" step="'+step+'" oninput="markDirty(this)">'
+                          + '<span class="unit">'+unit+'</span></div>';
                 }
-                updateUI();
             });
+            html += '</div>';
+        });
+        setHTML('cfg-body', html);
+        cfgDirty = false; updateSaveBtn();
+    }
+    function markDirty(inp){
+        if(inp){
+            const k = inp.getAttribute('data-k');
+            const orig = cfgOriginal[k];
+            const changed = String(parseFloat(inp.value)) !== String(orig);
+            inp.classList.toggle('changed', changed);
         }
+        cfgDirty = true; updateSaveBtn();
+    }
+    function updateSaveBtn(){ const b=el('cfg-save'); if(b){ b.textContent = cfgDirty ? 'Kaydet *' : 'Kaydet'; } }
+    function collectConfig(){
+        const out = {};
+        document.querySelectorAll('#cfg-body [data-k]').forEach(inp=>{
+            const k = inp.getAttribute('data-k');
+            out[k] = inp.type==='checkbox' ? inp.checked : parseFloat(inp.value);
+        });
+        return out;
+    }
+    function saveConfig(){
+        const body = collectConfig();
+        setText('cfg-toast','Kaydediliyor...'); el('cfg-toast').className='muted';
+        fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+            .then(r=>r.json()).then(d=>{
+                if(d.status==='success'){
+                    cfgOriginal = Object.assign({}, d.config||{});
+                    renderConfig(d.config||{}, cfgMeta);
+                    setText('cfg-toast','✓ Kaydedildi'); el('cfg-toast').className='green';
+                } else { setText('cfg-toast','Hata: '+(d.message||'')); el('cfg-toast').className='red'; }
+                setTimeout(()=>setText('cfg-toast',''), 2500);
+            }).catch(()=>{ setText('cfg-toast','İstek başarısız'); el('cfg-toast').className='red'; });
+    }
+    function resetConfig(){
+        if(!confirm('Tüm parametreleri varsayılana döndür?')) return;
+        fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({__reset__:true})})
+            .then(r=>r.json()).then(d=>{ cfgOriginal=Object.assign({},d.config||{}); renderConfig(d.config||{}, cfgMeta);
+                setText('cfg-toast','✓ Sıfırlandı'); el('cfg-toast').className='green'; setTimeout(()=>setText('cfg-toast',''),2500); }).catch(()=>{});
+    }
 
-        setTimeout(() => { updateUI(); setInterval(updateUI, 500); }, 300);
+    // ── main state refresh (500ms) — every access null-safe ──
+    function refresh(){
+        fetch('/api/state').then(r=>r.json()).then(s=>{
+            try { render(s); } catch(e){ console.error('render error:', e); }
+        }).catch(e=>console.error('state fetch failed:', e));
+    }
+    function render(s){
+        const paper = s.trading_mode === 'PAPER';
+        el('m-paper').className = 'mode' + (paper?' on-paper':'');
+        el('m-real').className = 'mode' + (paper?'':' on-real');
+        setText('m-bal', '$' + N(paper ? s.virtual_balance : s.real_balance, 2, '0'));
+        setText('th-mode', paper ? '[PAPER]' : '[REAL]');
+
+        // run state
+        const active = !!s.is_trading_active;
+        const rb = el('run-btn'), rbg = el('run-badge');
+        rb.className = 'btn ' + (active?'btn-stop':'btn-start');
+        rb.innerHTML = active ? '&#9632; DURDUR' : '&#9654; BAŞLAT';
+        rbg.className = 'badge ' + (active?'b-green':'b-yellow');
+        setText('run-t', active ? 'CANLI TİCARET' : 'GÖZLEM');
+
+        // metrics
+        const tc = G(s,'trade_count',0), wt = G(s,'winning_trades',0);
+        const wr = tc>0 ? wt/tc*100 : 0;
+        const gl = G(s,'gross_loss',0), gp = G(s,'gross_profit',0);
+        const pf = gl<0 ? Math.abs(gp/gl) : (gp>0?99.99:0);
+        setText('m-pnl', (G(s,'total_pnl',0)>=0?'+':'') + N(s.total_pnl,2,'0') + '%');
+        el('m-pnl').className = 'v ' + (G(s,'total_pnl',0)>=0?'green':'red');
+        setText('m-wr', N(wr,1,'0') + '%');
+        setText('m-pf', N(pf,2,'0'));
+        setText('m-sharpe', N(s.sharpe_ratio,2,'0'));
+        el('m-sharpe').className = 'v ' + (G(s,'sharpe_ratio',0)>=0?'green':'red');
+        setText('m-tc', tc);
+        const obi = G(s,'obi',0);
+        setText('m-obi', (obi>0?'+':'') + N(obi,2,'0'));
+        el('m-obi').className = 'v ' + (obi>0.3?'green':(obi<-0.3?'red':''));
+        setHTML('m-awl', '<span class="green">+'+N(s.avg_win,2,'0')+'</span>/<span class="red">'+N(s.avg_loss,2,'0')+'</span>');
+
+        // price
+        const p = G(s,'price',0), pel = el('price');
+        pel.className = 'price mono ' + (p>lastPrice?'green':(p<lastPrice?'red':''));
+        setText('price','$'+N(p,2,'0')); lastPrice = p;
+
+        // signal chip
+        const sig = G(s,'signal','HOLD'), st = G(s,'signal_type','');
+        const chip = el('sig-chip');
+        chip.textContent = sig + (st?(' · '+st):'');
+        chip.className = 'badge ' + (sig==='BUY'?'b-green':(sig==='SELL'?'b-red':'b-grey'));
+
+        // geometry
+        const g = s.geom || {};
+        renderGeo(g);
+
+        // position
+        renderPos(s);
+
+        // challenger + report buttons
+        const ps = s.parameters_store || {};
+        const chal = ps.shadow_challenger;
+        setText('chal', chal ? 'Aktif' : 'Yok');
+        el('chal').className = 'v ' + (chal?'accent':'muted');
+        const promo = el('promo-btn');
+        promo.style.display = (chal && !s.position_side) ? 'block' : 'none';
+        el('bt-btn').disabled = !!s.backtest_running;
+        el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : 'Backtest Çalıştır (3000b)';
+        el('wfo-btn').disabled = !!s.wfo_running;
+        el('wfo-btn').textContent = s.wfo_running ? 'WFO çalışıyor...' : 'Purged WFO Çalıştır';
+        renderReport(s);
+
+        // trades
+        renderTrades(s.trades || []);
+        // chart
+        renderChart(s.chart_data || []);
+        // orderbook
+        renderOB(s);
+    }
+
+    function renderGeo(g){
+        const status = G(g,'status','collecting');
+        const degraded = (status==='ready' && g.health==='degraded');
+        // header badge
+        const badge = el('geo-badge'), bt = el('geo-badge-t');
+        let bc='b-grey', bd='var(--muted)', txt=String(status).toUpperCase();
+        if(degraded){ bc='b-red'; bd='var(--red)'; txt='DEGRADED'; }
+        else if(status==='ready'){ bc='b-green'; bd='var(--green)'; txt='READY'; }
+        else if(status==='training'){ bc='b-yellow'; bd='var(--yellow)'; txt='TRAINING'; }
+        badge.className='badge '+bc; bt.textContent=txt;
+        badge.querySelector('.bdot').style.background=bd;
+
+        const hp = el('geo-health');
+        hp.textContent = degraded ? 'DEGRADED' : (status==='ready'?'OK':'—');
+        hp.style.background = degraded ? 'rgba(239,68,68,.15)' : (status==='ready'?'rgba(34,197,94,.15)':'rgba(125,135,156,.15)');
+        hp.style.color = degraded ? 'var(--red)' : (status==='ready'?'var(--green)':'var(--muted)');
+        const note = el('geo-health-note');
+        if(degraded && Array.isArray(g.health_reasons) && g.health_reasons.length){
+            note.style.display='block'; note.textContent='⚠ '+g.health_reasons.join(' · ');
+        } else note.style.display='none';
+
+        setText('g-status', String(status).toUpperCase());
+        setText('g-schema', G(g,'schema','-'));
+        setText('g-kappa', N(g.kappa,3)+' / '+N(g.kappa_init,3));
+        const gd = g.diag || {};
+        const pdn = gd.p_delta_nonzero;
+        setText('g-eta', N(g.eta,3)+' · '+(pdn!==undefined?N(pdn*100,1)+'%':'-'));
+        const inEp = g.episode==='EPISODE';
+        setText('g-ep', inEp ? ('EPİZOT'+(G(g,'cluster',-1)>=0?(' A'+g.cluster):'')) : 'NORMAL');
+        el('g-ep').className = 'v ' + (inEp?'yellow':'green');
+        setText('g-p', N(g.p_gbm,2)+' / '+N(g.p_meta,2));
+        const aOk = G(g,'a_score',0) >= G(g,'a_gate',0.5);
+        setText('g-a', N(g.a_score,2)+' (kapı '+N(g.a_gate,2)+')');
+        el('g-a').className = 'v ' + (aOk?'green':'muted');
+        const en = g.exp_net;
+        if(en!==undefined && g.tp_pct){
+            setText('g-en', (en>=0?'+':'')+N(en,2)+'% · '+N(g.tp_pct,2)+'/'+N(g.sl_pct,2)+'%');
+            el('g-en').className = 'v ' + (en>0?'green':'red');
+        } else setText('g-en','-');
+        setText('g-da', N(gd.d_anchor,4)+' · f'+G(g,'fold',0));
+        const pn = g.panel || {};
+        setText('g-panel', (pn.core_active!==undefined)?(pn.core_active+' / '+G(pn,'core_retired',0)):'-');
+        setText('lg-geo', 'Geometri: '+String(status).toUpperCase()+(status==='ready'&&g.schema?(' · '+g.schema):''));
+    }
+
+    function renderPos(s){
+        const box = el('pos');
+        if(s.position_side){
+            const long = s.position_side==='long';
+            const pnl = G(s,'position_pnl',0);
+            box.innerHTML =
+                '<div class="kv"><span class="k">Yön</span><span class="pill '+(long?'pill-long':'pill-short')+'">'+String(s.position_side).toUpperCase()+'</span></div>'
+              + '<div class="kv"><span class="k">Tip</span><span class="v">'+G(s,'position_type','-')+'</span></div>'
+              + '<div class="kv"><span class="k">Giriş</span><span class="v mono">$'+N(s.position_entry,2)+'</span></div>'
+              + '<div class="kv"><span class="k">PnL</span><span class="v '+(pnl>=0?'green':'red')+'">'+(pnl>=0?'+':'')+N(pnl,2)+'%</span></div>';
+        } else box.innerHTML = '<div class="muted" style="text-align:center; padding:4px;">Pozisyon yok</div>';
+    }
+
+    function renderReport(s){
+        const box = el('report');
+        if(s.wfo_report){
+            const w = s.wfo_report; let h = '<div class="accent" style="font-weight:700; margin-bottom:4px;">WFO Sonucu ('+G(w,'engine','-')+')</div>';
+            h += '<div class="kv"><span class="k">Stabilite</span><span class="v">'+G(w,'stability_count',0)+'/'+G(w,'slices_evaluated',0)+'</span></div>';
+            h += '<div class="kv"><span class="k">PF Varyans</span><span class="v">'+N(w.variance,4)+'</span></div>';
+            if(w.schema && w.schema!=='-') h += '<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+w.schema+'</span></div>';
+            const dg = (w.diagnostics||[]);
+            if(dg.length){ const d=dg[dg.length-1];
+                h += '<div class="muted" style="font-size:10px; margin-top:3px;">P(δ≠0)='+N(d.p_delta_nonzero*100,1)+'% · κ='+N(d.kappa,2)+' · gap='+N(d.overfit_gap,3)+' · D_anchor='+N(d.d_anchor,4)+'</div>'; }
+            box.innerHTML=h; box.style.display='block';
+        } else if(s.backtest_report){
+            const r=s.backtest_report;
+            if(r.status==='error'){ box.innerHTML='<div class="red">'+G(r,'message','hata')+'</div>'; box.style.display='block'; return; }
+            let h='<div class="green" style="font-weight:700; margin-bottom:4px;">Backtest ('+G(r,'engine','-')+')</div>';
+            if(r.schema && r.schema!=='-') h+='<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+r.schema+'</span></div>';
+            h+='<div class="kv"><span class="k">İşlem / Kazanç</span><span class="v">'+G(r,'trade_count',0)+' / '+N(r.win_rate,1)+'%</span></div>';
+            h+='<div class="kv"><span class="k">Net Kâr</span><span class="v '+(G(r,'total_pnl_usdt',0)>=0?'green':'red')+'">'+(G(r,'total_pnl_usdt',0)>=0?'+':'')+N(r.total_pnl_usdt,2)+' ('+N(r.total_pnl_pct,2)+'%)</span></div>';
+            h+='<div class="kv"><span class="k">PF / Sharpe</span><span class="v">'+N(r.profit_factor,2)+' / '+N(r.sharpe_ratio,2)+'</span></div>';
+            h+='<div class="kv"><span class="k">Max DD</span><span class="v red">'+N(r.max_drawdown_pct,2)+'%</span></div>';
+            box.innerHTML=h; box.style.display='block';
+        } else box.style.display='none';
+    }
+
+    function renderTrades(trades){
+        if(!trades.length) return;
+        setHTML('tbody', trades.slice(0,40).map(t=>{
+            const pnl = String(G(t,'pnl','-'));
+            const cls = pnl.startsWith('+')?'green':(pnl.startsWith('-')?'red':'');
+            const long = (t.side==='LONG'||t.side==='long');
+            const exit = G(t,'exit',0);
+            return '<tr><td class="muted">'+G(t,'time','')+'</td><td>'+G(t,'type','')+'</td>'
+                 + '<td><span class="pill '+(long?'pill-long':'pill-short')+'">'+G(t,'side','')+'</span></td>'
+                 + '<td class="mono">$'+N(t.entry,2)+'</td><td class="mono">'+(exit>0?'$'+N(exit,2):'-')+'</td>'
+                 + '<td class="mono '+cls+'">'+pnl+'</td><td class="muted">'+G(t,'reason','')+'</td></tr>';
+        }).join(''));
+    }
+
+    function renderChart(cd){
+        if(!chart) initChart();
+        if(!cd.length) return;
+        try {
+            candles.setData(cd.map(d=>({time:d.time, open:d.open, high:d.high, low:d.low, close:d.close})));
+            aHist.setData(cd.filter(d=>d.geo_a!==null&&d.geo_a!==undefined).map(d=>({
+                time:d.time, value:d.geo_a,
+                color: d.geo_episode ? 'rgba(245,183,61,.5)' : (d.geo_a>=d.geo_gate ? 'rgba(34,197,94,.6)' : 'rgba(125,135,156,.35)')
+            })));
+            let mk=[], prevEp=false;
+            cd.forEach(d=>{
+                if(d.geo_episode && !prevEp) mk.push({time:d.time, position:'aboveBar', color:'#f5b73d', shape:'circle', text:(d.geo_state>0?('A'+(d.geo_state-1)):'EP')});
+                prevEp = !!d.geo_episode;
+                if(d.geo_buy) mk.push({time:d.time, position:'belowBar', color:'#22c55e', shape:'arrowUp', text:'GEO'});
+                if(d.geo_sell) mk.push({time:d.time, position:'aboveBar', color:'#c084fc', shape:'arrowDown', text:'GEO S'});
+                if(d.geo_exit) mk.push({time:d.time, position:'aboveBar', color:'#ef4444', shape:'arrowDown', text:'EXIT'});
+            });
+            candles.setMarkers(mk);
+        } catch(e){ console.error('chart error:', e); }
+    }
+
+    function renderOB(s){
+        const ob = s.orderbook;
+        if(!ob || !ob.bids || !ob.asks || !ob.bids.length || !ob.asks.length) return;
+        const asks = ob.asks.slice(0,7).reverse(), bids = ob.bids.slice(0,7);
+        let mx=0; [...asks,...bids].forEach(a=>{ if(a[1]>mx) mx=a[1]; });
+        const row=(a,cls)=>{ const w=Math.min((a[1]/mx)*100,100); return '<div class="ob-row '+cls+'"><div class="ob-bar" style="width:'+w+'%"></div><span>'+N(a[0],2)+'</span><span>'+N(a[1],4)+'</span></div>'; };
+        setHTML('ob-asks', asks.map(a=>row(a,'ob-ask')).join(''));
+        setHTML('ob-bids', bids.map(a=>row(a,'ob-bid')).join(''));
+        setText('ob-mid', '$'+N(s.price,2));
+    }
+
+    // boot
+    loadConfig();
+    setTimeout(()=>{ refresh(); setInterval(refresh, 500); }, 250);
     </script>
 </body>
 </html>
@@ -4519,6 +4548,7 @@ def toggle_short():
     with state_lock:
         bot_state["allow_short"] = not bot_state.get("allow_short", False)
         allow = bot_state["allow_short"]
+    save_trading_config({"allow_short": allow})   # persist so it survives restarts
     log.info(f"allow_short toggled → {allow}")
     return jsonify({"status": "success", "allow_short": allow})
 
@@ -4547,6 +4577,35 @@ def set_trading_mode():
             bot_state["trading_mode"] = data["mode"]
             mode_val = bot_state["trading_mode"]
     return jsonify({"status": "success", "mode": mode_val})
+
+@app.route('/api/config', methods=['GET', 'POST'])
+def config_endpoint():
+    """GET returns the live trading config + UI metadata; POST validates,
+    persists (trading_config.json) and applies it. Geometry-affecting knobs
+    take effect on the next refit, the rest on the next tick."""
+    if request.method == 'GET':
+        return jsonify({
+            "status": "success",
+            "config": dict(CFG),
+            "meta": {k: list(v) for k, v in TRADING_CONFIG_META.items()},
+            "effective_cost_pct": round(roundtrip_cost_pct(), 4),
+        })
+    # POST
+    try:
+        data = request.json or {}
+        if data.get("__reset__"):
+            new_cfg = save_trading_config(dict(DEFAULT_TRADING_CONFIG))
+        else:
+            new_cfg = save_trading_config(data)
+        # keep the runtime toggle in sync with the persisted config
+        with state_lock:
+            bot_state["allow_short"] = bool(new_cfg.get("allow_short", False))
+        log.info(f"Trading config updated: {new_cfg}")
+        return jsonify({"status": "success", "config": new_cfg,
+                        "effective_cost_pct": round(roundtrip_cost_pct(), 4)})
+    except Exception as e:
+        log.error(f"Config update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/api/backtest', methods=['POST'])
 def run_backtest_endpoint():
