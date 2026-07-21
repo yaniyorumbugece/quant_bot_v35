@@ -68,7 +68,10 @@ SYMBOL = "BTC/USDT"
 OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more visible history
 RESEARCH_BARS_DEFAULT = int(os.environ.get("RESEARCH_BARS_DEFAULT", "35040"))
 RESEARCH_BARS_MIN = 3000
-RESEARCH_BARS_MAX = int(os.environ.get("RESEARCH_BARS_MAX", "100000"))
+# 500k covers Binance's full 15m BTC history (~290k bars since 2017) with room
+# for 1m requests of about a year; the paginator stops early at whatever depth
+# the provider actually has and fetch_ohlcv_large keeps the longest partial.
+RESEARCH_BARS_MAX = int(os.environ.get("RESEARCH_BARS_MAX", "500000"))
 ENABLE_MTF_FEATURES = os.environ.get("ENABLE_MTF_FEATURES", "0").strip().lower() in ("1", "true", "yes")
 ENABLE_FUTURES_FEATURES = os.environ.get("ENABLE_FUTURES_FEATURES", "0").strip().lower() in ("1", "true", "yes")
 # Community on-chain metrics are daily and deliberately opt-in.  They are
@@ -4325,6 +4328,7 @@ class QuantBot:
         # current candle cannot leave the requested closed-bar window one row short.
         cursor = now_ms - ((target_limit + 2) * tf_ms)
         candles = {}
+        reached_present = False
         page_size = 1000
         # Some venues return fewer candles than requested, so allow a generous but
         # finite page budget while still detecting a stalled cursor below.
@@ -4347,7 +4351,11 @@ class QuantBot:
                     f"[{provider.upper()}] OHLCV page {page + 1}: "
                     f"{len(candles)}/{target_limit} unique bars"
                 )
-                if len(candles) >= target_limit or cursor <= previous_cursor or newest_ts >= now_ms - tf_ms:
+                # two-interval margin: venues lag the current candle by up to a
+                # bar, and the still-forming candle itself is one more
+                if newest_ts >= now_ms - 2 * tf_ms:
+                    reached_present = True
+                if len(candles) >= target_limit or cursor <= previous_cursor or reached_present:
                     break
             except Exception as e:
                 log.error(f"[{provider.upper()}] OHLCV page {page + 1} failed: {e}")
@@ -4361,6 +4369,11 @@ class QuantBot:
         df = pd.DataFrame(ordered, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.attrs["data_source"] = provider
+        # Short of target although the fetch walked all the way to the present:
+        # the provider's history simply starts later than requested. Marks the
+        # partial as "complete for this venue" so a maxed-out request does not
+        # pointlessly re-walk every fallback provider.
+        df.attrs["history_exhausted"] = bool(reached_present and len(ordered) < target_limit)
         return df
 
     async def fetch_ohlcv_large(self, symbol, timeframe, limit=RESEARCH_BARS_DEFAULT):
@@ -4384,6 +4397,15 @@ class QuantBot:
                 if len(df) >= target_limit:
                     bot_state["research_data_source"] = provider
                     log.info(f"Research data source selected: {provider.upper()} ({len(df)} bars)")
+                    return df
+                if (df.attrs.get("history_exhausted") and
+                        len(df) >= TabularLightGBMPipeline.MIN_TRAIN_BARS + 200):
+                    # The venue delivered its ENTIRE history up to the present --
+                    # walking the remaining fallbacks would multiply a maxed-out
+                    # request's fetch time without producing deeper data.
+                    bot_state["research_data_source"] = provider
+                    log.info(f"Research data source selected: {provider.upper()} "
+                             f"({len(df)} bars -- full available history)")
                     return df
                 errors.append(f"{provider}: only {len(df)}/{target_limit} bars")
             except Exception as e:
@@ -5448,7 +5470,7 @@ HTML_TEMPLATE = """
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
                     <label class="muted" style="font-size:10px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
                         Araştırma barı
-                        <input id="research-bars" type="number" min="3000" max="100000" step="1000" value="35040"
+                        <input id="research-bars" type="number" min="3000" max="500000" step="1000" value="35040"
                                style="width:92px; background:#111722; color:#d7dbe3; border:1px solid #263044; border-radius:5px; padding:5px;">
                     </label>
                     <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır</button>
@@ -5514,7 +5536,7 @@ HTML_TEMPLATE = """
             rebuildSeries();
         }).catch(()=>{});
     }
-    function researchBars(){ return Math.min(100000, Math.max(3000, parseInt(el('research-bars').value||'35040',10))); }
+    function researchBars(){ return Math.min(500000, Math.max(3000, parseInt(el('research-bars').value||'35040',10))); }
     function runResearch(url, buttonId){
         const b=el(buttonId); b.disabled=true;
         fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bars:researchBars()})})
@@ -6553,6 +6575,37 @@ def test_research_provider_fallback():
         assert df.attrs["data_source"] == "binance"
         assert bot_state["research_data_source"] == "binance"
         print("  rejected MEXC -> BINANCE fallback selected ✓")
+    finally:
+        RESEARCH_PROVIDER_ORDER = previous_order
+
+    # A maxed-out request against a venue whose ENTIRE history is shorter than
+    # the target must accept that complete-to-present partial immediately
+    # instead of walking the remaining fallback providers.
+    class BoomIfConsulted:
+        def parse_timeframe(self, timeframe): return 60
+        def fetch_ohlcv(self, *args, **kwargs):
+            raise AssertionError("fallback consulted although history was exhausted")
+
+    class ShortHistoryHolder:
+        def __init__(self):
+            self.exchanges = {"binance": WorkingExchange(), "mexc": BoomIfConsulted()}
+        def _research_exchange(self, provider):
+            return self.exchanges[provider]
+        async def _fetch_ohlcv_paginated(self, exchange, provider, symbol, timeframe, limit):
+            return await QuantBot._fetch_ohlcv_paginated(
+                self, exchange, provider, symbol, timeframe, limit
+            )
+
+    previous_order = RESEARCH_PROVIDER_ORDER
+    RESEARCH_PROVIDER_ORDER = ("binance", "mexc")
+    try:
+        df = asyncio.run(QuantBot.fetch_ohlcv_large(
+            ShortHistoryHolder(), SYMBOL, "1m", 10_000
+        ))
+        assert len(df) < 10_000 and len(df) >= TabularLightGBMPipeline.MIN_TRAIN_BARS + 200
+        assert df.attrs["history_exhausted"] is True
+        assert df.attrs["data_source"] == "binance"
+        print(f"  exhausted history accepted at {len(df)} bars without fallback walk ✓")
     finally:
         RESEARCH_PROVIDER_ORDER = previous_order
 
