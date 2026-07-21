@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  QUANT BOT V3.7 — LIGHTGBM RESEARCH ENGINE                                 ║
+║  QUANT BOT V4.0 — CAUSAL TABULAR LIGHTGBM                                  ║
 ║  MEXC Spot · PyWebView arayüz · Scale-Out (70/30) + MTF Trailing           ║
 ║                                                                            ║
 ║  Çekirdek: Vol-Norm → Multi-res Paths (5/15/30/60 dyadik) → Chen İmzaları  ║
@@ -66,9 +66,14 @@ log = logging.getLogger("QuantBot")
 # ═══════════════════════════════════════════════════════════════════════════════
 SYMBOL = "BTC/USDT"
 OHLCV_LIMIT = 1000   # MEXC spot supports up to 1000 bars per fetch — more visible history
-RESEARCH_BARS_DEFAULT = int(os.environ.get("RESEARCH_BARS_DEFAULT", "10000"))
+RESEARCH_BARS_DEFAULT = int(os.environ.get("RESEARCH_BARS_DEFAULT", "35040"))
 RESEARCH_BARS_MIN = 3000
 RESEARCH_BARS_MAX = int(os.environ.get("RESEARCH_BARS_MAX", "100000"))
+ENABLE_MTF_FEATURES = os.environ.get("ENABLE_MTF_FEATURES", "0").strip().lower() in ("1", "true", "yes")
+ENABLE_FUTURES_FEATURES = os.environ.get("ENABLE_FUTURES_FEATURES", "0").strip().lower() in ("1", "true", "yes")
+# Community on-chain metrics are daily and deliberately opt-in.  They are
+# research-only until an untouched WFO proves they improve the base model.
+ENABLE_ONCHAIN_FEATURES = os.environ.get("ENABLE_ONCHAIN_FEATURES", "0").strip().lower() in ("1", "true", "yes")
 RESEARCH_PROVIDER_ORDER = tuple(
     p.strip().lower()
     for p in os.environ.get("RESEARCH_DATA_PROVIDERS", "binance,bybit,okx,mexc").split(",")
@@ -225,6 +230,17 @@ tf_change_event = asyncio.Event()
 state_lock = threading.Lock()
 
 PARAMETERS_STORE_PATH = Path(__file__).parent / "parameters_store.json"
+OBI_HISTORY_PATH = Path(__file__).parent / "obi_history.csv"
+
+DEFAULT_MODEL_PARAMS = {
+    "TP_PERCENT": 1.0,
+    "SL_PERCENT": 0.5,
+    "HOLD_BARS": 30,
+    "OBI_WALL": 0.25,
+    # Legacy keys stay readable so an existing parameters_store.json migrates safely.
+    "VOL_LENGTH": 14,
+    "TRAIL_MULT": 3.0,
+}
 
 def get_active_parameters():
     try:
@@ -232,10 +248,10 @@ def get_active_parameters():
             import json
             with open(PARAMETERS_STORE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data.get("champion", {})
+                return {**DEFAULT_MODEL_PARAMS, **(data.get("champion", {}) or {})}
     except Exception as e:
         log.error(f"Error loading parameters: {e}")
-    return {
+    return {**DEFAULT_MODEL_PARAMS, **{
         "FAST_LENGTH": 8,
         "SLOW_LENGTH": 21,
         "VOL_LENGTH": 14,
@@ -244,8 +260,8 @@ def get_active_parameters():
         "MIN_PROFIT_MARGIN": 0.3,
         "TRAIL_MULT": 3.0,
         "PING_STOP_MULT": 0.5,
-        "TP_PERCENT": 0.6
-    }
+        "TP_PERCENT": 1.0
+    }}
 
 def get_all_parameters():
     try:
@@ -293,7 +309,7 @@ def promote_parameter_set(store, parameters, source="manual"):
 bot_state = {
     "is_trading_active": False,
     "trading_mode": "PAPER",
-    "timeframe": "1m",
+    "timeframe": "15m",
     "timeframe_changed": False,
 
     "symbol": SYMBOL,
@@ -354,7 +370,7 @@ bot_state = {
     "wfo_bars_requested": RESEARCH_BARS_DEFAULT,
     "wfo_bars_used": 0,
     "research_data_source": "-",
-    "active_parameters": {"TRAIL_MULT": float(cfg("trail_mult"))},
+    "active_parameters": get_active_parameters(),
     "parameters_store": get_all_parameters(),
 
     # V3.6 Learned Geometry state
@@ -524,6 +540,208 @@ def roundtrip_cost_pct(commission_rate=None, slippage_rate=None, spread_rate=Non
     slip = cfg("slippage_pct") if slippage_rate is None else slippage_rate * 100.0
     sprd = cfg("spread_pct") if spread_rate is None else spread_rate * 100.0
     return 2.0 * comm + 2.0 * (slip + sprd / 2.0)
+
+
+def append_obi_minute(timestamp_sec, values):
+    """Persist one minute of real MEXC order-book imbalance observations."""
+    if not values:
+        return
+    import csv
+    exists = OBI_HISTORY_PATH.exists()
+    arr = np.asarray(values, dtype=float)
+    with open(OBI_HISTORY_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(["timestamp", "obi_mean", "obi_median", "obi_std", "samples"])
+        writer.writerow([
+            datetime.fromtimestamp(timestamp_sec, _tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            float(np.mean(arr)), float(np.median(arr)), float(np.std(arr)), int(len(arr)),
+        ])
+
+
+def attach_obi_history(df, timeframe):
+    """Join recorded real OBI to candles; never invent an OHLCV proxy for OBI."""
+    out = df.copy()
+    out.attrs.update(df.attrs)
+    out["obi"] = np.nan
+    if not OBI_HISTORY_PATH.exists():
+        out.attrs.update({"obi_coverage": 0.0, "obi_optimized": False})
+        return out
+    try:
+        hist = pd.read_csv(OBI_HISTORY_PATH)
+        if hist.empty:
+            raise ValueError("empty OBI history")
+        hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True).dt.tz_localize(None)
+        freq = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}.get(timeframe, "15min")
+        hist["bucket"] = hist["timestamp"].dt.floor(freq)
+        hist["weight"] = np.maximum(pd.to_numeric(hist["samples"], errors="coerce").fillna(1.0), 1.0)
+        hist["weighted_obi"] = pd.to_numeric(hist["obi_mean"], errors="coerce") * hist["weight"]
+        agg = hist.groupby("bucket", as_index=False).agg(weighted_obi=("weighted_obi", "sum"), weight=("weight", "sum"))
+        agg["obi"] = agg["weighted_obi"] / agg["weight"].replace(0, np.nan)
+        agg = agg[["bucket", "obi"]]
+        out = out.merge(agg, left_on="timestamp", right_on="bucket", how="left", suffixes=("", "_recorded"))
+        out["obi"] = out["obi_recorded"].where(out["obi_recorded"].notna(), out["obi"])
+        out.drop(columns=[c for c in ("bucket", "obi_recorded") if c in out], inplace=True)
+        coverage = float(out["obi"].notna().mean())
+        out.attrs.update(df.attrs)
+        out.attrs.update({"obi_coverage": coverage, "obi_optimized": coverage >= 0.80})
+        return out
+    except Exception as e:
+        log.warning(f"OBI history could not be attached: {e}")
+        out.attrs.update({"obi_coverage": 0.0, "obi_optimized": False})
+        return out
+
+
+def timeframe_minutes(timeframe):
+    return {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}.get(str(timeframe), 15)
+
+
+def attach_binance_futures_context(df, timeframe):
+    """Attach public USD-M futures klines and funding without lookahead.
+
+    Futures kline fields include historical taker-buy base volume. Funding events
+    are joined only after their event timestamp. Failure is non-fatal: the caller
+    keeps pure spot OHLCV and the model omits this optional feature group.
+    """
+    out = df.copy()
+    out.attrs.update(df.attrs)
+    if out.empty:
+        return out
+    symbol = SYMBOL.replace("/", "").replace(":USDT", "")
+    interval_ms = timeframe_minutes(timeframe) * 60_000
+    start_ms = int(pd.to_datetime(out["timestamp"].iloc[0]).timestamp() * 1000)
+    end_ms = int(pd.to_datetime(out["timestamp"].iloc[-1]).timestamp() * 1000) + interval_ms
+    base_url = "https://fapi.binance.com"
+    rows, cursor = [], start_ms
+    try:
+        while cursor < end_ms:
+            response = requests.get(
+                base_url + "/fapi/v1/klines",
+                params={"symbol": symbol, "interval": timeframe, "startTime": cursor,
+                        "endTime": end_ms, "limit": 1500}, timeout=15)
+            response.raise_for_status()
+            batch = response.json()
+            if not batch:
+                break
+            rows.extend(batch)
+            next_cursor = int(batch[-1][0]) + interval_ms
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(batch) < 1500:
+                break
+        if not rows:
+            raise RuntimeError("empty USD-M futures kline response")
+        fut = pd.DataFrame({
+            "timestamp": pd.to_datetime([int(r[0]) for r in rows], unit="ms"),
+            "fut_close": [float(r[4]) for r in rows],
+            "fut_volume": [float(r[5]) for r in rows],
+            "fut_quote_volume": [float(r[7]) for r in rows],
+            "fut_trades": [float(r[8]) for r in rows],
+            "fut_taker_buy_volume": [float(r[9]) for r in rows],
+        }).drop_duplicates("timestamp", keep="last")
+        out = out.merge(fut, on="timestamp", how="left")
+
+        funding_rows, funding_cursor = [], start_ms
+        while funding_cursor < end_ms:
+            response = requests.get(
+                base_url + "/fapi/v1/fundingRate",
+                params={"symbol": symbol, "startTime": funding_cursor,
+                        "endTime": end_ms, "limit": 1000}, timeout=15)
+            response.raise_for_status()
+            batch = response.json()
+            if not batch:
+                break
+            funding_rows.extend(batch)
+            next_cursor = int(batch[-1]["fundingTime"]) + 1
+            if next_cursor <= funding_cursor:
+                break
+            funding_cursor = next_cursor
+            if len(batch) < 1000:
+                break
+        out["funding_rate"] = np.nan
+        if funding_rows:
+            events = pd.DataFrame({
+                "funding_time": pd.to_datetime(
+                    [int(r["fundingTime"]) for r in funding_rows], unit="ms").astype("datetime64[ns]"),
+                "funding_rate_event": [float(r["fundingRate"]) for r in funding_rows],
+            }).sort_values("funding_time").drop_duplicates("funding_time", keep="last")
+            available = pd.DataFrame({
+                "_row": np.arange(len(out)),
+                "available_time": (pd.to_datetime(out["timestamp"]).astype("datetime64[ns]") +
+                                   pd.to_timedelta(interval_ms, unit="ms")),
+            }).sort_values("available_time")
+            joined = pd.merge_asof(available, events, left_on="available_time",
+                                   right_on="funding_time", direction="backward")
+            out.loc[joined["_row"].to_numpy(), "funding_rate"] = joined["funding_rate_event"].to_numpy()
+        coverage = float(out["fut_close"].notna().mean())
+        out.attrs.update(df.attrs)
+        out.attrs.update({"futures_context_coverage": coverage,
+                          "futures_context_source": "binance-usdm-public"})
+        log.info(f"Binance USD-M context attached: {coverage*100:.1f}% coverage")
+        return out
+    except Exception as e:
+        log.warning(f"Binance USD-M context unavailable; continuing with spot features: {e}")
+        out.attrs.update(df.attrs)
+        out.attrs.update({"futures_context_coverage": 0.0,
+                          "futures_context_source": "unavailable",
+                          "futures_context_error": str(e)})
+        return out
+
+
+def attach_coinmetrics_onchain_context(df, timeframe):
+    """Attach free daily Bitcoin network data with a one-day availability lag.
+
+    A daily on-chain observation describes the entire UTC day, so it cannot be
+    used by a candle within that day.  It is only merged after the following
+    midnight.  This deliberately conservative lag prevents a subtle daily
+    look-ahead leak in both backtests and WFO.
+    """
+    out = df.copy()
+    out.attrs.update(df.attrs)
+    if out.empty:
+        return out
+    metric_cols = ("TxCnt", "AdrActCnt", "FeeTotNtv", "CapMrktCurUSD")
+    try:
+        first_day = pd.to_datetime(out["timestamp"].iloc[0]).floor("D") - pd.Timedelta(days=45)
+        last_day = pd.to_datetime(out["timestamp"].iloc[-1]).ceil("D")
+        response = requests.get(
+            "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics",
+            params={"assets": "btc", "metrics": ",".join(metric_cols), "frequency": "1d",
+                    "start_time": first_day.strftime("%Y-%m-%d"),
+                    "end_time": last_day.strftime("%Y-%m-%d"), "page_size": 10000},
+            timeout=30)
+        response.raise_for_status()
+        rows = response.json().get("data", [])
+        if not rows:
+            raise RuntimeError("empty Coin Metrics response")
+        daily = pd.DataFrame(rows)
+        daily["available_time"] = (pd.to_datetime(daily["time"], utc=True).dt.tz_localize(None) +
+                                   pd.Timedelta(days=1)).astype("datetime64[ns]")
+        daily = daily[["available_time", *metric_cols]].copy()
+        for col in metric_cols:
+            daily[col] = pd.to_numeric(daily[col], errors="coerce")
+        daily = daily.sort_values("available_time").drop_duplicates("available_time", keep="last")
+        candle_end = pd.DataFrame({"_row": np.arange(len(out)),
+                                   "available_time": (pd.to_datetime(out["timestamp"]).astype("datetime64[ns]") +
+                                                     pd.to_timedelta(timeframe_minutes(timeframe), unit="m"))})
+        # Timestamp is the candle open across the bot.  The exact intraday
+        # duration does not change the one-day on-chain availability rule.
+        joined = pd.merge_asof(candle_end.sort_values("available_time"), daily,
+                               on="available_time", direction="backward")
+        for col in metric_cols:
+            out.loc[joined["_row"].to_numpy(), "onchain_" + col] = joined[col].to_numpy()
+        coverage = float(out["onchain_TxCnt"].notna().mean())
+        out.attrs.update({"onchain_coverage": coverage,
+                          "onchain_source": "coinmetrics-community-1d",
+                          "onchain_available_lag_days": 1})
+        log.info(f"Coin Metrics on-chain context attached: {coverage*100:.1f}% coverage (1d causal lag)")
+        return out
+    except Exception as e:
+        log.warning(f"On-chain context unavailable; continuing without it: {e}")
+        out.attrs.update({"onchain_coverage": 0.0, "onchain_source": "unavailable",
+                          "onchain_error": str(e)})
+        return out
 
 
 def _softplus(x):
@@ -2273,20 +2491,14 @@ class GeometricPipeline:
         hist = store.get("schemas", {}).get(self.timeframe, [])
         return (hist[-1]["version"] + 1) if hist else 1
 
-    def _barrier_pcts(self, vol, vidx, tp_base_override=None):
+    def _barrier_pcts(self, vol, vidx):
         """Cost-floored, volatility-scaled barrier targets per bar (percent).
 
         TP must clear the cost wall with room to spare (≥ 3× roundtrip) or track the
         realized vol of the barrier horizon; SL risks less than the target so the
         payoff matrix can be positive at achievable hit rates.
-        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors.
-
-        tp_base_override: lets PurgedWalkForwardEngine grid-search the base TP%
-        without mutating the process-global trading config -- the live bot's
-        on_bar() reads the same global cfg() concurrently in another thread, so
-        temporarily overwriting CFG here would leak a backtest value into a real
-        trade for the duration of the search."""
-        base_tp = float(tp_base_override) if tp_base_override is not None else float(cfg("tp_base_pct"))
+        Breakeven win rate = (SL+c)/(TP+SL) ≈ 0.56 at the floors."""
+        base_tp = float(cfg("tp_base_pct"))
         cost = self.cost_pct
         hold = int(cfg("barrier_hold_bars"))
         tp_floor = float(cfg("tp_cost_floor_mult"))
@@ -2307,9 +2519,8 @@ class GeometricPipeline:
                                xin_row[:8]])
 
     # ── batch inference over a dataframe (backtest / WFO) ─────────────────────
-    def batch_signals(self, df, start_at=0, precomputed=None, tp_base_override=None):
-        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t.
-        tp_base_override: see _barrier_pcts -- thread-safe grid-search knob."""
+    def batch_signals(self, df, start_at=0, precomputed=None):
+        """Per-bar arrays: signal, exit flag, p, p_meta, A. Bar t uses data ≤ t."""
         n = len(df)
         out = {
             "signal": np.array(["HOLD"] * n, dtype=object),
@@ -2335,7 +2546,7 @@ class GeometricPipeline:
         Xf, flags, states, _ = self._decision_features(embeds, vidx, vol, Xin,
                                                        fit_mode=False, closes=closes)
         p_all = self.gbm.predict_proba(Xf[:, self.feature_mask])
-        tp_arr, sl_arr = self._barrier_pcts(vol, vidx, tp_base_override=tp_base_override)
+        tp_arr, sl_arr = self._barrier_pcts(vol, vidx)
         a_gate = self.conformal.a_min if self.conformal else 0.5
         cost = self.cost_pct
         for t in range(len(vidx)):
@@ -2553,15 +2764,378 @@ class GeometricPipeline:
         threading.Thread(target=_worker, daemon=True).start()
 
 
+class TabularLightGBMPipeline:
+    """Causal OHLCV LightGBM baseline with disjoint train/validation/calibration.
+
+    Geometry, meta-label stacking and pseudo-conformal acceptance are deliberately
+    absent.  One model predicts whether the exact executable long trade is net
+    profitable after TP/SL/max-hold and configured roundtrip costs.
+    """
+
+    MIN_TRAIN_BARS = 700
+    FEATURE_WARMUP = 128
+
+    def __init__(self, timeframe="15m", seed=42,
+                 use_mtf=ENABLE_MTF_FEATURES, use_futures=ENABLE_FUTURES_FEATURES,
+                 use_onchain=ENABLE_ONCHAIN_FEATURES):
+        self.timeframe = timeframe
+        self.seed = int(seed)
+        self.use_mtf = bool(use_mtf)
+        self.use_futures = bool(use_futures)
+        self.use_onchain = bool(use_onchain)
+        self.model = None
+        self.calibrator = None
+        self.status = "collecting"
+        self.diagnostics = []
+        self.p_gate = 1.01
+        self.tp_pct = 1.0
+        self.sl_pct = 0.5
+        self.hold_bars = 30
+        self.cost_pct = roundtrip_cost_pct()
+        self.win_net_pct = self.tp_pct - self.cost_pct
+        self.loss_net_pct = self.sl_pct + self.cost_pct
+        self.min_edge_pct = max(0.02, 0.10 * self.cost_pct)
+        self.feature_names = []
+        self.last_state = {}
+        self.last_fit_timestamp = None
+
+    def _higher_timeframe_features(self, df, target_minutes):
+        """Completed higher-timeframe features aligned to base-candle close time."""
+        base_minutes = timeframe_minutes(self.timeframe)
+        if target_minutes <= base_minutes:
+            return pd.DataFrame(index=df.index)
+        raw = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+        indexed = raw.set_index("timestamp")
+        rule = f"{int(target_minutes)}min"
+        higher = indexed.resample(rule, label="left", closed="left").agg({
+            "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        higher = higher.dropna(subset=["open", "high", "low", "close"])
+        hc = higher["close"].clip(lower=1e-12)
+        hlog = np.log(hc)
+        hr = hlog.diff()
+        htr = pd.concat([
+            higher["high"] - higher["low"],
+            (higher["high"] - higher["close"].shift()).abs(),
+            (higher["low"] - higher["close"].shift()).abs(),
+        ], axis=1).max(axis=1) / hc
+        hv = np.log1p(higher["volume"].clip(lower=0))
+        prefix = f"htf_{target_minutes}m"
+        features = pd.DataFrame(index=higher.index)
+        features[f"{prefix}_ret_1"] = hr
+        features[f"{prefix}_ret_4"] = hlog.diff(4)
+        features[f"{prefix}_trend_20"] = hlog - hlog.ewm(span=20, adjust=False).mean()
+        features[f"{prefix}_trend_50"] = hlog - hlog.ewm(span=50, adjust=False).mean()
+        features[f"{prefix}_rv_20"] = hr.rolling(20).std()
+        features[f"{prefix}_atr_14"] = htr.rolling(14).mean()
+        features[f"{prefix}_volume_z_20"] = ((hv - hv.rolling(20).mean()) /
+                                                hv.rolling(20).std().replace(0, np.nan))
+        features["available_time"] = features.index + pd.to_timedelta(target_minutes, unit="min")
+        base = pd.DataFrame({
+            "_row": np.arange(len(df)),
+            "available_time": pd.to_datetime(df["timestamp"]) + pd.to_timedelta(base_minutes, unit="min"),
+        }).sort_values("available_time")
+        aligned = pd.merge_asof(base, features.reset_index(drop=True).sort_values("available_time"),
+                                on="available_time", direction="backward")
+        aligned = aligned.sort_values("_row").set_index("_row")
+        return aligned.drop(columns=["available_time"], errors="ignore").reindex(df.index)
+
+    def _feature_frame(self, df):
+        o = pd.to_numeric(df["open"], errors="coerce")
+        h = pd.to_numeric(df["high"], errors="coerce")
+        l = pd.to_numeric(df["low"], errors="coerce")
+        c = pd.to_numeric(df["close"], errors="coerce")
+        v = pd.to_numeric(df["volume"], errors="coerce").clip(lower=0)
+        logc = np.log(c.clip(lower=1e-12))
+        r1 = logc.diff()
+        tr_pct = pd.Series(calc_true_range(h.values, l.values, c.values), index=df.index) / c.replace(0, np.nan)
+        x = pd.DataFrame(index=df.index)
+        for lag in (1, 2, 4, 8, 16, 32):
+            x[f"ret_{lag}"] = logc.diff(lag)
+        for w in (8, 16, 32, 64, 128):
+            x[f"rv_{w}"] = r1.rolling(w).std()
+            x[f"trend_{w}"] = logc - logc.ewm(span=w, adjust=False).mean()
+            x[f"atr_{w}"] = tr_pct.rolling(w).mean()
+        candle_range = (h - l).replace(0, np.nan)
+        x["body_pct"] = (c - o) / o.replace(0, np.nan)
+        x["range_pct"] = candle_range / o.replace(0, np.nan)
+        x["close_location"] = ((c - l) / candle_range).clip(0, 1) - 0.5
+        logv = np.log1p(v)
+        for w in (16, 64, 128):
+            vm = logv.rolling(w).mean()
+            vs = logv.rolling(w).std().replace(0, np.nan)
+            x[f"volume_z_{w}"] = (logv - vm) / vs
+        signed = np.sign(c - o) * logv
+        x["signed_flow_16"] = signed.rolling(16).sum() / (logv.rolling(16).sum() + 1e-9)
+        x["signed_flow_64"] = signed.rolling(64).sum() / (logv.rolling(64).sum() + 1e-9)
+        ts = pd.to_datetime(df["timestamp"])
+        minute = ts.dt.hour * 60 + ts.dt.minute
+        x["tod_sin"] = np.sin(2 * np.pi * minute / 1440.0)
+        x["tod_cos"] = np.cos(2 * np.pi * minute / 1440.0)
+        x["dow_sin"] = np.sin(2 * np.pi * ts.dt.dayofweek / 7.0)
+        x["dow_cos"] = np.cos(2 * np.pi * ts.dt.dayofweek / 7.0)
+        if self.use_mtf:
+            for target in (60, 240):
+                higher = self._higher_timeframe_features(df, target)
+                for col in higher.columns:
+                    x[col] = higher[col].to_numpy()
+        futures_cols = {"fut_close", "fut_volume", "fut_taker_buy_volume"}
+        if self.use_futures and futures_cols.issubset(df.columns):
+            coverage = float(pd.to_numeric(df["fut_close"], errors="coerce").notna().mean())
+            if coverage >= 0.80:
+                fut_close = pd.to_numeric(df["fut_close"], errors="coerce")
+                fut_vol = pd.to_numeric(df["fut_volume"], errors="coerce").clip(lower=0)
+                taker_buy = pd.to_numeric(df["fut_taker_buy_volume"], errors="coerce").clip(lower=0)
+                basis = fut_close / c.replace(0, np.nan) - 1.0
+                x["futures_basis"] = basis
+                x["futures_basis_z_64"] = ((basis - basis.rolling(64).mean()) /
+                                             basis.rolling(64).std().replace(0, np.nan))
+                fvol = np.log1p(fut_vol)
+                x["futures_volume_z_64"] = ((fvol - fvol.rolling(64).mean()) /
+                                              fvol.rolling(64).std().replace(0, np.nan))
+                taker_imbalance = (2.0 * taker_buy / fut_vol.replace(0, np.nan) - 1.0).clip(-1, 1)
+                x["futures_taker_imbalance_1"] = taker_imbalance
+                x["futures_taker_imbalance_4"] = taker_imbalance.rolling(4).mean()
+                x["futures_taker_imbalance_16"] = taker_imbalance.rolling(16).mean()
+                if "funding_rate" in df:
+                    funding = pd.to_numeric(df["funding_rate"], errors="coerce").ffill()
+                    x["funding_rate"] = funding
+                    funding_window = max(8, int(2880 / timeframe_minutes(self.timeframe)))
+                    x["funding_rate_z_2d"] = ((funding - funding.rolling(funding_window).mean()) /
+                                               funding.rolling(funding_window).std().replace(0, np.nan))
+        onchain_cols = {"onchain_TxCnt", "onchain_AdrActCnt", "onchain_FeeTotNtv"}
+        if self.use_onchain and onchain_cols.issubset(df.columns):
+            coverage = float(pd.to_numeric(df["onchain_TxCnt"], errors="coerce").notna().mean())
+            if coverage >= 0.80:
+                for raw_col, name in (("onchain_TxCnt", "tx_count"),
+                                      ("onchain_AdrActCnt", "active_addr"),
+                                      ("onchain_FeeTotNtv", "fees_btc")):
+                    series = np.log1p(pd.to_numeric(df[raw_col], errors="coerce").clip(lower=0))
+                    baseline = series.rolling(30 * max(1, int(1440 / timeframe_minutes(self.timeframe)))).mean()
+                    spread = series.rolling(30 * max(1, int(1440 / timeframe_minutes(self.timeframe)))).std().replace(0, np.nan)
+                    x[f"onchain_{name}_z_30d"] = (series - baseline) / spread
+                # Daily network metrics are slow; the one-day change avoids
+                # duplicating the faster OHLCV trend features.
+                x["onchain_activity_change_1d"] = (
+                    np.log1p(pd.to_numeric(df["onchain_TxCnt"], errors="coerce")) -
+                    np.log1p(pd.to_numeric(df["onchain_TxCnt"], errors="coerce")).shift(
+                        max(1, int(1440 / timeframe_minutes(self.timeframe)))))
+        return x.replace([np.inf, -np.inf], np.nan)
+
+    @staticmethod
+    def _trade_outcomes(df, tp_pct, sl_pct, hold_bars, cost_pct):
+        n = len(df)
+        y = np.full(n, np.nan)
+        net = np.full(n, np.nan)
+        o = df["open"].to_numpy(dtype=float)
+        h = df["high"].to_numpy(dtype=float)
+        l = df["low"].to_numpy(dtype=float)
+        c = df["close"].to_numpy(dtype=float)
+        friction = (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0
+        commission = cfg("commission_pct") / 100.0
+
+        def net_return(entry, exit_price):
+            return ((exit_price - entry - entry * commission - exit_price * commission) / entry) * 100.0
+
+        for t in range(0, n - hold_bars - 1):
+            entry = o[t + 1] * (1.0 + friction)
+            if not np.isfinite(entry) or entry <= 0:
+                continue
+            tp_price = entry * (1.0 + tp_pct / 100.0)
+            sl_price = entry * (1.0 - sl_pct / 100.0)
+            realised = None
+            for j in range(t + 1, t + hold_bars + 1):
+                hit_sl = l[j] <= sl_price
+                hit_tp = h[j] >= tp_price
+                if hit_sl:          # pessimistic ordering when both hit in one candle
+                    realised = net_return(entry, sl_price * (1.0 - friction))
+                    break
+                if hit_tp:
+                    realised = net_return(entry, tp_price * (1.0 - friction))
+                    break
+            if realised is None:
+                realised = net_return(entry, c[t + hold_bars] * (1.0 - friction))
+            net[t] = realised
+            y[t] = float(realised > 0.0)
+        return y, net
+
+    def fit(self, df, params=None, fold=0, **_):
+        params = {**get_active_parameters(), **(params or {})}
+        self.cost_pct = roundtrip_cost_pct()
+        self.tp_pct = max(float(params.get("TP_PERCENT", 1.0)), 3.0 * self.cost_pct)
+        self.sl_pct = max(float(params.get("SL_PERCENT", 0.5)), 1.5 * self.cost_pct)
+        self.hold_bars = max(5, int(params.get("HOLD_BARS", cfg("barrier_hold_bars"))))
+        friction = (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0
+        commission = cfg("commission_pct") / 100.0
+        tp_exit_ratio = (1.0 + self.tp_pct / 100.0) * (1.0 - friction)
+        sl_exit_ratio = (1.0 - self.sl_pct / 100.0) * (1.0 - friction)
+        self.win_net_pct = (tp_exit_ratio - 1.0 - commission - tp_exit_ratio * commission) * 100.0
+        self.loss_net_pct = -(sl_exit_ratio - 1.0 - commission - sl_exit_ratio * commission) * 100.0
+        xf = self._feature_frame(df)
+        y, net = self._trade_outcomes(df, self.tp_pct, self.sl_pct, self.hold_bars, self.cost_pct)
+        valid = np.isfinite(xf.to_numpy()).all(axis=1) & np.isfinite(y)
+        idx = np.where(valid)[0]
+        if len(idx) < self.MIN_TRAIN_BARS:
+            raise ValueError(f"Tabular LightGBM needs at least {self.MIN_TRAIN_BARS} usable bars ({len(idx)})")
+        self.feature_names = list(xf.columns)
+        X = xf.to_numpy(dtype=float)
+        n = len(idx)
+        tr_cut = int(n * 0.60)
+        va_cut = int(n * 0.80)
+        purge = self.hold_bars
+        tr = idx[:max(1, tr_cut - purge)]
+        va = idx[min(n, tr_cut + purge):max(tr_cut + purge + 1, va_cut - purge)]
+        cal = idx[min(n, va_cut + purge):]
+        if min(len(tr), len(va), len(cal)) < 30:
+            raise ValueError("Not enough disjoint train/validation/calibration observations")
+
+        self.model = LightGBMModel(n_trees=250, depth=3, lr=0.03, min_leaf=80, seed=self.seed)
+        self.model.fit(X[tr], y[tr], X[va], y[va])
+        p_raw = self.model.predict_proba(X)
+        self.calibrator = MetaLabeler(lr=0.05, epochs=500, l2=0.01)
+        if 0 < float(np.mean(y[cal])) < 1:
+            self.calibrator.fit(p_raw[cal, None], y[cal])
+        # A probability calibrator may change scale but must never reverse model
+        # ranking. If the fitted Platt slope is negative, keep raw LightGBM scores.
+        if self.calibrator.w is not None and len(self.calibrator.w) > 1 and self.calibrator.w[1] < 0:
+            self.calibrator = None
+            p = p_raw
+        else:
+            p = self.calibrator.predict_proba(p_raw[:, None])
+        p_break = self.loss_net_pct / max(self.win_net_pct + self.loss_net_pct, 1e-9)
+        gate_q = float(np.clip(cfg("gbm_gate_quantile") / 100.0, 0.50, 0.90))
+        calibrated_gate = float(np.quantile(p[cal], gate_q))
+        # Require positive cost-adjusted expectancy with a modest confidence
+        # margin, but do not let a train-only percentile make OOS trading impossible.
+        self.p_gate = float(min(p_break + 0.12, max(p_break + 0.03, calibrated_gate)))
+        self.min_edge_pct = max(0.02, 0.10 * self.cost_pct)
+        train_auc = LightGBMModel.auc(y[tr], p[tr])
+        val_auc = LightGBMModel.auc(y[va], p[va])
+        cal_auc = LightGBMModel.auc(y[cal], p[cal])
+        brier = float(np.mean((p[cal] - y[cal]) ** 2))
+        diag = {
+            "fold": int(fold), "train_auc": train_auc, "oos_auc": cal_auc,
+            "validation_auc": val_auc, "overfit_gap": float(train_auc - cal_auc),
+            "brier": brier, "p_gate": self.p_gate, "p_break_even": p_break,
+            "train_samples": int(len(tr)), "validation_samples": int(len(va)),
+            "calibration_samples": int(len(cal)), "tp_pct": self.tp_pct,
+            "sl_pct": self.sl_pct, "hold_bars": self.hold_bars,
+            "mean_cal_net_pct": float(np.mean(net[cal])),
+        }
+        self.diagnostics.append(diag)
+        self.status = "ready"
+        self.last_fit_timestamp = pd.to_datetime(df["timestamp"].iloc[-1])
+        return diag
+
+    def _probabilities(self, df):
+        xf = self._feature_frame(df)
+        X = xf.to_numpy(dtype=float)
+        valid = np.isfinite(X).all(axis=1)
+        p = np.full(len(df), 0.5)
+        if self.model is not None and np.any(valid):
+            raw = self.model.predict_proba(X[valid])
+            p[valid] = (self.calibrator.predict_proba(raw[:, None])
+                        if self.calibrator is not None else raw)
+        return p, valid
+
+    def batch_signals(self, df, start_at=0, enforce_health=True, **_):
+        n = len(df)
+        out = {
+            "signal": np.array(["HOLD"] * n, dtype=object), "dir": np.zeros(n, dtype=int),
+            "exit_flag": np.zeros(n, dtype=bool), "p": np.full(n, 0.5),
+            "p_meta": np.full(n, 0.5), "A": np.zeros(n),
+            "episode": np.zeros(n, dtype=bool), "state": np.zeros(n, dtype=int),
+            "tp": np.full(n, self.tp_pct), "sl": np.full(n, self.sl_pct),
+            "exp_net": np.zeros(n),
+            # Signal-funnel instrumentation: which bars were evaluatable and
+            # which model gate each bar passed, so gate-by-gate attrition and a
+            # shadow book of rejected signals can be reconstructed downstream.
+            "gate_valid": np.zeros(n, dtype=bool),
+            "gate_p": np.zeros(n, dtype=bool),
+            "gate_ev": np.zeros(n, dtype=bool),
+        }
+        if self.model is None or (enforce_health and self.health_status()["health"] != "ok"):
+            return out
+        p, valid = self._probabilities(df)
+        ev = p * self.win_net_pct - (1.0 - p) * self.loss_net_pct
+        scope = valid & (np.arange(n) >= int(start_at))
+        gate_p = scope & (p >= self.p_gate)
+        gate_ev = gate_p & (ev >= self.min_edge_pct)
+        fire = gate_ev
+        out["signal"][fire] = "BUY"
+        out["dir"][fire] = 1
+        out["p"] = p; out["p_meta"] = p; out["A"] = p; out["exp_net"] = ev
+        out["gate_valid"] = scope; out["gate_p"] = gate_p; out["gate_ev"] = gate_ev
+        return out
+
+    def health_status(self, **_):
+        if self.status != "ready" or not self.diagnostics:
+            return {"health": "warmup", "reasons": []}
+        d = self.diagnostics[-1]
+        reasons = []
+        if d["oos_auc"] < 0.52: reasons.append(f"OOS AUC {d['oos_auc']:.3f}<0.520")
+        if d["overfit_gap"] > 0.08: reasons.append(f"overfit gap {d['overfit_gap']:.3f}>0.080")
+        if d["brier"] > 0.26: reasons.append(f"Brier {d['brier']:.3f}>0.260")
+        return {"health": "degraded" if reasons else "ok", "reasons": reasons}
+
+    def infer_latest(self, df):
+        sig = self.batch_signals(df)
+        i = len(df) - 1
+        return {
+            "status": self.status, "signal": str(sig["signal"][i]), "dir": int(sig["dir"][i]),
+            "exit_flag": False, "p_gbm": float(sig["p"][i]), "p_meta": float(sig["p"][i]),
+            "a_score": float(sig["A"][i]), "a_gate": float(self.p_gate),
+            "tp_pct": self.tp_pct, "sl_pct": self.sl_pct, "exp_net": float(sig["exp_net"][i]),
+            "episode": "TABULAR", "cluster": -1,
+            "chart": {"n": len(df), "A": sig["A"].tolist(), "episode": [False] * len(df),
+                      "state": [0] * len(df), "buy": (sig["signal"] == "BUY").tolist(),
+                      "sell": [False] * len(df), "exit": [False] * len(df)},
+        }
+
+    def live_state(self, extra=None):
+        hs = self.health_status()
+        s = {
+            "status": self.status, "health": hs["health"], "health_reasons": hs["reasons"],
+            "schema": "TAB-LGBM-v1", "version": 1, "kappa": 0.0, "kappa_init": 0.0,
+            "eta": 0.0, "delta_hat": {}, "fold": len(self.diagnostics),
+            "signal": "HOLD", "dir": 0, "exit_flag": False, "p_gbm": 0.5,
+            "p_meta": 0.5, "a_score": 0.0, "a_gate": self.p_gate,
+            "allow_short": False, "tp_pct": self.tp_pct, "sl_pct": self.sl_pct,
+            "exp_net": 0.0, "episode": "TABULAR", "cluster": -1,
+            "feature_groups": {"mtf": self.use_mtf, "futures": self.use_futures,
+                               "onchain": self.use_onchain},
+            "panel": {"core_active": 0, "core_retired": 0}, "delta_hat_series": [],
+            "diag": self.diagnostics[-1] if self.diagnostics else {},
+        }
+        if extra: s.update(extra)
+        if hs["health"] == "degraded": s["signal"] = "HOLD"
+        self.last_state = s
+        return s
+
+    def on_bar(self, df, force_retrain=False, timeframe=None, params=None):
+        tf = timeframe or self.timeframe
+        if tf != self.timeframe:
+            self.timeframe = tf; self.status = "collecting"; self.model = None
+        if len(df) < self.MIN_TRAIN_BARS:
+            return self.live_state({"status": "collecting", "signal": "HOLD"})
+        if self.model is None or force_retrain:
+            self.status = "training"
+            try:
+                self.fit(df, params=params)
+            except Exception as e:
+                log.error(f"Tabular LightGBM fit failed: {e}")
+                self.status = "collecting"
+                return self.live_state({"status": "collecting", "signal": "HOLD"})
+        return self.live_state(self.infer_latest(df))
+
+
 class PurgedWalkForwardEngine:
     """
     Purged Walk-Forward over the geometric pipeline: expanding chronological folds
     with an embargo gap (signature warm-up + label horizon) between IS and OOS,
     warm start + neighbour-fold RKD between folds, geometry schema fixed after the
-    first window. The OOS trading-parameter mini-grid searches tp_base_pct and
-    trail_mult -- the same two keys the live bot reads from trading_config.json
-    via cfg() -- so a promoted challenger is guaranteed to change live behaviour,
-    not just a parameter store nothing downstream consults.
+    first window. The OOS trading-parameter mini-grid keeps the champion/challenger
+    contract of the legacy optimizer.
     """
 
     def __init__(self, df, timeframe="1m", n_folds=5, seed=42):
@@ -2587,20 +3161,23 @@ class PurgedWalkForwardEngine:
             return ({k: (v[:upto] if isinstance(v, np.ndarray) else v) for k, v in vol.items()},
                     {r: sigs[r][:upto] for r in GEOM_RESOLUTIONS}, valid[:upto])
 
-        base_tp = float(cfg("tp_base_pct"))
-        base_trail = float(cfg("trail_mult"))
-        # Index 0 is always the exact live cfg baseline so the candidate must beat
-        # the production configuration, not merely win against an unrelated grid.
-        combos = [{"tp_base_pct": base_tp, "TRAIL_MULT": base_trail}]
-        tp_grid = sorted({base_tp, 0.4, 0.6, 1.0, 1.6})
-        trail_grid = sorted({base_trail, 2.0, 2.5, 3.0, 3.5, 4.0})
+        base = get_active_parameters()
+        # Index 0 is always the currently-live champion so the candidate must beat
+        # the exact production baseline, not merely win against an unrelated grid.
+        combos = [dict(base)]
+        tp_grid = sorted({float(base.get("TP_PERCENT", 0.6)), 0.6, 1.0, 1.6, 2.4})
+        trail_grid = sorted({float(base.get("TRAIL_MULT", 3.0)), 2.0, 2.5, 3.0, 3.5, 4.0})
         for tp in tp_grid:
             for tm in trail_grid:
+                cmb = dict(base)
+                cmb["TP_PERCENT"] = tp
+                cmb["TRAIL_MULT"] = tm
                 if not any(
-                    old["tp_base_pct"] == tp and old["TRAIL_MULT"] == tm
+                    float(old.get("TP_PERCENT", 0.0)) == tp and
+                    float(old.get("TRAIL_MULT", 0.0)) == tm
                     for old in combos
                 ):
-                    combos.append({"tp_base_pct": tp, "TRAIL_MULT": tm})
+                    combos.append(cmb)
 
         fold_results = {i: [] for i in range(len(combos))}
         prev_encoder = None
@@ -2618,20 +3195,12 @@ class PurgedWalkForwardEngine:
             prev_encoder = pipeline.encoder
             prev_std = pipeline._prev_standardize
 
+            geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
+                                              precomputed=pre_slice(oos_end))
             oos_df = df.iloc[oos_start:oos_end].reset_index(drop=True)
-            # tp_base_pct changes which bars count as barrier hits, so the geo
-            # payload must be recomputed per TP candidate (thread-safe -- see
-            # _barrier_pcts); trail_mult is applied post-hoc by Backtester on a
-            # fixed geo, so every combo sharing a TP value reuses one geo array.
-            geo_by_tp = {}
-            for tp_val in tp_grid:
-                geo_full = pipeline.batch_signals(df.iloc[:oos_end], start_at=oos_start,
-                                                  precomputed=pre_slice(oos_end),
-                                                  tp_base_override=tp_val)
-                geo_by_tp[tp_val] = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
-                                      for kk, vv in geo_full.items()}
+            geo = {kk: (vv[oos_start:oos_end] if isinstance(vv, np.ndarray) else vv)
+                   for kk, vv in geo_full.items()}
             for ci, cmb in enumerate(combos):
-                geo = geo_by_tp[cmb["tp_base_pct"]]
                 res = Backtester(oos_df).run(cmb, geo=geo)
                 fold_results[ci].append({"pf": res["profit_factor"], "calmar": res["calmar_ratio"],
                                          "pnl": res["total_pnl_usdt"], "trades": res["trade_count"]})
@@ -2657,13 +3226,7 @@ class PurgedWalkForwardEngine:
             key = (stable, robust_score, total_trades, -var)
             if best_key is None or key > best_key:
                 best_ci, best_key = ci, key
-        # normalize to the exact cfg() key shape -- this is what
-        # /api/promote_challenger feeds straight into save_trading_config(), so
-        # "optimal parameters" found here become the live trading_config.json
-        # values instead of a parallel store nothing downstream reads.
-        best_combo = combos[best_ci]
-        challenger = {"tp_base_pct": float(best_combo["tp_base_pct"]),
-                      "trail_mult": float(best_combo["TRAIL_MULT"])}
+        challenger = dict(combos[best_ci])
         best_summary = summaries.get(best_ci, {})
         champion_summary = summaries.get(0, {})
         folds_evaluated = max((len(rs) for rs in fold_results.values()), default=0)
@@ -2741,6 +3304,466 @@ def run_geometric_backtest(df, params, timeframe="1m", seed=42):
     return report
 
 
+class BarrierBacktester:
+    """Execution-aligned, long-only simulator used by backtest, WFO and live rules."""
+
+    def __init__(self, df, commission_rate=None, slippage_rate=None, spread_rate=None):
+        self.df = df.reset_index(drop=True)
+        self.commission_rate = cfg("commission_pct") / 100.0 if commission_rate is None else float(commission_rate)
+        self.slippage_rate = cfg("slippage_pct") / 100.0 if slippage_rate is None else float(slippage_rate)
+        self.spread_rate = cfg("spread_pct") / 100.0 if spread_rate is None else float(spread_rate)
+
+    def run(self, params, signals):
+        params = {**DEFAULT_MODEL_PARAMS, **(params or {})}
+        n = len(self.df)
+        initial = float(cfg("paper_start_balance"))
+        if n < 3 or signals is None:
+            return self._metrics(initial, initial, [], 0)
+        o = self.df["open"].to_numpy(dtype=float)
+        h = self.df["high"].to_numpy(dtype=float)
+        l = self.df["low"].to_numpy(dtype=float)
+        c = self.df["close"].to_numpy(dtype=float)
+        obi = self.df["obi"].to_numpy(dtype=float) if "obi" in self.df else np.full(n, np.nan)
+        raw_signal = np.asarray(signals.get("signal", ["HOLD"] * n), dtype=object)
+        tp_pct = max(float(params["TP_PERCENT"]), 3.0 * roundtrip_cost_pct())
+        sl_pct = max(float(params["SL_PERCENT"]), 1.5 * roundtrip_cost_pct())
+        hold_bars = max(5, int(params["HOLD_BARS"]))
+        obi_wall = float(params["OBI_WALL"])
+        friction = self.slippage_rate + self.spread_rate / 2.0
+        balance, position = initial, None
+        trades, equity_curve = [], [initial]
+        obi_blocked = 0
+        # Execution-level funnel: what happened to every BUY signal bar. Indices
+        # are signal-bar positions (i-1) local to this dataframe, consumed by the
+        # shadow book in run_tabular_backtest.
+        executed_bars, obi_blocked_bars, busy_bars, small_bars = [], [], [], []
+
+        for i in range(1, n):
+            closed = False
+            if position is not None:
+                position["bars"] += 1
+                tp_price = position["entry"] * (1.0 + tp_pct / 100.0)
+                sl_price = position["entry"] * (1.0 - sl_pct / 100.0)
+                exit_raw, reason = None, None
+                # Conservative intrabar ordering: if TP and SL both occur, SL wins.
+                if l[i] <= sl_price:
+                    exit_raw, reason = sl_price, "Stop Loss"
+                elif h[i] >= tp_price:
+                    exit_raw, reason = tp_price, "Take Profit"
+                elif position["bars"] >= hold_bars:
+                    exit_raw, reason = c[i], "Max Hold"
+                if exit_raw is not None:
+                    exit_price = float(exit_raw) * (1.0 - friction)
+                    exit_fee = position["qty"] * exit_price * self.commission_rate
+                    net = position["qty"] * (exit_price - position["entry"]) - position["entry_fee"] - exit_fee
+                    balance += net
+                    trades.append({
+                        "entry_price": float(position["entry"]), "exit_price": float(exit_price),
+                        "pnl_pct": float(100.0 * net / max(position["notional"], 1e-12)),
+                        "pnl_usdt": float(net), "side": "long", "type": "Tabular-LGBM",
+                        "reason": reason, "bars_held": int(position["bars"]),
+                    })
+                    equity_curve.append(balance)
+                    position, closed = None, True
+
+            # Signal at candle i-1 is executable no earlier than candle i open.
+            if i - 1 < len(raw_signal) and raw_signal[i - 1] == "BUY":
+                if position is not None or closed:
+                    # single-position rule: a signal while a position is open (or
+                    # on the same bar an exit just filled) is silently unusable
+                    busy_bars.append(i - 1)
+                    continue
+                obi_value = obi[i - 1]
+                if np.isfinite(obi_value) and obi_value < -obi_wall:
+                    obi_blocked += 1
+                    obi_blocked_bars.append(i - 1)
+                    continue
+                entry = float(o[i]) * (1.0 + friction)
+                risk_cash = max(balance, 0.0) * cfg("risk_per_trade_pct") / 100.0
+                qty_risk = risk_cash / max(entry * sl_pct / 100.0, 1e-12)
+                qty_cap = max(balance, 0.0) * cfg("max_capital_pct") / 100.0 / max(entry, 1e-12)
+                qty = min(qty_risk, qty_cap)
+                notional = qty * entry
+                if notional >= cfg("min_order_usdt"):
+                    position = {"entry": entry, "qty": qty, "notional": notional, "bars": 0,
+                                "entry_fee": notional * self.commission_rate}
+                    executed_bars.append(i - 1)
+                else:
+                    small_bars.append(i - 1)
+
+        if position is not None:
+            exit_price = float(c[-1]) * (1.0 - friction)
+            exit_fee = position["qty"] * exit_price * self.commission_rate
+            net = position["qty"] * (exit_price - position["entry"]) - position["entry_fee"] - exit_fee
+            balance += net
+            trades.append({"entry_price": float(position["entry"]), "exit_price": float(exit_price),
+                           "pnl_pct": float(100.0 * net / max(position["notional"], 1e-12)),
+                           "pnl_usdt": float(net), "side": "long", "type": "Tabular-LGBM",
+                           "reason": "End of Test", "bars_held": int(position["bars"])})
+            equity_curve.append(balance)
+        report = self._metrics(initial, balance, trades, obi_blocked, equity_curve)
+        # local signal-bar indices per outcome; consumed by the shadow book
+        report["signal_bars"] = {"executed": executed_bars, "obi_blocked": obi_blocked_bars,
+                                 "busy": busy_bars, "min_notional": small_bars}
+        return report
+
+    @staticmethod
+    def _metrics(initial, balance, trades, obi_blocked, equity_curve=None):
+        pnl = np.asarray([t["pnl_usdt"] for t in trades], dtype=float)
+        pp = np.asarray([t["pnl_pct"] for t in trades], dtype=float)
+        gp = float(pnl[pnl > 0].sum()) if len(pnl) else 0.0
+        gl = float(-pnl[pnl < 0].sum()) if len(pnl) else 0.0
+        pf = gp / gl if gl > 0 else (999.0 if gp > 0 else 1.0)
+        curve = np.asarray(equity_curve or [initial, balance], dtype=float)
+        peaks = np.maximum.accumulate(curve)
+        dd = (peaks - curve) / np.maximum(peaks, 1e-12) * 100.0
+        max_dd = float(np.max(dd)) if len(dd) else 0.0
+        total_pct = float((balance / initial - 1.0) * 100.0) if initial else 0.0
+        downside = pp[pp < 0]
+        return {
+            "trade_count": int(len(trades)), "total_pnl_pct": total_pct,
+            "total_pnl_usdt": float(balance - initial), "profit_factor": float(pf),
+            "max_drawdown_pct": max_dd,
+            "calmar_ratio": float(total_pct / max_dd) if max_dd > 0 else (999.0 if total_pct > 0 else 0.0),
+            "sharpe_ratio": float(np.mean(pp) / np.std(pp)) if len(pp) > 1 and np.std(pp) > 0 else 0.0,
+            "sortino_ratio": float(np.mean(pp) / np.std(downside)) if len(downside) > 1 and np.std(downside) > 0 else 0.0,
+            "recovery_factor": float((balance - initial) / (initial * max_dd / 100.0)) if max_dd > 0 else 0.0,
+            "win_rate": float(100.0 * np.sum(pnl > 0) / len(trades)) if trades else 0.0,
+            "expectancy": float(np.mean(pp)) if len(pp) else 0.0,
+            "obi_blocked": int(obi_blocked), "trades": trades, "engine": "tabular-lightgbm",
+        }
+
+
+# This later definition intentionally replaces the legacy geometry WFO above.
+class PurgedWalkForwardEngine:
+    """Nested purged WFO with a final untouched holdout and optional real-OBI tuning."""
+
+    PARAM_KEYS = ("TP_PERCENT", "SL_PERCENT", "HOLD_BARS", "OBI_WALL")
+
+    def __init__(self, df, timeframe="15m", n_folds=5, seed=42,
+                 use_mtf=ENABLE_MTF_FEATURES, use_futures=ENABLE_FUTURES_FEATURES,
+                 use_onchain=ENABLE_ONCHAIN_FEATURES):
+        attrs = dict(df.attrs)
+        self.df = df.reset_index(drop=True)
+        self.df.attrs.update(attrs)
+        self.timeframe = timeframe
+        self.n_folds = max(3, int(n_folds))
+        self.seed = int(seed)
+        self.use_mtf = bool(use_mtf)
+        self.use_futures = bool(use_futures)
+        self.use_onchain = bool(use_onchain)
+
+    @staticmethod
+    def _slice(signals, start, end):
+        return {k: (v[start:end] if isinstance(v, np.ndarray) else v) for k, v in signals.items()}
+
+    def _grid(self, base):
+        combos = [{**DEFAULT_MODEL_PARAMS, **base}]
+        obi_optimized = bool(self.df.attrs.get("obi_optimized", False))
+        obi_grid = sorted({float(base["OBI_WALL"]), 0.15, 0.30, 0.45}) if obi_optimized else [float(base["OBI_WALL"])]
+        # Curated structural grid: broad enough to test payoff/horizon regimes,
+        # deliberately small enough to limit multiple-testing overfit.
+        structures = [
+            (float(base["TP_PERCENT"]), float(base["SL_PERCENT"]), int(base["HOLD_BARS"])),
+            (0.8, 0.4, 20), (1.0, 0.5, 30), (1.2, 0.5, 30),
+            (1.4, 0.6, 40), (1.1, 0.4, 20), (0.8, 0.6, 40), (1.2, 0.6, 20),
+        ]
+        for tp, sl, hold in structures:
+            for wall in obi_grid:
+                c = {**DEFAULT_MODEL_PARAMS, **base, "TP_PERCENT": tp, "SL_PERCENT": sl,
+                     "HOLD_BARS": hold, "OBI_WALL": wall}
+                key = tuple(c[k] for k in self.PARAM_KEYS)
+                if not any(tuple(x[k] for k in self.PARAM_KEYS) == key for x in combos):
+                    combos.append(c)
+        return combos, obi_optimized
+
+    def run(self):
+        df, n = self.df, len(self.df)
+        base = {**DEFAULT_MODEL_PARAMS, **get_active_parameters()}
+        final_start = int(n * 0.80)
+        dev = df.iloc[:final_start].reset_index(drop=True)
+        if len(dev) < 2400 or n - final_start < 300:
+            raise ValueError(f"Nested purged WFO needs at least 3000 bars ({n})")
+        combos, obi_optimized = self._grid(base)
+        embargo = max(40, max(int(c["HOLD_BARS"]) for c in combos))
+        first_is = max(TabularLightGBMPipeline.MIN_TRAIN_BARS + 3 * embargo, int(len(dev) * 0.40))
+        oos_len = max(1, (len(dev) - first_is) // self.n_folds)
+        fold_results = {i: [] for i in range(len(combos))}
+        diagnostics = []
+
+        for fold in range(self.n_folds):
+            is_end = first_is + fold * oos_len
+            oos_start = is_end + embargo
+            oos_end = min(first_is + (fold + 1) * oos_len, len(dev))
+            if oos_end - oos_start < 80:
+                continue
+            cache = {}
+            for ci, candidate in enumerate(combos):
+                model_key = (candidate["TP_PERCENT"], candidate["SL_PERCENT"], candidate["HOLD_BARS"])
+                if model_key not in cache:
+                    pipe = TabularLightGBMPipeline(
+                        self.timeframe, seed=self.seed + fold,
+                        use_mtf=self.use_mtf, use_futures=self.use_futures,
+                        use_onchain=self.use_onchain)
+                    diag = pipe.fit(dev.iloc[:is_end], params=candidate, fold=fold)
+                    cache[model_key] = (pipe.batch_signals(
+                        dev.iloc[:oos_end], start_at=oos_start, enforce_health=False), diag)
+                    diagnostics.append({**diag, "candidate_key": list(model_key)})
+                sig_full, _ = cache[model_key]
+                res = BarrierBacktester(dev.iloc[oos_start:oos_end]).run(
+                    candidate, self._slice(sig_full, oos_start, oos_end))
+                fold_results[ci].append({"pf": float(res["profit_factor"]),
+                                         "calmar": float(res["calmar_ratio"]),
+                                         "pnl": float(res["total_pnl_usdt"]),
+                                         "trades": int(res["trade_count"]),
+                                         "expectancy": float(res["expectancy"]),
+                                         "obi_blocked": int(res["obi_blocked"])})
+
+        summaries, best_ci, best_key = {}, 0, None
+        for ci, rows in fold_results.items():
+            pfs = [min(r["pf"], 10.0) for r in rows]
+            stable = sum(r["pf"] > 1.10 and r["pnl"] > 0 and r["expectancy"] > 0 for r in rows)
+            variance = float(np.std(pfs)) if pfs else 999.0
+            med_pf = float(np.median(pfs)) if pfs else 0.0
+            med_pnl = float(np.median([r["pnl"] for r in rows])) if rows else -1e9
+            med_exp = float(np.median([r["expectancy"] for r in rows])) if rows else -1e9
+            trades = int(sum(r["trades"] for r in rows))
+            robust = med_pnl + 20.0 * med_exp + 5.0 * (med_pf - 1.0) - 2.0 * variance
+            summaries[ci] = {"stable_folds": int(stable), "pf_variance": variance,
+                             "median_pf": med_pf, "median_pnl": med_pnl,
+                             "median_expectancy": med_exp, "total_trades": trades,
+                             "robust_score": float(robust)}
+            key = (stable, robust, trades, -variance)
+            if best_key is None or key > best_key:
+                best_ci, best_key = ci, key
+
+        folds = max((len(x) for x in fold_results.values()), default=0)
+        if folds < 3:
+            raise ValueError("Too few usable purged WFO folds")
+        challenger = dict(combos[best_ci])
+        final_df = df.iloc[final_start:].reset_index(drop=True)
+        final_reports, final_diags = {}, {}
+        for name, candidate in (("champion", combos[0]), ("challenger", challenger)):
+            pipe = TabularLightGBMPipeline(
+                self.timeframe, seed=self.seed + 100,
+                use_mtf=self.use_mtf, use_futures=self.use_futures,
+                use_onchain=self.use_onchain)
+            final_diags[name] = pipe.fit(dev, params=candidate, fold=99)
+            sig = pipe.batch_signals(df, start_at=final_start, enforce_health=False)
+            final_reports[name] = BarrierBacktester(final_df).run(candidate, self._slice(sig, final_start, n))
+
+        best, champion = summaries[best_ci], summaries[0]
+        improvement = float(best["robust_score"] - champion["robust_score"])
+        model_key = [challenger["TP_PERCENT"], challenger["SL_PERCENT"], challenger["HOLD_BARS"]]
+        diag_rows = [d for d in diagnostics if d["candidate_key"] == model_key]
+        gaps = [d["overfit_gap"] for d in diag_rows]
+        aucs = [d["oos_auc"] for d in diag_rows]
+        overfit = {"mean_gap": float(np.mean(gaps)) if gaps else 1.0,
+                   "max_gap": float(np.max(gaps)) if gaps else 1.0,
+                   "mean_oos_auc": float(np.mean(aucs)) if aucs else 0.0}
+        overfit["verdict"] = "high" if overfit["mean_gap"] > 0.08 else "low"
+        min_stable = max(3, int(math.ceil(folds * 0.60)))
+        ch, cp = final_reports["challenger"], final_reports["champion"]
+        changed = any(challenger[k] != combos[0][k] for k in self.PARAM_KEYS)
+        checks = [
+            (changed, "current champion remains optimal"),
+            (improvement > 0, "inner WFO improvement is not positive"),
+            (best["stable_folds"] >= min_stable, f"stable in fewer than {min_stable} folds"),
+            (best["total_trades"] >= max(20, 4 * folds), "too few inner OOS trades"),
+            (overfit["mean_gap"] <= 0.08, "LightGBM IS-OOS overfit gap is high"),
+            (overfit["mean_oos_auc"] >= 0.52, "mean OOS AUC is below 0.52"),
+            (ch["trade_count"] >= 10, "too few untouched-final trades"),
+            (ch["profit_factor"] >= 1.15, "untouched-final profit factor is below 1.15"),
+            (ch["expectancy"] > 0, "untouched-final expectancy is not positive"),
+            (ch["total_pnl_usdt"] > cp["total_pnl_usdt"], "challenger did not beat champion on untouched final"),
+        ]
+        eligible = all(ok for ok, _ in checks)
+        if eligible:
+            reason = "validated on inner WFO and untouched final"
+        elif not changed and (overfit["mean_oos_auc"] < 0.52 or overfit["mean_gap"] > 0.08):
+            reason = (f"no validated edge: mean OOS AUC {overfit['mean_oos_auc']:.3f}, "
+                      f"IS-OOS gap {overfit['mean_gap']:.3f}")
+        else:
+            reason = next(msg for ok, msg in checks if not ok)
+        return {
+            "challenger": challenger, "stability_count": int(best["stable_folds"]),
+            "variance": float(best["pf_variance"]), "slices_evaluated": int(folds),
+            "eligible_for_promotion": bool(eligible), "promotion_reason": reason,
+            "improvement_score": improvement, "challenger_summary": best,
+            "champion_summary": champion, "engine": "tabular-lightgbm-nested-purged-wfo",
+            "diagnostics": diag_rows, "overfit": overfit, "schema": "TAB-LGBM-v1",
+            "obi_coverage": float(df.attrs.get("obi_coverage", 0.0)), "obi_optimized": obi_optimized,
+            "obi_status": ("real OBI optimized" if obi_optimized else
+                           "OBI held fixed: at least 80% recorded history is required"),
+            "final_holdout_bars": int(n - final_start), "final_reports": final_reports,
+            "final_diagnostics": final_diags,
+            "fold_results": {str(i): x for i, x in fold_results.items()},
+            "parameter_summaries": {str(i): x for i, x in summaries.items()},
+        }
+
+
+def _attach_entry_diagnostics(df, master, report, params, test_start, seed):
+    """Signal funnel, shadow book and entry baselines for the tabular backtest.
+
+    All three answer one question -- does the entry model add anything beyond
+    the exit machinery? -- in a single shared unit: hyp_net[t], the hypothetical
+    net %% of the exact executable trade signalled at bar t (enter next open,
+    same TP/SL/max-hold and cost model as live, via _trade_outcomes).
+
+    * funnel      : gate-by-gate attrition of test-window bars
+                    (evaluated -> p-gate -> EV-gate -> execution outcomes)
+    * shadow_book : per-rejection-group expectancy of the trades NOT taken,
+                    so a gate that kills profitable signals becomes visible
+    * baseline    : unconditional (random-entry) expectancy of the same exit
+                    machinery, a bootstrap percentile of the traded bars' mean
+                    against equal-size random draws, and buy&hold -- if the
+                    traded mean does not clearly beat random draws, the entry
+                    model has no timing edge regardless of backtest PnL
+    """
+    cost = roundtrip_cost_pct()
+    tp_pct = max(float(params["TP_PERCENT"]), 3.0 * cost)
+    sl_pct = max(float(params["SL_PERCENT"]), 1.5 * cost)
+    hold_bars = max(5, int(params["HOLD_BARS"]))
+    _, hyp_net = TabularLightGBMPipeline._trade_outcomes(df, tp_pct, sl_pct, hold_bars, cost)
+    usable = master["gate_valid"] & np.isfinite(hyp_net)
+    usable[:test_start] = False
+    gate_p, gate_ev = master["gate_p"], master["gate_ev"]
+
+    def _stats(sel):
+        vals = hyp_net[sel]
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            return {"count": 0, "mean_net_pct": None, "win_rate": None}
+        return {"count": int(len(vals)), "mean_net_pct": float(np.mean(vals)),
+                "win_rate": float(100.0 * np.mean(vals > 0))}
+
+    sb = report.pop("signal_bars", None) or {"executed": [], "obi_blocked": [],
+                                             "busy": [], "min_notional": []}
+    executed = np.asarray(sb["executed"], dtype=int)
+    report["funnel"] = {
+        "test_bars_evaluated": int(np.sum(usable)),
+        "p_gate_pass": int(np.sum(gate_p & usable)),
+        "ev_gate_pass": int(np.sum(gate_ev & usable)),
+        "obi_blocked": int(len(sb["obi_blocked"])),
+        "busy_skipped": int(len(sb["busy"])),
+        "min_notional_skipped": int(len(sb["min_notional"])),
+        "executed": int(len(executed)),
+    }
+    report["shadow_book"] = {
+        "traded": _stats(executed),
+        "ev_rejected": _stats(gate_p & ~gate_ev & usable),
+        "p_rejected": _stats(usable & ~gate_p),
+        "obi_blocked": _stats(np.asarray(sb["obi_blocked"], dtype=int)),
+        "busy_skipped": _stats(np.asarray(sb["busy"], dtype=int)),
+    }
+
+    pool = np.where(usable)[0]
+    traded_vals = hyp_net[executed] if len(executed) else np.asarray([], dtype=float)
+    traded_vals = traded_vals[np.isfinite(traded_vals)]
+    baseline = {
+        "random_entry_mean_net_pct": float(np.mean(hyp_net[pool])) if pool.size else None,
+        "traded_mean_net_pct": float(np.mean(traded_vals)) if len(traded_vals) else None,
+        "edge_percentile_vs_random": None,
+        "bootstrap_draws": 0,
+        "buy_hold_net_pct": None,
+    }
+    if pool.size >= 20 and len(traded_vals) >= 3:
+        rng = np.random.default_rng(seed)
+        k = int(min(len(traded_vals), pool.size))
+        draws = np.array([float(np.mean(hyp_net[rng.choice(pool, size=k, replace=False)]))
+                          for _ in range(400)])
+        baseline["bootstrap_draws"] = 400
+        baseline["edge_percentile_vs_random"] = float(
+            100.0 * np.mean(draws < float(np.mean(traded_vals))))
+    if len(df) - test_start >= 2:
+        commission = cfg("commission_pct") / 100.0
+        friction = (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0
+        entry = float(df["open"].iloc[test_start]) * (1.0 + friction)
+        exit_price = float(df["close"].iloc[-1]) * (1.0 - friction)
+        if np.isfinite(entry) and entry > 0 and np.isfinite(exit_price):
+            baseline["buy_hold_net_pct"] = float(
+                (exit_price - entry - entry * commission - exit_price * commission) / entry * 100.0)
+    report["baseline"] = baseline
+
+
+def run_tabular_backtest(df, params, timeframe="15m", seed=42,
+                         use_mtf=ENABLE_MTF_FEATURES,
+                         use_futures=ENABLE_FUTURES_FEATURES,
+                         use_onchain=ENABLE_ONCHAIN_FEATURES):
+    """Fit on the first 60%; simulate only the purged, unseen remainder."""
+    attrs = dict(df.attrs)
+    df = df.reset_index(drop=True)
+    df.attrs.update(attrs)
+    params = {**DEFAULT_MODEL_PARAMS, **(params or {})}
+    n = len(df)
+    split = max(TabularLightGBMPipeline.MIN_TRAIN_BARS + 100, int(n * 0.60))
+    embargo = max(int(params["HOLD_BARS"]), TabularLightGBMPipeline.FEATURE_WARMUP)
+    if n < split + embargo + 200:
+        raise ValueError(f"Not enough bars for tabular LightGBM backtest ({n})")
+    test_start = split + embargo
+    master = {
+        "signal": np.array(["HOLD"] * n, dtype=object), "dir": np.zeros(n, dtype=int),
+        "exit_flag": np.zeros(n, dtype=bool), "p": np.full(n, 0.5),
+        "p_meta": np.full(n, 0.5), "A": np.zeros(n), "episode": np.zeros(n, dtype=bool),
+        "state": np.zeros(n, dtype=int), "tp": np.full(n, float(params["TP_PERCENT"])),
+        "sl": np.full(n, float(params["SL_PERCENT"])), "exp_net": np.zeros(n),
+        "gate_valid": np.zeros(n, dtype=bool), "gate_p": np.zeros(n, dtype=bool),
+        "gate_ev": np.zeros(n, dtype=bool),
+    }
+    # Four expanding walk-forward test blocks keep calibration reasonably close
+    # to the traded regime while every prediction remains strictly out-of-sample.
+    bounds = np.linspace(test_start, n, 5, dtype=int)
+    fold_diags, gates = [], []
+    for fold, (block_start, block_end) in enumerate(zip(bounds[:-1], bounds[1:])):
+        train_end = block_start - embargo
+        if block_end - block_start < 20 or train_end < TabularLightGBMPipeline.MIN_TRAIN_BARS:
+            continue
+        pipe = TabularLightGBMPipeline(
+            timeframe, seed=seed + fold, use_mtf=use_mtf, use_futures=use_futures,
+            use_onchain=use_onchain)
+        fold_diags.append(pipe.fit(df.iloc[:train_end], params=params, fold=fold))
+        part = pipe.batch_signals(df.iloc[:block_end], start_at=block_start, enforce_health=False)
+        for key, values in master.items():
+            if isinstance(values, np.ndarray) and key in part:
+                values[block_start:block_end] = part[key][block_start:block_end]
+        gates.append(float(pipe.p_gate))
+    if not fold_diags:
+        raise ValueError("No usable walk-forward backtest folds")
+    report = BarrierBacktester(df).run(params, master)
+    _attach_entry_diagnostics(df, master, report, params, test_start, seed)
+    mean_auc = float(np.mean([d["oos_auc"] for d in fold_diags]))
+    mean_gap = float(np.mean([d["overfit_gap"] for d in fold_diags]))
+    mean_brier = float(np.mean([d["brier"] for d in fold_diags]))
+    health_reasons = []
+    if mean_auc < 0.52: health_reasons.append(f"mean OOS AUC {mean_auc:.3f}<0.520")
+    if mean_gap > 0.08: health_reasons.append(f"mean overfit gap {mean_gap:.3f}>0.080")
+    if mean_brier > 0.26: health_reasons.append(f"mean Brier {mean_brier:.3f}>0.260")
+    health = {"health": "degraded" if health_reasons else "ok", "reasons": health_reasons}
+    test_probs = master["p"][test_start:]
+    report.update({"engine": "tabular-lightgbm", "train_bars": int(split),
+                   "test_bars": int(n - split - embargo), "schema": "TAB-LGBM-v1",
+                   "diagnostics": {**fold_diags[-1], "mean_oos_auc": mean_auc,
+                                   "mean_overfit_gap": mean_gap, "mean_brier": mean_brier},
+                   "fold_diagnostics": fold_diags,
+                   "feature_groups": {"mtf": bool(use_mtf), "futures": bool(use_futures),
+                                      "onchain": bool(use_onchain)},
+                   "model_health": health["health"],
+                   "health_reasons": health["reasons"],
+                   "live_trade_allowed": health["health"] == "ok",
+                   "signal_candidates": int(np.sum(master["signal"] == "BUY")),
+                   "probability_gate": float(np.mean(gates)),
+                   "test_probability_max": float(np.max(test_probs)) if len(test_probs) else 0.0,
+                   "test_probability_p99": float(np.quantile(test_probs, 0.99)) if len(test_probs) else 0.0,
+                   "obi_coverage": float(df.attrs.get("obi_coverage", 0.0)),
+                   "obi_optimized": bool(df.attrs.get("obi_optimized", False))})
+    return report
+
+
+# Backward-compatible API/test name; implementation is no longer geometric.
+def run_geometric_backtest(df, params, timeframe="15m", seed=42):
+    return run_tabular_backtest(df, params, timeframe=timeframe, seed=seed)
+
+
 class SignalEngine:
     """Thin adapter over the learned-geometry pipeline. Signal is HOLD until
     (a) the pipeline is READY and (b) its health monitor is green — no
@@ -2748,7 +3771,8 @@ class SignalEngine:
     the "test / shadow-off" mode used by the safety suite."""
 
     def __init__(self, enable_geometry=True):
-        self.geometry = GeometricPipeline(bot_state.get("timeframe", "1m")) if enable_geometry else None
+        # Compatibility name only: this is now the tabular LightGBM engine.
+        self.geometry = TabularLightGBMPipeline(bot_state.get("timeframe", "15m")) if enable_geometry else None
 
     def process(self, df, params=None, force_retrain=False):
         c = df['close'].values
@@ -2763,9 +3787,9 @@ class SignalEngine:
             try:
                 geom_state = self.geometry.on_bar(
                     df, force_retrain=force_retrain,
-                    timeframe=bot_state.get("timeframe", self.geometry.timeframe))
+                    timeframe=bot_state.get("timeframe", self.geometry.timeframe), params=params)
             except Exception as e_geom:
-                log.error(f"Geometry pipeline error: {e_geom}")
+                log.error(f"Tabular LightGBM pipeline error: {e_geom}")
                 geom_state = self.geometry.live_state() if self.geometry else {}
 
         # Signal is authoritative only when the pipeline is READY AND HEALTHY.
@@ -2773,8 +3797,8 @@ class SignalEngine:
         sig, st = "HOLD", ""
         if geom_state.get("status") == "ready" and geom_state.get("health", "ok") == "ok":
             gsig = geom_state.get("signal", "HOLD")
-            if gsig in ("BUY", "SELL"):
-                sig, st = gsig, "Geo"
+            if gsig == "BUY":
+                sig, st = gsig, "Tabular-LGBM"
 
         return {
             "signal": sig,
@@ -2808,11 +3832,16 @@ class PositionManager:
         self.tp_percent = 0.3
         self.sl_percent = 0.3
         self.min_trail_dist = 0.0
+        self.max_hold_bars = int(DEFAULT_MODEL_PARAMS["HOLD_BARS"])
+        self.bars_open = 0
+        self.last_bar_timestamp = None
 
     @property
     def is_open(self): return self.side is not None
 
     def open(self, side, price, qty, sig_type, gauss_vol, invested_amount, ou_target=0.0, ou_stop=0.0, mode="PAPER", stop_order_id=None, params=None, tp_percent=0.3, sl_percent=0.3, entry_volatility=0.0, min_trail_dist=0.0):
+        if params is None:
+            params = get_active_parameters()
         self.side, self.entry_price, self.entry_type, self.qty = side, price, sig_type, qty
         self.invested_amount = invested_amount
         self.has_taken_partial_tp = False
@@ -2829,13 +3858,12 @@ class PositionManager:
         # floor for the trailing distance so tight low-TF volatility cannot pull
         # the stops inside the cost wall (used by learned-geometry entries)
         self.min_trail_dist = float(min_trail_dist)
+        self.max_hold_bars = max(5, int(params.get("HOLD_BARS", DEFAULT_MODEL_PARAMS["HOLD_BARS"])))
+        self.bars_open = 0
+        self.last_bar_timestamp = None
 
-        # `params` is accepted for test-call compatibility but no longer the
-        # source of truth: trail_mult is the single, live, UI-editable value in
-        # trading_config.json (see cfg()), so WFO-promote and manual edits both
-        # take effect the same way instead of feeding a store nothing reads.
-        self.trail_mult = float(params["TRAIL_MULT"]) if params and "TRAIL_MULT" in params else float(cfg("trail_mult"))
-        self.ping_stop_mult = 0.5
+        self.trail_mult = float(params.get("TRAIL_MULT", 3.0))
+        self.ping_stop_mult = float(params.get("PING_STOP_MULT", 0.5))
 
         trail_dist = max(gauss_vol*self.trail_mult, self.min_trail_dist)
         if side == "long":
@@ -2856,7 +3884,18 @@ class PositionManager:
         self.stop_order_id = None
         self.realized_pnl_usdt = 0.0
         self.min_trail_dist = 0.0
+        self.bars_open = 0
+        self.last_bar_timestamp = None
         return pnl_pct, pnl_usdt
+
+    def on_completed_bar(self, timestamp):
+        """Count a completed candle once, even though the decision loop ticks faster."""
+        if not self.is_open:
+            return
+        stamp = str(timestamp)
+        if stamp != self.last_bar_timestamp:
+            self.last_bar_timestamp = stamp
+            self.bars_open += 1
 
     def update_stops(self, price, gv_normal, gv_lower):
         self.max_price_seen = max(self.max_price_seen, price)
@@ -2880,6 +3919,13 @@ class PositionManager:
         marker left is the health flag from the pipeline (handled by caller)."""
         if not self.is_open: return None
         if force_close: return "Zaman Dilimi Degisimi (Force Close)"
+
+        if self.entry_type == "Tabular-LGBM":
+            if self.side == "long":
+                if price <= self.entry_price * (1 - self.sl_percent/100): return "Stop Loss"
+                if price >= self.entry_price * (1 + self.tp_percent/100): return f"Take Profit ({self.tp_percent:.2f}%)"
+            if self.bars_open >= self.max_hold_bars: return "Max Hold"
+            return None
 
         if self.side == "long":
             if self.has_taken_partial_tp:
@@ -3055,6 +4101,32 @@ class QuantBot:
         self.signal_engine = SignalEngine()
         self.position = PositionManager()
         self.telegram = TelegramController(self)
+        self._obi_minute = None
+        self._obi_samples = []
+        self._futures_context_cache = None
+        self._futures_context_cache_at = 0.0
+        self._futures_context_cache_tf = None
+
+    async def attach_live_futures_context(self, df):
+        """Refresh optional public futures context at most once per minute."""
+        if not ENABLE_FUTURES_FEATURES:
+            return df
+        now = datetime.now().timestamp()
+        tf = bot_state.get("timeframe", "15m")
+        cached = self._futures_context_cache
+        if (cached is not None and self._futures_context_cache_tf == tf and
+                now - self._futures_context_cache_at < 60.0):
+            cols = [c for c in cached.columns if c.startswith("fut_") or c == "funding_rate"]
+            if cols:
+                out = df.merge(cached[["timestamp"] + cols], on="timestamp", how="left")
+                out.attrs.update(df.attrs)
+                out.attrs.update(cached.attrs)
+                return out
+        enriched = await asyncio.to_thread(attach_binance_futures_context, df, tf)
+        self._futures_context_cache = enriched.copy()
+        self._futures_context_cache_at = now
+        self._futures_context_cache_tf = tf
+        return enriched
 
     def simulate_slippage(self, side, qty, orderbook):
         """
@@ -3318,7 +4390,7 @@ class QuantBot:
                 errors.append(f"{provider}: {e}")
                 log.warning(f"Research provider {provider.upper()} unavailable; trying next source")
 
-        if best_partial is not None and len(best_partial) >= GeometricPipeline.MIN_TRAIN_BARS + 200:
+        if best_partial is not None and len(best_partial) >= TabularLightGBMPipeline.MIN_TRAIN_BARS + 200:
             provider = best_partial.attrs.get("data_source", "partial")
             bot_state["research_data_source"] = provider
             log.warning(f"Using best partial research dataset: {provider} ({len(best_partial)} bars)")
@@ -3368,13 +4440,12 @@ class QuantBot:
                 pos_qty = filled_qty
             else:
                 log.info(f"PAPER CLOSE EXECUTED (Virtual)")
-                # Slippage & commission for Paper Trade
-                # Exit slippage = 0.05%
-                exit_price_slippage = price * 0.9995 if pos_side == "long" else price * 1.0005
+                # Same configured friction as backtest/WFO.
+                exit_friction = (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0
+                exit_price_slippage = price * (1.0 - exit_friction) if pos_side == "long" else price * (1.0 + exit_friction)
                 actual_exit_price = exit_price_slippage
                 
-                # Exit commission = 0.1% of exit value
-                comm_exit = (pos_qty * actual_exit_price) * 0.001
+                comm_exit = (pos_qty * actual_exit_price) * (cfg("commission_pct") / 100.0)
                 bot_state["virtual_balance"] -= comm_exit
 
             pnl_pct, pnl_usdt = self.position.close(reason, actual_exit_price)
@@ -3414,6 +4485,7 @@ class QuantBot:
 
     async def main_tick(self):
         df = await self.fetch_ohlcv()
+        df = await self.attach_live_futures_context(df)
         force_retrain = False
 
         if bot_state["timeframe_changed"]:
@@ -3421,12 +4493,14 @@ class QuantBot:
             bot_state["timeframe_changed"] = False
             force_retrain = True
 
-        trail_mult = float(cfg("trail_mult"))
-        bot_state["active_parameters"] = {"TRAIL_MULT": trail_mult}  # legacy display key, kept for API compat
+        active_params = get_active_parameters()
+        bot_state["active_parameters"] = active_params
+        
+        trail_mult = float(active_params.get("TRAIL_MULT", 3.0))
 
         # Repaint fix: process completed bars only
         df_completed = df.iloc[:-1].copy() if len(df) > 30 else df
-        info = self.signal_engine.process(df_completed, force_retrain=force_retrain)
+        info = self.signal_engine.process(df_completed, params=active_params, force_retrain=force_retrain)
         price = float(df['close'].iloc[-1])
         geom = info.get("geom", {}) or {}
         log.info(f"Tick [{bot_state['timeframe']}]: Price={price:.2f}, Signal={info['signal']} ({info['type'] or 'None'}), "
@@ -3466,12 +4540,11 @@ class QuantBot:
         bot_state["chart_data"] = chart_data
 
         if self.position.is_open:
-            gv = info['gauss_vol']
-            self.position.update_stops(price, gv, gv)
+            self.position.on_completed_bar(df_completed['timestamp'].iloc[-1])
+            if self.position.entry_type != "Tabular-LGBM":
+                gv = info['gauss_vol']
+                self.position.update_stops(price, gv, gv)
             reason = self.position.check_exits(price, info)
-            # Geo exits when conformal collapses inside an anomalous episode
-            if reason is None and geom.get("exit_flag"):
-                reason = "Geo Exit (Conformal/Transition)"
 
             bot_state["position_side"] = self.position.side
             bot_state["position_entry"] = float(self.position.entry_price)
@@ -3580,10 +4653,11 @@ class QuantBot:
         # OBI & Risk Parity filtering
         obi_filter_pass = True
         obi_now = bot_state.get("obi", 0)
-        if info['signal'] == "BUY" and obi_now < -cfg("obi_wall"):
+        active_obi_wall = float(active_params.get("OBI_WALL", cfg("obi_wall")))
+        if info['signal'] == "BUY" and obi_now < -active_obi_wall:
             obi_filter_pass = False
             log.info(f"BUY blocked by OBI ({obi_now:.2f} Sell Wall)")
-        elif info['signal'] == "SELL" and obi_now > cfg("obi_wall"):
+        elif info['signal'] == "SELL" and obi_now > active_obi_wall:
             obi_filter_pass = False
             log.info(f"SELL blocked by OBI ({obi_now:.2f} Buy Wall)")
 
@@ -3591,15 +4665,13 @@ class QuantBot:
         if not self.position.is_open and info['signal'] == "BUY" and obi_filter_pass:
             if bot_state["is_trading_active"]:
                 try:
-                    # cost-floored, vol-scaled targets from the geometry pipeline
+                    # Identical targets to labels/backtest/WFO; no trailing or Geo exit.
                     entry_vol = float(info['gauss_vol'])
                     cost = roundtrip_cost_pct()
-                    bar_vol_pct = (entry_vol / price * 100.0) if price > 0 else 0.0
-                    opt_tp = max(float(geom.get("tp_pct") or 0.0), cfg("tp_cost_floor_mult") * cost,
-                                 2.0 * bar_vol_pct * math.sqrt(int(cfg("barrier_hold_bars"))))
-                    opt_sl = max(float(geom.get("sl_pct") or 0.0), cfg("sl_cost_floor_mult") * cost, 0.5 * opt_tp)
-                    min_trail_dist = price * opt_tp / 100.0 * 0.5
-                    stop_dist = max(entry_vol * trail_mult, min_trail_dist, price * 0.01)
+                    opt_tp = max(float(active_params.get("TP_PERCENT", 1.0)), 3.0 * cost)
+                    opt_sl = max(float(active_params.get("SL_PERCENT", 0.5)), 1.5 * cost)
+                    min_trail_dist = price * opt_sl / 100.0
+                    stop_dist = min_trail_dist
                     active_mode = bot_state["trading_mode"]
 
                     if active_mode == "REAL":
@@ -3674,12 +4746,13 @@ class QuantBot:
                             max_qty = (bot_state["virtual_balance"] * (cfg("max_capital_pct") / 100.0)) / price
                             qty = min(target_qty, max_qty)
                             
-                            # Apply paper slippage on entry (0.05%)
-                            slippage_price = price * 1.0005
+                            # Use the same configured spread/slippage/fee as research.
+                            entry_friction = (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0
+                            slippage_price = price * (1.0 + entry_friction)
                             invested = qty * slippage_price
                             
                             # Deduct entry commission fee (0.1%)
-                            comm_entry = invested * 0.001
+                            comm_entry = invested * (cfg("commission_pct") / 100.0)
                             bot_state["virtual_balance"] -= comm_entry
 
                             log.info(f"PAPER ORDER: buy {info['type']} (Qty: {qty:.6f}, Entry Price: {slippage_price:.2f}, Invest: ${invested:.2f})")
@@ -3782,6 +4855,13 @@ class QuantBot:
                     bids_vol = sum(vol for price, vol in ob['bids'])
                     asks_vol = sum(vol for price, vol in ob['asks'])
                     bot_state["obi"] = float((bids_vol - asks_vol) / (bids_vol + asks_vol)) if (bids_vol + asks_vol) > 0 else 0.0
+                    minute = int(datetime.now(_tz.utc).timestamp() // 60 * 60)
+                    if self._obi_minute is None:
+                        self._obi_minute = minute
+                    elif minute != self._obi_minute:
+                        append_obi_minute(self._obi_minute, self._obi_samples)
+                        self._obi_minute, self._obi_samples = minute, []
+                    self._obi_samples.append(bot_state["obi"])
 
                     current_price = float(ob['bids'][0][0])
                     bot_state["price"] = current_price
@@ -3795,7 +4875,7 @@ class QuantBot:
             await asyncio.sleep(FAST_LOOP_INTERVAL)
 
     async def main_loop(self):
-        log.info("QUANT BOT V3.7 (LightGBM Research Engine) - Paper Trading Active")
+        log.info("QUANT BOT V4.0 (Tabular LightGBM) - Paper Trading Active")
         bot_state["loop"] = asyncio.get_running_loop()
         await asyncio.to_thread(self.exchange.load_markets)
 
@@ -3861,6 +4941,18 @@ class QuantBot:
                 
         except Exception as ex_reconcile:
             log.error(f"Startup reconciliation failed: {ex_reconcile}")
+
+        # Prime the live decision model from the same large free OHLCV history used
+        # by research. Later ticks perform inference only, avoiding a 1000-bar model.
+        try:
+            prime_df = await self.fetch_ohlcv_large(SYMBOL, bot_state["timeframe"], RESEARCH_BARS_DEFAULT)
+            if ENABLE_FUTURES_FEATURES:
+                prime_df = await asyncio.to_thread(
+                    attach_binance_futures_context, prime_df, bot_state["timeframe"])
+            self.signal_engine.geometry.fit(prime_df, params=get_active_parameters())
+            log.info(f"Tabular LightGBM primed with {len(prime_df)} bars")
+        except Exception as ex_prime:
+            log.error(f"Large-history model priming failed; remaining in HOLD: {ex_prime}")
 
         asyncio.create_task(self.fast_orderbook_tick())
         asyncio.create_task(self.telegram.run_loop())  # Start Telegram polling
@@ -3929,10 +5021,7 @@ class Backtester:
 
         vol_len = int(params.get("VOL_LENGTH", 14))
         trail_mult = float(params.get("TRAIL_MULT", 3.0))
-        # tp_base_pct is the live cfg() key (see DEFAULT_TRADING_CONFIG); geo["tp"]
-        # below is already computed from this same value (or a WFO grid override),
-        # so this floor tracks whatever produced geo_tp instead of a stale constant.
-        tp_percent = float(params.get("tp_base_pct", cfg("tp_base_pct")))
+        tp_percent = float(params.get("TP_PERCENT", 0.6))
 
         # Simple realised volatility (True Range, rolling mean) for trailing stops.
         # No more Gaussian-filter/CVD/HMM machinery — signals come from `geo` only.
@@ -4148,7 +5237,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Bot V3.7 — LightGBM Research Engine</title>
+    <title>Quant Bot V4.0 — Tabular LightGBM</title>
     <link rel="icon" href="data:,">
     <script src="/static/lightweight-charts.js"></script>
     <style>
@@ -4258,7 +5347,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <header>
-        <div class="brand"><span class="dot blink"></span> Quant Bot <span class="muted" style="font-weight:400;">V3.7 · LightGBM</span></div>
+        <div class="brand"><span class="dot blink"></span> Quant Bot <span class="muted" style="font-weight:400;">V4.0 · Tabular LightGBM</span></div>
         <div class="sym">BTC/USDT</div>
         <div id="price" class="price mono">$0.00</div>
         <div id="geo-badge" class="badge b-grey"><span class="bdot" style="background:var(--muted)"></span><span id="geo-badge-t">COLLECTING</span></div>
@@ -4286,9 +5375,9 @@ HTML_TEMPLATE = """
         <div class="left">
             <div class="tfbar">
                 <span class="muted" style="font-size:11px; margin-right:4px;">Zaman:</span>
-                <button class="tf on" onclick="setTF('1m',this)">1m</button>
+                <button class="tf" onclick="setTF('1m',this)">1m</button>
                 <button class="tf" onclick="setTF('5m',this)">5m</button>
-                <button class="tf" onclick="setTF('15m',this)">15m</button>
+                <button class="tf on" onclick="setTF('15m',this)">15m</button>
                 <button class="tf" onclick="setTF('1h',this)">1h</button>
                 <button class="tf" onclick="setTF('4h',this)">4h</button>
                 <div class="grow"></div>
@@ -4297,28 +5386,28 @@ HTML_TEMPLATE = """
             <div class="chart-wrap">
                 <div id="chart"></div>
                 <div class="legend">
-                    <div><span class="green">▮</span> Conformal A ≥ kapı &nbsp; <span class="muted">▮</span> A &lt; kapı</div>
-                    <div><span class="yellow">●</span> Epizot &nbsp; <span class="green">▲</span> GEO Long &nbsp; <span class="purple">▼</span> GEO Short</div>
-                    <div id="lg-geo" class="muted">Geometri: -</div>
+                    <div><span class="green">▮</span> Olasılık ≥ kapı &nbsp; <span class="muted">▮</span> Olasılık &lt; kapı</div>
+                    <div><span class="green">▲</span> LightGBM Long &nbsp; <span class="muted">yalnızca long</span></div>
+                    <div id="lg-geo" class="muted">Model: -</div>
                 </div>
             </div>
         </div>
 
         <div class="side">
-            <!-- Learned Geometry -->
+            <!-- Tabular LightGBM -->
             <div class="card">
-                <h4>Öğrenilmiş Geometri <span id="geo-health" class="pill" style="background:rgba(125,135,156,.15); color:var(--muted);">-</span></h4>
+                <h4>Tabular LightGBM <span id="geo-health" class="pill" style="background:rgba(125,135,156,.15); color:var(--muted);">-</span></h4>
                 <div id="geo-health-note" class="health-note" style="display:none;"></div>
                 <div class="kv"><span class="k">Durum</span><span class="v" id="g-status">-</span></div>
-                <div class="kv"><span class="k">Şema M</span><span class="v cyan" id="g-schema" style="font-size:11px;">-</span></div>
-                <div class="kv"><span class="k">κ (öğr./init)</span><span class="v" id="g-kappa">- / -</span></div>
-                <div class="kv"><span class="k">η · P(δ≠0)</span><span class="v" id="g-eta">-</span></div>
-                <div class="kv"><span class="k">Epizot</span><span class="v" id="g-ep">NORMAL</span></div>
-                <div class="kv"><span class="k">p GBM / Meta</span><span class="v" id="g-p">- / -</span></div>
-                <div class="kv"><span class="k">Conformal A</span><span class="v" id="g-a">-</span></div>
+                <div class="kv"><span class="k">Model şeması</span><span class="v cyan" id="g-schema" style="font-size:11px;">-</span></div>
+                <div class="kv"><span class="k">Train / OOS AUC</span><span class="v" id="g-kappa">- / -</span></div>
+                <div class="kv"><span class="k">Brier / overfit gap</span><span class="v" id="g-eta">-</span></div>
+                <div class="kv"><span class="k">Karar modu</span><span class="v" id="g-ep">LONG ONLY</span></div>
+                <div class="kv"><span class="k">Olasılık / kapı</span><span class="v" id="g-p">- / -</span></div>
+                <div class="kv"><span class="k">Beklenen net</span><span class="v" id="g-a">-</span></div>
                 <div class="kv"><span class="k">E[net] · TP/SL</span><span class="v" id="g-en">-</span></div>
-                <div class="kv"><span class="k">D_anchor · Fold</span><span class="v" id="g-da">-</span></div>
-                <div class="kv"><span class="k">Panel (aktif/emekli)</span><span class="v" id="g-panel">-</span></div>
+                <div class="kv"><span class="k">Train / validasyon</span><span class="v" id="g-da">-</span></div>
+                <div class="kv"><span class="k">Kalibrasyon örneği</span><span class="v" id="g-panel">-</span></div>
             </div>
 
             <!-- Position -->
@@ -4359,7 +5448,7 @@ HTML_TEMPLATE = """
                 <div style="display:flex; flex-direction:column; gap:6px; margin-top:8px;">
                     <label class="muted" style="font-size:10px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
                         Araştırma barı
-                        <input id="research-bars" type="number" min="3000" max="100000" step="1000" value="10000"
+                        <input id="research-bars" type="number" min="3000" max="100000" step="1000" value="35040"
                                style="width:92px; background:#111722; color:#d7dbe3; border:1px solid #263044; border-radius:5px; padding:5px;">
                     </label>
                     <button class="btn btn-ghost" id="bt-btn" onclick="runBacktest()">Backtest Çalıştır</button>
@@ -4425,7 +5514,7 @@ HTML_TEMPLATE = """
             rebuildSeries();
         }).catch(()=>{});
     }
-    function researchBars(){ return Math.min(100000, Math.max(3000, parseInt(el('research-bars').value||'10000',10))); }
+    function researchBars(){ return Math.min(100000, Math.max(3000, parseInt(el('research-bars').value||'35040',10))); }
     function runResearch(url, buttonId){
         const b=el(buttonId); b.disabled=true;
         fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bars:researchBars()})})
@@ -4436,11 +5525,7 @@ HTML_TEMPLATE = """
     function runWFO(){ runResearch('/api/run_wfo','wfo-btn'); }
     function promote(){
         if(!confirm('Challenger parametrelerini şampiyon (canlı) yapmak istiyor musunuz?')) return;
-        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{
-            alert(d.status==='success'?'Yükseltildi! Yeni parametreler: '+JSON.stringify(d.parameters||{}):'Hata: '+(d.message||''));
-            loadConfig();   // Trading Parameters panel must reflect the promoted values immediately
-            refresh();
-        }).catch(()=>{});
+        fetch('/api/promote_challenger',{method:'POST'}).then(r=>r.json()).then(d=>{ alert(d.status==='success'?'Yükseltildi!':'Hata: '+(d.message||'')); refresh(); }).catch(()=>{});
     }
 
     // ── Trading Parameters panel ──
@@ -4577,10 +5662,11 @@ HTML_TEMPLATE = """
         // challenger + report buttons
         const ps = s.parameters_store || {};
         const chal = ps.shadow_challenger;
-        setText('chal', chal ? 'Aktif' : 'Yok');
-        el('chal').className = 'v ' + (chal?'accent':'muted');
+        const chalOk = !!ps.challenger_eligible;
+        setText('chal', chal ? (chalOk?'Doğrulandı':'Reddedildi') : 'Yok');
+        el('chal').className = 'v ' + (chal?(chalOk?'green':'yellow'):'muted');
         const promo = el('promo-btn');
-        promo.style.display = (chal && !s.position_side) ? 'block' : 'none';
+        promo.style.display = (chal && chalOk && !s.position_side) ? 'block' : 'none';
         el('bt-btn').disabled = !!s.backtest_running;
         el('bt-btn').textContent = s.backtest_running ? 'Backtest çalışıyor...' : 'Backtest Çalıştır';
         el('wfo-btn').disabled = !!s.wfo_running;
@@ -4619,26 +5705,23 @@ HTML_TEMPLATE = """
 
         setText('g-status', String(status).toUpperCase());
         setText('g-schema', G(g,'schema','-'));
-        setText('g-kappa', N(g.kappa,3)+' / '+N(g.kappa_init,3));
         const gd = g.diag || {};
-        const pdn = gd.p_delta_nonzero;
-        setText('g-eta', N(g.eta,3)+' · '+(pdn!==undefined?N(pdn*100,1)+'%':'-'));
-        const inEp = g.episode==='EPISODE';
-        setText('g-ep', inEp ? ('EPİZOT'+(G(g,'cluster',-1)>=0?(' A'+g.cluster):'')) : 'NORMAL');
-        el('g-ep').className = 'v ' + (inEp?'yellow':'green');
-        setText('g-p', N(g.p_gbm,2)+' / '+N(g.p_meta,2));
-        const aOk = G(g,'a_score',0) >= G(g,'a_gate',0.5);
-        setText('g-a', N(g.a_score,2)+' (kapı '+N(g.a_gate,2)+')');
+        setText('g-kappa', N(gd.train_auc,3)+' / '+N(gd.oos_auc,3));
+        setText('g-eta', N(gd.brier,3)+' / '+N(gd.overfit_gap,3));
+        setText('g-ep', 'LONG ONLY');
+        el('g-ep').className = 'v green';
+        setText('g-p', N(g.p_gbm,3)+' / '+N(g.a_gate,3));
+        const aOk = G(g,'p_gbm',0) >= G(g,'a_gate',0.5);
+        setText('g-a', (G(g,'exp_net',0)>=0?'+':'')+N(G(g,'exp_net',0),3)+'%');
         el('g-a').className = 'v ' + (aOk?'green':'muted');
         const en = g.exp_net;
         if(en!==undefined && g.tp_pct){
             setText('g-en', (en>=0?'+':'')+N(en,2)+'% · '+N(g.tp_pct,2)+'/'+N(g.sl_pct,2)+'%');
             el('g-en').className = 'v ' + (en>0?'green':'red');
         } else setText('g-en','-');
-        setText('g-da', N(gd.d_anchor,4)+' · f'+G(g,'fold',0));
-        const pn = g.panel || {};
-        setText('g-panel', (pn.core_active!==undefined)?(pn.core_active+' / '+G(pn,'core_retired',0)):'-');
-        setText('lg-geo', 'Geometri: '+String(status).toUpperCase()+(status==='ready'&&g.schema?(' · '+g.schema):''));
+        setText('g-da', G(gd,'train_samples','-')+' / '+G(gd,'validation_samples','-'));
+        setText('g-panel', G(gd,'calibration_samples','-'));
+        setText('lg-geo', 'Model: '+String(status).toUpperCase()+(status==='ready'&&g.schema?(' · '+g.schema):''));
     }
 
     function renderPos(s){
@@ -4658,27 +5741,62 @@ HTML_TEMPLATE = """
         const box = el('report');
         if(s.wfo_report){
             const w = s.wfo_report; let h = '<div class="accent" style="font-weight:700; margin-bottom:4px;">WFO Sonucu ('+G(w,'engine','-')+')</div>';
+            if(w.status==='error'){ box.innerHTML='<div class="red">WFO hatası: '+G(w,'message','bilinmeyen hata')+'</div>'; box.style.display='block'; return; }
             h += '<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(w,'bars_used',0)+' bar · '+String(G(w,'data_source','-')).toUpperCase()+' / '+G(w,'model','-')+'</span></div>';
             h += '<div class="kv"><span class="k">Stabilite</span><span class="v">'+G(w,'stability_count',0)+'/'+G(w,'slices_evaluated',0)+'</span></div>';
             h += '<div class="kv"><span class="k">PF Varyans</span><span class="v">'+N(w.variance,4)+'</span></div>';
             const promoted = G(w,'promotion_status','not_promoted')==='auto_promoted';
             h += '<div class="kv"><span class="k">Parametre</span><span class="v '+(promoted?'green':'yellow')+'">'+(promoted?'Otomatik güncellendi':G(w,'promotion_status','doğrulanmadı'))+'</span></div>';
             if(w.promotion_reason) h += '<div class="muted" style="font-size:10px; margin-top:3px;">'+w.promotion_reason+'</div>';
-            if(w.schema && w.schema!=='-') h += '<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+w.schema+'</span></div>';
+            if(w.schema && w.schema!=='-') h += '<div class="kv"><span class="k">Model</span><span class="v cyan" style="font-size:10px;">'+w.schema+'</span></div>';
+            h += '<div class="kv"><span class="k">OBI</span><span class="v '+(w.obi_optimized?'green':'yellow')+'">'+(w.obi_optimized?'WFO optimize etti':'Sabit tutuldu')+' · '+N(G(w,'obi_coverage',0)*100,1)+'%</span></div>';
+            if(w.final_holdout_bars) h += '<div class="kv"><span class="k">Kilitli son test</span><span class="v">'+w.final_holdout_bars+' bar</span></div>';
+            const fr=(w.final_reports||{}).challenger||{};
+            if(fr.trade_count!==undefined) h += '<div class="kv"><span class="k">Final işlem / PF</span><span class="v">'+G(fr,'trade_count',0)+' / '+N(G(fr,'profit_factor',0),2)+'</span></div>';
             const dg = (w.diagnostics||[]);
             if(dg.length){ const d=dg[dg.length-1];
-                h += '<div class="muted" style="font-size:10px; margin-top:3px;">P(δ≠0)='+N(d.p_delta_nonzero*100,1)+'% · κ='+N(d.kappa,2)+' · gap='+N(d.overfit_gap,3)+' · D_anchor='+N(d.d_anchor,4)+'</div>'; }
+                h += '<div class="muted" style="font-size:10px; margin-top:3px;">OOS AUC='+N(d.oos_auc,3)+' · gap='+N(d.overfit_gap,3)+' · Brier='+N(d.brier,3)+'</div>'; }
             box.innerHTML=h; box.style.display='block';
         } else if(s.backtest_report){
             const r=s.backtest_report;
             if(r.status==='error'){ box.innerHTML='<div class="red">'+G(r,'message','hata')+'</div>'; box.style.display='block'; return; }
             let h='<div class="green" style="font-weight:700; margin-bottom:4px;">Backtest ('+G(r,'engine','-')+')</div>';
             h+='<div class="kv"><span class="k">Veri / Model</span><span class="v">'+G(r,'bars_used',0)+' bar · '+String(G(r,'data_source','-')).toUpperCase()+' / '+G(r,'model','-')+'</span></div>';
-            if(r.schema && r.schema!=='-') h+='<div class="kv"><span class="k">Geometri</span><span class="v cyan" style="font-size:10px;">'+r.schema+'</span></div>';
+            if(r.schema && r.schema!=='-') h+='<div class="kv"><span class="k">Model</span><span class="v cyan" style="font-size:10px;">'+r.schema+'</span></div>';
+            const healthy=G(r,'live_trade_allowed',false);
+            h+='<div class="kv"><span class="k">Canlı işlem izni</span><span class="v '+(healthy?'green':'red')+'">'+(healthy?'AÇIK':'KAPALI')+'</span></div>';
+            const fg=r.feature_groups||{};
+            h+='<div class="kv"><span class="k">Özellik politikası</span><span class="v">Temel'+(fg.mtf?' + MTF':'')+(fg.futures?' + Futures':'')+'</span></div>';
+            const rd=r.diagnostics||{};
+            if(rd.oos_auc!==undefined) h+='<div class="muted" style="font-size:10px;">Ort. OOS AUC='+N(G(rd,'mean_oos_auc',rd.oos_auc),3)+' · gap='+N(G(rd,'mean_overfit_gap',rd.overfit_gap),3)+' · Brier='+N(G(rd,'mean_brier',rd.brier),3)+'</div>';
+            h+='<div class="kv"><span class="k">Aday sinyal</span><span class="v">'+G(r,'signal_candidates',0)+' · p maks '+N(G(r,'test_probability_max',0),3)+' / kapı '+N(G(r,'probability_gate',0),3)+'</span></div>';
+            if(!healthy && Array.isArray(r.health_reasons) && r.health_reasons.length) h+='<div class="red" style="font-size:10px; margin-top:3px;">Canlı HOLD: '+r.health_reasons.join(' · ')+'</div>';
+            h+='<div class="kv"><span class="k">OBI kayıt kapsaması</span><span class="v">'+N(G(r,'obi_coverage',0)*100,1)+'% · '+G(r,'obi_blocked',0)+' blok</span></div>';
             h+='<div class="kv"><span class="k">İşlem / Kazanç</span><span class="v">'+G(r,'trade_count',0)+' / '+N(r.win_rate,1)+'%</span></div>';
             h+='<div class="kv"><span class="k">Net Kâr</span><span class="v '+(G(r,'total_pnl_usdt',0)>=0?'green':'red')+'">'+(G(r,'total_pnl_usdt',0)>=0?'+':'')+N(r.total_pnl_usdt,2)+' ('+N(r.total_pnl_pct,2)+'%)</span></div>';
             h+='<div class="kv"><span class="k">PF / Sharpe</span><span class="v">'+N(r.profit_factor,2)+' / '+N(r.sharpe_ratio,2)+'</span></div>';
             h+='<div class="kv"><span class="k">Max DD</span><span class="v red">'+N(r.max_drawdown_pct,2)+'%</span></div>';
+            const fu=r.funnel||{};
+            if(fu.test_bars_evaluated!==undefined){
+                h+='<div class="accent" style="font-weight:700; margin-top:6px; font-size:10px;">TEŞHİS: Sinyal Hunisi</div>';
+                h+='<div class="muted" style="font-size:10px;">'+fu.test_bars_evaluated+' bar → p-kapı '+G(fu,'p_gate_pass',0)+' → EV '+G(fu,'ev_gate_pass',0)+' → işlem '+G(fu,'executed',0)+' (OBI '+G(fu,'obi_blocked',0)+' · dolu '+G(fu,'busy_skipped',0)+')</div>';
+            }
+            const sbk=r.shadow_book||{}, fmtG=(g,l)=>{ if(!g||!g.count) return ''; return '<div class="kv" style="font-size:10px;"><span class="k">'+l+' ('+g.count+')</span><span class="v '+(g.mean_net_pct>=0?'green':'red')+'">'+(g.mean_net_pct>=0?'+':'')+N(g.mean_net_pct,3)+'% · kzn '+N(g.win_rate,0)+'%</span></div>'; };
+            if(sbk.traded){
+                h+='<div class="accent" style="font-weight:700; margin-top:4px; font-size:10px;">Gölge Defter (aynı çıkış makinesi, ort. net%)</div>';
+                h+=fmtG(sbk.traded,'İşleme girenler')+fmtG(sbk.ev_rejected,'EV reddetti')+fmtG(sbk.obi_blocked,'OBI blokladı')+fmtG(sbk.busy_skipped,'Pozisyon doluydu')+fmtG(sbk.p_rejected,'p-kapı altı');
+            }
+            const bl=r.baseline||{};
+            if(bl.random_entry_mean_net_pct!==undefined && bl.random_entry_mean_net_pct!==null){
+                h+='<div class="accent" style="font-weight:700; margin-top:4px; font-size:10px;">Giriş Edge Testi</div>';
+                h+='<div class="kv" style="font-size:10px;"><span class="k">Rastgele giriş ort.</span><span class="v">'+N(bl.random_entry_mean_net_pct,3)+'%</span></div>';
+                if(bl.traded_mean_net_pct!==null) h+='<div class="kv" style="font-size:10px;"><span class="k">Model girişleri ort.</span><span class="v">'+N(bl.traded_mean_net_pct,3)+'%</span></div>';
+                if(bl.edge_percentile_vs_random!==null){
+                    const ep=bl.edge_percentile_vs_random, epc=ep>=95?'green':(ep>=80?'yellow':'red');
+                    h+='<div class="kv" style="font-size:10px;"><span class="k">Rastgeleye karşı yüzdelik</span><span class="v '+epc+'">'+N(ep,1)+'% '+(ep>=95?'(gerçek edge)':(ep>=80?'(zayıf)':'(edge yok)'))+'</span></div>';
+                }
+                if(bl.buy_hold_net_pct!==null) h+='<div class="kv" style="font-size:10px;"><span class="k">Al-tut (test aralığı)</span><span class="v">'+N(bl.buy_hold_net_pct,2)+'%</span></div>';
+            }
             box.innerHTML=h; box.style.display='block';
         } else box.style.display='none';
     }
@@ -4885,10 +6003,12 @@ def run_backtest_endpoint():
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running backtest simulation...")
             data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
-            # TRAIL_MULT is the only params-dict key Backtester still reads (TP/SL
-            # come from the geometry pipeline's cost-floored barrier targets);
-            # source it from the live, UI-editable trading config.
-            active_params = {"TRAIL_MULT": float(cfg("trail_mult"))}
+            df = attach_obi_history(df, bot_state["timeframe"])
+            if ENABLE_FUTURES_FEATURES:
+                df = attach_binance_futures_context(df, bot_state["timeframe"])
+            if ENABLE_ONCHAIN_FEATURES:
+                df = attach_coinmetrics_onchain_context(df, bot_state["timeframe"])
+            active_params = get_active_parameters()
             # Geometric backtest: train on the first window, trade the purged remainder.
             report = run_geometric_backtest(df, active_params, timeframe=bot_state["timeframe"])
             log.info(f"Backtest simulation completed ({report.get('engine','geometric')}). Trade Count: {report['trade_count']}, Net PnL: {report['total_pnl_usdt']:.2f} USDT")
@@ -4909,6 +6029,21 @@ def run_backtest_endpoint():
                 "data_source": data_source,
                 "bars_requested": requested_bars,
                 "bars_used": int(len(df)),
+                "diagnostics": report.get("diagnostics", {}),
+                "model_health": report.get("model_health", "unknown"),
+                "health_reasons": report.get("health_reasons", []),
+                "live_trade_allowed": bool(report.get("live_trade_allowed", False)),
+                "feature_groups": report.get("feature_groups", {"mtf": False, "futures": False, "onchain": False}),
+                "signal_candidates": int(report.get("signal_candidates", 0)),
+                "probability_gate": float(report.get("probability_gate", 0.0)),
+                "test_probability_max": float(report.get("test_probability_max", 0.0)),
+                "test_probability_p99": float(report.get("test_probability_p99", 0.0)),
+                "obi_coverage": float(report.get("obi_coverage", 0.0)),
+                "obi_optimized": bool(report.get("obi_optimized", False)),
+                "obi_blocked": int(report.get("obi_blocked", 0)),
+                "funnel": report.get("funnel", {}),
+                "shadow_book": report.get("shadow_book", {}),
+                "baseline": report.get("baseline", {}),
                 "trades": report["trades"][-10:]
             }
             bot_state["backtest_bars_used"] = int(len(df))
@@ -4955,6 +6090,11 @@ def run_wfo_endpoint():
                 
             log.info(f"Historical OHLCV data fetched successfully: {len(df)} bars. Running purged walk-forward...")
             data_source = str(df.attrs.get("data_source", bot_state.get("research_data_source", "-")))
+            df = attach_obi_history(df, bot_state["timeframe"])
+            if ENABLE_FUTURES_FEATURES:
+                df = attach_binance_futures_context(df, bot_state["timeframe"])
+            if ENABLE_ONCHAIN_FEATURES:
+                df = attach_coinmetrics_onchain_context(df, bot_state["timeframe"])
             # Purged walk-forward over the geometric pipeline (warm start +
             # neighbour-fold RKD, geometry schema fixed).
             engine = PurgedWalkForwardEngine(df, timeframe=bot_state["timeframe"])
@@ -4962,21 +6102,17 @@ def run_wfo_endpoint():
             log.info(f"WFO completed ({result.get('engine','geometric-purged-wfo')}). Challenger: {result['challenger']}, "
                      f"Stability: {result['stability_count']}/{result['slices_evaluated']}")
 
-            # challenger is {"tp_base_pct": ..., "trail_mult": ...} -- the exact
-            # keys save_trading_config()/cfg() use, so a promotion below changes
-            # what the live bot actually reads, not a parallel store nothing
-            # downstream consults.
             challenger = result["challenger"]
+            if challenger:
+                challenger = {k: v for k, v in challenger.items() if not k.startswith("slice_")}
 
             p_store = get_all_parameters()
             promotion_status = "not_promoted"
             promotion_reason = result.get("promotion_reason", "validation gate failed")
-            # Re-read live cfg (not the stale pre-run snapshot) so a manual config
-            # edit made while this multi-minute WFO was running isn't mistaken for
-            # "no change".
-            candidate_changed = bool(challenger) and (
-                abs(float(challenger.get("tp_base_pct", 0.0)) - float(cfg("tp_base_pct"))) > 1e-9 or
-                abs(float(challenger.get("trail_mult", 0.0)) - float(cfg("trail_mult"))) > 1e-9
+            champion = p_store.get("champion") or {}
+            candidate_changed = challenger and any(
+                float(challenger.get(k, 0.0)) != float(champion.get(k, 0.0))
+                for k in ("TP_PERCENT", "SL_PERCENT", "HOLD_BARS", "OBI_WALL")
             )
             if result.get("eligible_for_promotion") and candidate_changed:
                 if bot_instance.position.is_open:
@@ -4984,20 +6120,21 @@ def run_wfo_endpoint():
                     promotion_status = "pending_position_close"
                     promotion_reason = "validated; waiting for the open position to close"
                 else:
-                    save_trading_config({"tp_base_pct": challenger["tp_base_pct"],
-                                          "trail_mult": challenger["trail_mult"]})
                     promote_parameter_set(p_store, challenger, source="purged_wfo_auto")
                     promotion_status = "auto_promoted"
-                    promotion_reason = "validated OOS improvement; live config updated"
+                    promotion_reason = "validated OOS improvement; champion updated"
             else:
                 # Preserve a genuinely different candidate for deliberate manual
-                # override, but do not show the current config as its own challenger.
+                # override, but do not show the current champion as its own challenger.
                 p_store["shadow_challenger"] = challenger if candidate_changed else None
+
+            p_store["challenger_eligible"] = bool(result.get("eligible_for_promotion", False))
+            p_store["challenger_reason"] = promotion_reason
 
             save_parameters_store(p_store)
 
             bot_state["parameters_store"] = p_store
-            bot_state["active_parameters"] = {"TRAIL_MULT": float(cfg("trail_mult"))}
+            bot_state["active_parameters"] = p_store.get("champion", get_active_parameters())
             bot_state["wfo_bars_used"] = int(len(df))
 
             bot_state["wfo_report"] = {
@@ -5014,6 +6151,11 @@ def run_wfo_endpoint():
                 "bars_requested": requested_bars,
                 "bars_used": int(len(df)),
                 "schema": result.get("schema", "-"),
+                "obi_coverage": float(result.get("obi_coverage", 0.0)),
+                "obi_optimized": bool(result.get("obi_optimized", False)),
+                "obi_status": result.get("obi_status", "-"),
+                "final_holdout_bars": int(result.get("final_holdout_bars", 0)),
+                "final_reports": result.get("final_reports", {}),
                 "overfit": result.get("overfit", {}),
                 "diagnostics": result.get("diagnostics", []),
                 "d_anchor_log": result.get("d_anchor_log", []),
@@ -5041,30 +6183,28 @@ def promote_challenger_endpoint():
     try:
         p_store = get_all_parameters()
         shadow = p_store.get("shadow_challenger")
+        if shadow and not p_store.get("challenger_eligible", False):
+            return jsonify({"status": "error", "message":
+                            "Challenger doğrulama kapılarını geçmedi: " +
+                            str(p_store.get("challenger_reason", "neden bilinmiyor"))}), 400
         if not shadow:
             return jsonify({"status": "error", "message": "Aktif Challenger parametresi bulunamadı!"}), 400
-
-        # Apply into the SAME live config the Trading Parameters panel edits --
-        # this is what makes "promote" actually change behaviour, instead of
-        # writing into parameters_store.json's champion, which nothing outside
-        # the display layer reads.
-        patch = {k: v for k, v in shadow.items() if k in DEFAULT_TRADING_CONFIG}
-        new_cfg = save_trading_config(patch)
+            
         promote_parameter_set(p_store, shadow, source="manual_override")
         save_parameters_store(p_store)
-
+            
         bot_state["parameters_store"] = p_store
-        bot_state["active_parameters"] = {"TRAIL_MULT": float(cfg("trail_mult"))}
-
+        bot_state["active_parameters"] = shadow
+        
         msg = (
-            f"🔄 *CHALLENGER PARAMETRELERİ UYGULANDI!*\n\n"
-            f"📈 *Versiyon:* v{p_store['active_version']}\n"
-            f"Parametreler: {patch}"
+            f"🔄 *CHALLENGER PARAMETRESİ ŞAMPİYON YAPILDI!*\n\n"
+            f"📈 *Yeni Versiyon:* v{p_store['active_version']}\n"
+            f"Parameters: {shadow}"
         )
         if bot_state.get("loop"):
             asyncio.run_coroutine_threadsafe(bot_instance.telegram.send_message(msg), bot_state["loop"])
-
-        return jsonify({"status": "success", "parameters": patch, "config": new_cfg})
+            
+        return jsonify({"status": "success", "parameters": shadow})
     except Exception as e:
         log.error(f"Error promoting challenger: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -5528,7 +6668,9 @@ def test_backtester_short():
         idx = 700
         geo["signal"][idx] = "SELL"; geo["dir"][idx] = -1
         geo["exp_net"][idx] = 1.0
-    params = {"TRAIL_MULT": 3.0}
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
     rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
         params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
     shorts = [t for t in rep["trades"] if t["side"] == "short"]
@@ -5547,12 +6689,9 @@ def test_overfit_diagnostic():
     for k in ("train_auc", "oos_auc", "overfit_gap"):
         assert k in diag, f"missing {k}"
     assert abs(diag["overfit_gap"] - (diag["train_auc"] - diag["oos_auc"])) < 1e-9
-    eng = PurgedWalkForwardEngine(df, timeframe="1m", n_folds=3)
-    res = eng.run()
-    assert "overfit" in res and "mean_gap" in res["overfit"]
-    assert res["overfit"]["verdict"] in ("low", "moderate", "high")
-    print(f"  fold gap {diag['overfit_gap']:+.3f} | WFO mean gap {res['overfit']['mean_gap']:+.3f} "
-          f"[{res['overfit']['verdict']}] ✓")
+    # WFO-level overfit readout is covered by test_tabular_backtest_and_nested_wfo
+    # (the active nested tabular engine needs 3000+ bars).
+    print(f"  fold gap {diag['overfit_gap']:+.3f} ✓")
 
 
 def test_anchor_panel():
@@ -5612,94 +6751,68 @@ def test_pipeline_end_to_end():
     assert ch["n"] == len(ch["A"]) == len(ch["episode"]) == len(ch["buy"]) \
         == len(ch["exit"]) == len(ch["state"]), "chart overlay arrays must align"
     assert all(0.0 <= a <= 1.0 for a in ch["A"])
-    params = {"TRAIL_MULT": 3.0}
+    params = {"FAST_LENGTH": 8, "SLOW_LENGTH": 21, "VOL_LENGTH": 14, "CVD_LENGTH": 14,
+              "BAND_MULT": 2.5, "MIN_PROFIT_MARGIN": 0.3, "TRAIL_MULT": 3.0,
+              "PING_STOP_MULT": 0.5, "TP_PERCENT": 0.6}
     rep = Backtester(df.iloc[660:].reset_index(drop=True)).run(
         params, geo={k: (v[660:] if isinstance(v, np.ndarray) else v) for k, v in geo.items()})
     assert "trade_count" in rep and "profit_factor" in rep
     print(f"  geo backtest slice: {rep['trade_count']} trades, PF={rep['profit_factor']:.2f}")
 
 
-def test_geometric_backtest_and_purged_wfo():
-    print("Testing run_geometric_backtest + PurgedWalkForwardEngine...")
-    df = _make_synth_df(1250, seed=7)
-    params = {"TRAIL_MULT": 3.0}
-    rep = run_geometric_backtest(df, params, timeframe="1m")
-    assert rep["engine"] == "geometric"
-    assert rep["train_bars"] > 0 and "schema" in rep
-    print(f"  geometric backtest: {rep['trade_count']} trades | schema {rep['schema']}")
+def test_tabular_backtest_and_nested_wfo():
+    print("Testing run_tabular_backtest + nested PurgedWalkForwardEngine + entry diagnostics...")
+    df = _make_synth_df(3600, seed=7)
+    params = dict(DEFAULT_MODEL_PARAMS)
+    rep = run_tabular_backtest(df, params, timeframe="1m")
+    assert rep["engine"] == "tabular-lightgbm"
+    assert rep["train_bars"] > 0 and rep["schema"] == "TAB-LGBM-v1"
+    assert "signal_bars" not in rep, "raw bar lists must not leak into the report"
+
+    # ── signal funnel: attrition must be monotone and internally consistent ──
+    fu = rep["funnel"]
+    assert fu["test_bars_evaluated"] >= fu["p_gate_pass"] >= fu["ev_gate_pass"] >= 0
+    # every fired signal gets exactly one execution outcome; the two counts may
+    # differ only by tail bars (fired inside the last HOLD_BARS window, where
+    # hyp_net is undefined so the funnel does not count them as evaluated)
+    total_outcomes = (fu["executed"] + fu["obi_blocked"] +
+                      fu["busy_skipped"] + fu["min_notional_skipped"])
+    assert abs(total_outcomes - fu["ev_gate_pass"]) <= int(params["HOLD_BARS"]) + 3
+    assert fu["executed"] == rep["trade_count"], "each executed entry must produce exactly one trade"
+
+    # ── shadow book: every group reports the same schema in the same unit ──
+    sbk = rep["shadow_book"]
+    for group in ("traded", "ev_rejected", "p_rejected", "obi_blocked", "busy_skipped"):
+        g = sbk[group]
+        assert set(g) == {"count", "mean_net_pct", "win_rate"}
+        if g["count"]:
+            assert -100.0 < g["mean_net_pct"] < 100.0 and 0.0 <= g["win_rate"] <= 100.0
+    assert sbk["p_rejected"]["count"] > 0, "most bars are rejected by the p-gate"
+
+    # ── baselines: random-entry expectancy + bootstrap percentile + buy&hold ──
+    bl = rep["baseline"]
+    assert bl["random_entry_mean_net_pct"] is not None
+    assert bl["buy_hold_net_pct"] is not None
+    if bl["edge_percentile_vs_random"] is not None:
+        assert 0.0 <= bl["edge_percentile_vs_random"] <= 100.0 and bl["bootstrap_draws"] == 400
+    print(f"  funnel: {fu['test_bars_evaluated']} bars -> p {fu['p_gate_pass']} -> "
+          f"ev {fu['ev_gate_pass']} -> executed {fu['executed']}")
+    print(f"  shadow: traded n={sbk['traded']['count']} | p-rejected n={sbk['p_rejected']['count']} "
+          f"mean={sbk['p_rejected']['mean_net_pct']:.3f}%")
+    print(f"  baseline: random {bl['random_entry_mean_net_pct']:.3f}% | "
+          f"edge percentile {bl['edge_percentile_vs_random']} | B&H {bl['buy_hold_net_pct']:.2f}%")
+
     eng = PurgedWalkForwardEngine(df, timeframe="1m", n_folds=3)
     res = eng.run()
-    assert res["engine"] == "geometric-purged-wfo"
-    assert res["slices_evaluated"] == 3
-    # challenger keys must match what /api/promote_challenger writes straight into
-    # trading_config.json -- this IS the "WFO updates optimal parameters" contract.
-    assert res["challenger"] is not None
-    assert "tp_base_pct" in res["challenger"] and "trail_mult" in res["challenger"]
-    assert len(res["diagnostics"]) >= 2
-    versions = {d["schema"] for d in res["diagnostics"]}
-    assert len(versions) == 1, "geometry schema must stay fixed across folds"
-    assert len(res["d_anchor_log"]) >= 2
-    d0 = res["d_anchor_log"][0]["d_anchor"]
-    assert abs(d0) < 1e-9, "fold-0 D_anchor is the baseline (0)"
-    assert len(res["delta_hat_series"]) >= 2
-    print(f"  purged WFO: stability {res['stability_count']}/3 | "
-          f"D_anchor log {[round(e['d_anchor'], 4) for e in res['d_anchor_log']]}")
-
-
-def test_promote_challenger_updates_live_config():
-    print("Testing that promoting a WFO challenger updates the live trading config...")
-    global bot_instance
-
-    class PositionStub:
-        is_open = False
-
-    class TelegramStub:
-        async def send_message(self, msg): pass
-
-    class BotStub:
-        position = PositionStub()
-        telegram = TelegramStub()
-
-    original_bot = bot_instance
-    cfg_snapshot = dict(CFG)
-    pstore_existed = PARAMETERS_STORE_PATH.exists()
-    pstore_snapshot = PARAMETERS_STORE_PATH.read_text() if pstore_existed else None
-    bot_instance = BotStub()
-    try:
-        challenger = {"tp_base_pct": 1.23, "trail_mult": 4.56}
-        assert abs(cfg("tp_base_pct") - challenger["tp_base_pct"]) > 1e-6, "fixture must differ from current cfg"
-        assert abs(cfg("trail_mult") - challenger["trail_mult"]) > 1e-6, "fixture must differ from current cfg"
-
-        p_store = get_all_parameters()
-        p_store["shadow_challenger"] = challenger
-        save_parameters_store(p_store)
-        bot_state["parameters_store"] = p_store
-        bot_state["loop"] = None
-
-        client = app.test_client()
-        resp = client.post("/api/promote_challenger")
-        body = resp.get_json()
-        assert resp.status_code == 200 and body["status"] == "success", body
-
-        # this IS the "WFO -> optimal parameters" contract: the live cfg() the
-        # bot loop reads must match the promoted challenger, not a parallel
-        # store nothing downstream consults.
-        assert abs(cfg("tp_base_pct") - challenger["tp_base_pct"]) < 1e-9, "promote must update live cfg tp_base_pct"
-        assert abs(cfg("trail_mult") - challenger["trail_mult"]) < 1e-9, "promote must update live cfg trail_mult"
-
-        import json as _json
-        on_disk = _json.loads(TRADING_CONFIG_PATH.read_text())
-        assert abs(on_disk["tp_base_pct"] - challenger["tp_base_pct"]) < 1e-9, "promote must persist to trading_config.json"
-        assert abs(on_disk["trail_mult"] - challenger["trail_mult"]) < 1e-9, "promote must persist to trading_config.json"
-        print(f"  promote -> live cfg tp_base_pct={cfg('tp_base_pct')} trail_mult={cfg('trail_mult')} "
-              f"(also persisted to disk) ✓")
-    finally:
-        bot_instance = original_bot
-        save_trading_config(cfg_snapshot)
-        if pstore_existed:
-            PARAMETERS_STORE_PATH.write_text(pstore_snapshot)
-        elif PARAMETERS_STORE_PATH.exists():
-            PARAMETERS_STORE_PATH.unlink()
+    assert res["engine"] == "tabular-lightgbm-nested-purged-wfo"
+    assert res["challenger"] is not None and "TP_PERCENT" in res["challenger"]
+    assert isinstance(res["eligible_for_promotion"], bool) and res["promotion_reason"]
+    assert "overfit" in res and "mean_gap" in res["overfit"]
+    assert res["final_holdout_bars"] > 0
+    for name in ("champion", "challenger"):
+        assert name in res["final_reports"] and "trade_count" in res["final_reports"][name]
+    print(f"  nested WFO: stability {res['stability_count']}/{res['slices_evaluated']} | "
+          f"eligible={res['eligible_for_promotion']} ({res['promotion_reason']})")
 
 
 def test_signal_engine_contract():
@@ -5821,8 +6934,11 @@ async def _run_safety_tests_async():
     await bot.main_tick()
     print(f"  Position open? {bot.position.is_open} (Expected: True)")
     print(f"  Position mode: {bot.position.mode} (Expected: PAPER)")
-    print(f"  Position entry price: {bot.position.entry_price:.2f} (Expected: 60030.00)")
-    assert abs(bot.position.entry_price - 60030.0) < 1e-5
+    # Paper entry applies the SAME friction as research: slippage + half spread
+    # (cfg-driven, so the expectation is computed instead of hardcoded).
+    expected_entry = 60000.0 * (1.0 + (cfg("slippage_pct") + cfg("spread_pct") / 2.0) / 100.0)
+    print(f"  Position entry price: {bot.position.entry_price:.2f} (Expected: {expected_entry:.2f})")
+    assert abs(bot.position.entry_price - expected_entry) < 1e-5
     invested = bot.position.invested_amount
     expected_fee = invested * 0.001
     expected_balance = 10000.0 - expected_fee
@@ -5903,8 +7019,7 @@ def _run_geom_suite():
     test_overfit_diagnostic()
     test_anchor_panel()
     test_pipeline_end_to_end()
-    test_geometric_backtest_and_purged_wfo()
-    test_promote_challenger_updates_live_config()
+    test_tabular_backtest_and_nested_wfo()
     test_signal_engine_contract()
     test_health_monitor_auto_hold()
     print("\nAll V3.6 learned-geometry tests passed!")
@@ -5980,7 +7095,7 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot, daemon=False)
     bot_thread.start()
     try:
-        webview.create_window(title='Quant Bot V3.7 - LightGBM Research Engine', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
+        webview.create_window(title='Quant Bot V4.0 - Tabular LightGBM', url=app, width=1400, height=850, resizable=True, min_size=(1100, 700))
         webview.start()
     except Exception as e:
         log.warning(f"Webview error: {e}")
