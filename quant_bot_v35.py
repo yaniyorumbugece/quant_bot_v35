@@ -129,7 +129,7 @@ DEFAULT_TRADING_CONFIG = {
     "tp_base_pct": 0.6,            # base take-profit % (floored by cost model)
     "trail_mult": 3.0,             # trailing-stop = mult × realised volatility
     "partial_tp_ratio": 70.0,      # % of position taken at first trailing hit
-    "barrier_hold_bars": 30,       # barrier-race horizon (labels/meta/targets)
+    "barrier_hold_bars": 26,       # barrier-race horizon (labels/meta/targets); 26×15m≈1σ
     "tp_cost_floor_mult": 3.0,     # TP must clear this × roundtrip cost
     "sl_cost_floor_mult": 1.5,     # SL floor = this × roundtrip cost
     # ── Maliyet Modeli ──
@@ -238,7 +238,9 @@ OBI_HISTORY_PATH = Path(__file__).parent / "obi_history.csv"
 DEFAULT_MODEL_PARAMS = {
     "TP_PERCENT": 1.0,
     "SL_PERCENT": 0.5,
-    "HOLD_BARS": 30,
+    # 26 bars × 15 min = 6.5 h ≈ 1σ expected move at 15m volatility (~1%).
+    # This is the mathematically recommended horizon for the default 15m timeframe.
+    "HOLD_BARS": 26,
     "OBI_WALL": 0.25,
     # Legacy keys stay readable so an existing parameters_store.json migrates safely.
     "VOL_LENGTH": 14,
@@ -3468,7 +3470,7 @@ class PurgedWalkForwardEngine:
         # deliberately small enough to limit multiple-testing overfit.
         structures = [
             (float(base["TP_PERCENT"]), float(base["SL_PERCENT"]), int(base["HOLD_BARS"])),
-            (0.8, 0.4, 20), (1.0, 0.5, 30), (1.2, 0.5, 30),
+            (0.8, 0.4, 20), (0.9, 0.45, 26), (1.0, 0.5, 30), (1.2, 0.5, 30),
             (1.4, 0.6, 40), (1.1, 0.4, 20), (0.8, 0.6, 40), (1.2, 0.6, 20),
         ]
         for tp, sl, hold in structures:
